@@ -139,6 +139,53 @@ voice_service = true
 # periodic_registration_secs = 3600
 
 ###############################################################################
+# OPTIONAL: Neighbor Cell Broadcast (NCB)
+#
+# Advertises adjacent TETRA cells to terminals so they know where to roam.
+# Broadcast in D-NWRK-BROADCAST PDU, alongside the network time (~61s cadence).
+# Up to 7 neighbor cells supported. Each must have a unique cell_identifier_ca
+# and a unique main_carrier_number.
+#
+# Per ETSI EN 300 392-2 clause 18.5.17 / Table 18.64.
+#
+# Add one [[cell_info.neighbor_cells_ca]] block per neighboring cell.
+# Comment out the whole section if you have no neighbors.
+#
+# [[cell_info.neighbor_cells_ca]]
+# cell_identifier_ca = 1                # 0-31, unique within CA cluster
+# cell_reselection_types_supported = 1  # 0=none, 1=announced, 2=unannounced, 3=both
+# neighbor_cell_synchronized = false    # true if time-sync'd with us
+# cell_load_ca = 0                      # 0=low, 1=medium-low, 2=medium-high, 3=high
+# main_carrier_number = 1525            # 0-4095, must differ from our main_carrier
+#
+# Optional fields (omit if not needed):
+# main_carrier_number_extension = 0     # 0-1023 (only if carrier > 4095 needed)
+# mcc = 204                             # 0-1023, only set if neighbor on different MCC
+# mnc = 1337                            # 0-16383, only set if neighbor on different MNC
+# location_area = 3                     # 0-16383, neighbor's location area
+# maximum_ms_transmit_power = 7         # 0-7 (0=lowest, 7=highest TX power for MS)
+# minimum_rx_access_level = 0           # 0-15 (minimum RSSI level for cell access)
+# subscriber_class = 0xFFFF             # 16 bits, which subscriber classes can access
+# timeshare_cell_information_or_security_parameters = 0  # 0-31
+# tdma_frame_offset = 0                 # 0-63, TDMA frame offset vs our cell
+#
+# Example with two neighbors:
+# [[cell_info.neighbor_cells_ca]]
+# cell_identifier_ca = 1
+# cell_reselection_types_supported = 1
+# neighbor_cell_synchronized = false
+# cell_load_ca = 0
+# main_carrier_number = 1525
+#
+# [[cell_info.neighbor_cells_ca]]
+# cell_identifier_ca = 2
+# cell_reselection_types_supported = 1
+# neighbor_cell_synchronized = false
+# cell_load_ca = 0
+# main_carrier_number = 1529
+###############################################################################
+
+###############################################################################
 # OPTIONAL: Home Mode Display (PID 220)
 #
 # Periodically broadcasts a text string to all MSs on the cell via D-SDS-DATA.
