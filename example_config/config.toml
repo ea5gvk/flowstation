@@ -9,6 +9,13 @@ stack_mode = "Bs"
 # Uncomment to enable verbose logging. Files grow fast and generate additional load.
 # debug_log = "./verbose_log.txt"
 
+# Optional explicit systemd service unit name. Used by SDS command control
+# (restart/shutdown) and the dashboard OTA update button. When unset, FlowStation
+# tries to auto-detect via /proc/self/cgroup, then falls back to
+# "tetra-bluestation.service". Set this if your unit has a custom name.
+# Environment variable FLOWSTATION_SERVICE_UNIT also works.
+# service_name = "tetra"
+
 ###############################################################################
 # FALLBACK CONFIG
 #

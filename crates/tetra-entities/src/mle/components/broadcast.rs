@@ -70,39 +70,20 @@ impl MleBroadcast {
         // ambiguity or invalid timezone), continue without time — the broadcast
         // PDU still carries useful info (neighbours, cell load) and must not crash.
         let time_value = self.time_broadcast.as_deref().and_then(network_time::encode_tetra_network_time);
-
-        // ============================================================
-        // PDU #1 — Time-only broadcast (no neighbours).
-        //
-        // This PDU is bit-for-bit identical to what BlueStation transmits:
-        //   75 bits, Some(time) + Some(0) neighbours, no neighbour info.
-        //
-        // Any MS that accepts BlueStation accepts this — guaranteed.
-        // We always send it first so radios get the time even if the
-        // neighbour PDU (below) is rejected for any reason (e.g.
-        // misconfigured cell_identifier_ca, MCC/MNC mismatch, etc.).
-        // ============================================================
-        if let Some(time_value) = time_value {
-            let pdu_time_only = DNwrkBroadcast {
-                cell_re_select_parameters: 0,
-                cell_load_ca: 0,
-                tetra_network_time: Some(time_value),
-                number_of_ca_neighbour_cells: Some(0),
-                neighbour_cell_information_for_ca: Vec::new(),
-            };
-            self.transmit_pdu(queue, pdu_time_only, "time-only");
-        }
-
-        // ============================================================
-        // PDU #2 — Neighbour info broadcast (only if neighbours configured).
-        //
-        // Carries the full neighbour list for CA / handover. Larger PDU,
-        // can be rejected by some MS firmware if a neighbour is misconfigured,
-        // but at worst the time PDU above already arrived, so the time still
-        // shows on the radio.
-        // ============================================================
         let cfg = self.config.config();
-        if !cfg.cell.neighbor_cells_ca.is_empty() {
+        let has_neighbours = !cfg.cell.neighbor_cells_ca.is_empty();
+
+        // Strategy:
+        //   - If no neighbours: send a single time-only PDU (compact, ~75 bits).
+        //   - If neighbours configured: send a single combined PDU (time + neighbours).
+        //
+        // We deliberately do NOT send two PDUs (time-only + with-neighbours) when NCB is
+        // active. Each D-NWRK-BROADCAST occupies a slot on the MCCH BNCH, and the MCCH
+        // is shared with other broadcasts (Home Mode Display SDS, periodic SDS, live SDS).
+        // Sending 2 PDUs per hyperframe doubled MCCH pressure and squeezed HMD out of the
+        // queue — radios stopped showing the configured callsign as soon as neighbours were
+        // configured.
+        if has_neighbours {
             let neighbour_cells: Vec<NeighbourCellInformationForCa> = cfg
                 .cell
                 .neighbor_cells_ca
@@ -138,8 +119,19 @@ impl MleBroadcast {
             self.transmit_pdu(
                 queue,
                 pdu_with_neighbours,
-                &format!("with {} neighbours", neighbour_count),
+                &format!("time+{} neighbours", neighbour_count),
             );
+        } else if let Some(time_value) = time_value {
+            // Time only, no neighbours — keep the field semantics identical to BlueStation
+            // for maximum MS compatibility: number_of_ca_neighbour_cells = Some(0).
+            let pdu_time_only = DNwrkBroadcast {
+                cell_re_select_parameters: 0,
+                cell_load_ca: 0,
+                tetra_network_time: Some(time_value),
+                number_of_ca_neighbour_cells: Some(0),
+                neighbour_cell_information_for_ca: Vec::new(),
+            };
+            self.transmit_pdu(queue, pdu_time_only, "time-only");
         }
 
         tracing::info!(

@@ -16,6 +16,20 @@ struct LifecycleControl {
 
 static LIFECYCLE_CONTROL: OnceLock<LifecycleControl> = OnceLock::new();
 
+/// Service unit configured from the TOML config file (e.g. service_name = "tetra").
+/// Takes precedence over cgroup auto-detection but is overridden by FLOWSTATION_SERVICE_UNIT env var.
+static CONFIGURED_SERVICE_UNIT: OnceLock<String> = OnceLock::new();
+
+/// Set the service unit from config — should be called once at startup.
+/// Subsequent calls are ignored (OnceLock).
+pub fn set_configured_service_unit(unit: &str) {
+    if let Some(normalized) = normalize_service_unit(unit) {
+        let _ = CONFIGURED_SERVICE_UNIT.set(normalized);
+    } else {
+        tracing::warn!("Service control: ignoring invalid configured service_name={:?}", unit);
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum ServiceAction {
     Restart,
@@ -95,6 +109,10 @@ pub fn resolve_service_unit() -> String {
             return unit;
         }
         tracing::warn!("Service control: ignoring invalid {}={:?}", SERVICE_UNIT_ENV, value);
+    }
+
+    if let Some(configured) = CONFIGURED_SERVICE_UNIT.get() {
+        return configured.clone();
     }
 
     std::fs::read_to_string("/proc/self/cgroup")

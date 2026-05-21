@@ -58,6 +58,12 @@ pub struct StackConfig {
     pub stack_mode: StackMode,
     pub debug_log: Option<String>,
 
+    /// Optional explicit systemd service unit name (e.g. "tetra", "tetra-flowstation",
+    /// "bluestation"). Used by SDS command control (restart/shutdown) and dashboard
+    /// OTA update. When unset, FlowStation auto-detects the unit from /proc/self/cgroup,
+    /// then falls back to "tetra". Override via env var FLOWSTATION_SERVICE_UNIT also works.
+    pub service_name: Option<String>,
+
     pub phy_io: CfgPhyIo,
     pub net: CfgNetInfo,
     pub cell: CfgCellInfo,

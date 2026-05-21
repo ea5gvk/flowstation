@@ -50,6 +50,46 @@ impl MmBs {
         }
     }
 
+    /// Force CMCE to release any individual P2P calls involving the given ISSI,
+    /// without touching Brew affiliations. Used on soft re-attach (e.g. MTP3550
+    /// 2s RF dropout) to prevent "PTT denied" caused by stale call state in CMCE.
+    ///
+    /// Implementation: sends Deregister to CMCE only (not Brew), then re-sends
+    /// Register + Affiliate so subscriber_groups and group_listener counts are
+    /// restored. Brew is not informed because the MS is still considered registered.
+    fn emit_individual_call_release_for_issi(&mut self, queue: &mut MessageQueue, issi: u32) {
+        let groups: Vec<u32> = self
+            .client_mgr
+            .get_client_by_issi(issi)
+            .map(|c| c.groups.iter().copied().collect())
+            .unwrap_or_default();
+
+        // CMCE Deregister: releases individual_calls + drops group_listener counts
+        let dereg = MmSubscriberUpdate { issi, groups: Vec::new(), action: BrewSubscriberAction::Deregister };
+        queue.push_back(SapMsg {
+            sap: Sap::Control, src: TetraEntity::Mm, dest: TetraEntity::Cmce,
+            msg: SapMsgInner::MmSubscriberUpdate(dereg),
+        });
+
+        // CMCE Register: re-introduces the ISSI as known
+        let reg = MmSubscriberUpdate { issi, groups: Vec::new(), action: BrewSubscriberAction::Register };
+        queue.push_back(SapMsg {
+            sap: Sap::Control, src: TetraEntity::Mm, dest: TetraEntity::Cmce,
+            msg: SapMsgInner::MmSubscriberUpdate(reg),
+        });
+
+        // CMCE Affiliate: restores group_listener counts so group calls still route
+        if !groups.is_empty() {
+            let aff = MmSubscriberUpdate { issi, groups, action: BrewSubscriberAction::Affiliate };
+            queue.push_back(SapMsg {
+                sap: Sap::Control, src: TetraEntity::Mm, dest: TetraEntity::Cmce,
+                msg: SapMsgInner::MmSubscriberUpdate(aff),
+            });
+        }
+
+        tracing::info!("MM: forced individual call release for ISSI {} (soft re-attach)", issi);
+    }
+
     fn emit_subscriber_update(&self, queue: &mut MessageQueue, issi: u32, groups: Vec<u32>, action: BrewSubscriberAction) {
         // If brew is active, forward subscriber updates to the Brew entity.
         // Register/Deregister must always be sent for brew-routable ISSIs,
@@ -284,11 +324,8 @@ impl MmBs {
                 // terminal — a PTT press in that window gets "no listeners" and the terminal
                 // interprets it as a network error and fully disconnects.
                 //
-                // Heuristic: treat RoamingLocationUpdating as a soft re-attach (no cleanup) if:
-                //   a) The terminal registered less than 120 seconds ago, OR
-                //   b) The terminal has an active individual (P2P) call — tearing it down mid-call
-                //      causes audible interruptions and "unit not attached" on the peer radio.
-                // If neither condition holds, treat as a genuine reboot.
+                // Heuristic: treat RoamingLocationUpdating as a soft re-attach (no cleanup) if
+                // the terminal registered less than 120 seconds ago.
                 let recently_registered = self.client_mgr
                     .get_client_by_issi(issi)
                     .map(|c| c.last_registration_time.elapsed().as_secs() < 120)
@@ -298,6 +335,13 @@ impl MmBs {
                         "MM: ISSI {} RoamingLocationUpdating within 120s of last register — treating as soft re-attach (Sepura post-PTT)",
                         issi
                     );
+                    // Even on soft re-attach, force CMCE to release any individual P2P calls
+                    // involving this ISSI. Terminals (e.g. Motorola MTP3550) that drop RF for
+                    // 2s and re-attach lose call state but BS keeps the call alive — next PTT
+                    // is rejected ("PTT denied") because the terminal doesn't recognize the call_id
+                    // in our D-TX-GRANTED. Releasing the individual call here forces a clean U-SETUP
+                    // on the next PTT.
+                    self.emit_individual_call_release_for_issi(queue, issi);
                     false
                 } else {
                     true

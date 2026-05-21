@@ -251,6 +251,14 @@ fn main() {
 
     let _log_guards = debug::setup_logging_default(cfg.config().debug_log.clone());
 
+    // Apply explicit systemd service name from config, if provided.
+    // Used by SDS command control (restart/shutdown) and dashboard OTA.
+    // Auto-detection from /proc/self/cgroup is still the fallback.
+    if let Some(ref service_name) = cfg.config().service_name {
+        tetra_entities::service_control::set_configured_service_unit(service_name);
+        tracing::info!("Service control: using configured service_name={}", service_name);
+    }
+
     // Log fallback immediately after logging is set up, even without dashboard.
     if let Some((ref fb_path, ref fb_reason)) = fallback_info {
         tracing::warn!(

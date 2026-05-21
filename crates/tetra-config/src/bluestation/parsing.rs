@@ -141,6 +141,7 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
     let mut cfg = StackConfig {
         stack_mode: root.stack_mode,
         debug_log: root.debug_log,
+        service_name: root.service_name,
         phy_io: phy_dto_to_cfg(root.phy_io),
         net: net_dto_to_cfg(root.net_info),
         cell: cell_cfg,
@@ -199,6 +200,8 @@ struct TomlConfigRoot {
     config_version: String,
     stack_mode: StackMode,
     debug_log: Option<String>,
+    #[serde(default)]
+    service_name: Option<String>,
 
     phy_io: PhyIoDto,
     net_info: NetInfoDto,

@@ -64,12 +64,19 @@ fn resolve_source_dir(override_dir: Option<&str>) -> Result<std::path::PathBuf, 
         p.join(".git").exists()
     }
 
+    fn is_acceptable_path(p: &std::path::Path) -> bool {
+        // Reject filesystem root, single-character paths, /usr, /bin, etc.
+        // These are never valid source directories and would just produce confusing errors.
+        let s = p.to_string_lossy();
+        s != "/" && s.len() > 6 && !matches!(s.as_ref(), "/usr" | "/bin" | "/sbin" | "/etc" | "/var" | "/tmp")
+    }
+
     let mut tried: Vec<String> = Vec::new();
 
     // 1. Explicit override from config.
     if let Some(dir) = override_dir {
         let path = std::path::PathBuf::from(dir);
-        if is_git_repo(&path) {
+        if is_git_repo(&path) && is_acceptable_path(&path) {
             return Ok(path);
         }
         tried.push(format!("{} (from config: not a git repo)", path.display()));
@@ -80,10 +87,8 @@ fn resolve_source_dir(override_dir: Option<&str>) -> Result<std::path::PathBuf, 
         let mut cur = exe.parent().map(|p| p.to_path_buf());
         for _ in 0..6 {
             let Some(p) = cur else { break };
-            // Don't accept "/" as a result — virtually never the right answer
-            // and walking past the root produces None anyway.
-            if p.parent().is_none() {
-                tried.push(format!("{} (filesystem root — skipped)", p.display()));
+            if !is_acceptable_path(&p) {
+                tried.push(format!("{} (rejected: system path or too shallow)", p.display()));
                 break;
             }
             if is_git_repo(&p) {
@@ -112,15 +117,25 @@ fn resolve_source_dir(override_dir: Option<&str>) -> Result<std::path::PathBuf, 
 
     // 4. Current working directory.
     if let Ok(cwd) = std::env::current_dir() {
-        if is_git_repo(&cwd) {
+        if is_git_repo(&cwd) && is_acceptable_path(&cwd) {
             return Ok(cwd);
         }
         tried.push(format!("{} (current working dir: not a git repo)", cwd.display()));
     }
 
     Err(format!(
-        "could not locate FlowStation git source. Set [dashboard].source_dir in config.toml \
-         to the absolute path of your git clone (e.g. source_dir = \"/opt/tetra-bluestation\"). \
+        "OTA update needs the FlowStation git source tree to be present on this machine, \
+         but none was found. You have two options:\n\
+         \n\
+         1) Clone the sources next to your binary:\n\
+            git clone https://github.com/razvanzeces/flowstation.git /opt/tetra-bluestation\n\
+            Then either move the binary into that tree, or set source_dir in config:\n\
+            [dashboard]\n\
+            source_dir = \"/opt/tetra-bluestation\"\n\
+         \n\
+         2) If your platform can't compile (e.g. Pi Zero), update manually by downloading \
+         the latest release binary from GitHub.\n\
+         \n\
          Paths tried: {}",
         if tried.is_empty() { "(none)".to_string() } else { tried.join("; ") }
     ))
