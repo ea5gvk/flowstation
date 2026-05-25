@@ -142,18 +142,6 @@ fn start_control_worker(cfg: SharedConfig, command_dispatchers: HashMap<TetraEnt
 fn build_bs_stack(cfg: &mut SharedConfig) -> (MessageRouter, Option<TelemetrySource>, HashMap<TetraEntity, CommandDispatcher>) {
     let mut router = MessageRouter::new(cfg.clone());
 
-    // Add suitable Phy component based on PhyIo type
-    match cfg.config().phy_io.backend {
-        PhyBackend::SoapySdr => {
-            let rxdev = RxTxDevSoapySdr::new(cfg);
-            let phy = PhyBs::new(cfg.clone(), rxdev);
-            router.register_entity(Box::new(phy));
-        }
-        _ => {
-            panic!("Unsupported PhyIo type: {:?}", cfg.config().phy_io.backend);
-        }
-    }
-
     // Build telemetry sink/source — always create if either telemetry or dashboard is enabled
     let needs_telemetry = cfg.config().telemetry.is_some() || cfg.config().dashboard.is_some();
     let (tsink, tsource) = if needs_telemetry {
@@ -162,6 +150,26 @@ fn build_bs_stack(cfg: &mut SharedConfig) -> (MessageRouter, Option<TelemetrySou
     } else {
         (None, None)
     };
+
+    // Add suitable Phy component based on PhyIo type
+    match cfg.config().phy_io.backend {
+        PhyBackend::SoapySdr => {
+            let rxdev = RxTxDevSoapySdr::with_telemetry(cfg, tsink.clone());
+            let phy = PhyBs::new(cfg.clone(), rxdev);
+            router.register_entity(Box::new(phy));
+        }
+        _ => {
+            panic!("Unsupported PhyIo type: {:?}", cfg.config().phy_io.backend);
+        }
+    }
+
+    // Background sys-health worker — reads /sys for temperatures, voltages,
+    // currents, power. Universal across host hardware: RPi 5 (full PMIC),
+    // RPi 4 (CPU temp), x86 desktop (RAPL + motherboard sensors), laptops
+    // (battery). Falls back gracefully if nothing is available.
+    if let Some(ref sink) = tsink {
+        tetra_entities::sys_telemetry::spawn_sys_health(sink.clone());
+    }
 
     // Always build control links — dashboard needs them even without external control server
     let (mut c_d, mut c_e) = build_all_control_links();

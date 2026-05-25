@@ -58,6 +58,57 @@ pub struct DashboardStateInner {
     /// Contains the parse error that caused the primary config to be rejected.
     pub fallback_config_active: bool,
     pub fallback_config_reason: String,
+    /// Most recent fast visual snapshot (spectrum + IQ + RMS/peak). Sent on init
+    /// so the RF page paints instantly on connect.
+    pub last_tx_visual: Option<TxVisualSnapshot>,
+    /// Most recent slow quality snapshot (EVM, PAPR, etc).
+    pub last_tx_quality: Option<TxQualitySnapshot>,
+    /// Most recent SDR hardware health snapshot.
+    pub last_sdr_health: Option<SdrHealthSnapshot>,
+    /// Most recent host system health snapshot (temps, voltages, power).
+    pub last_sys_health: Option<SysHealthSnapshot>,
+}
+
+/// Fast-path visual snapshot — spectrum + IQ + RMS/peak. Refreshed several times
+/// per second so the RF page renders fluidly.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TxVisualSnapshot {
+    pub sample_rate: f32,
+    pub center_freq_hz: f64,
+    pub rms_dbfs: f32,
+    pub peak_dbfs: f32,
+    pub spectrum_db_tenths: Vec<i16>,
+    pub constellation_iq: Vec<i16>,
+}
+
+/// Slow-path quality snapshot — derived metrics shown on the RF page as stable
+/// readouts. Refreshed once per second.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TxQualitySnapshot {
+    pub papr_db: f32,
+    pub evm_pct: f32,
+    pub dc_offset_i: f32,
+    pub dc_offset_q: f32,
+    pub iq_amplitude_imbalance_db: f32,
+    pub iq_phase_imbalance_deg: f32,
+    pub carrier_leakage_db: f32,
+    pub occupied_bandwidth_hz: f32,
+}
+
+/// Snapshot of host system health (temperatures, voltages, currents, power).
+/// Mirrored from TelemetryEvent::SysHealth.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SysHealthSnapshot {
+    pub total_power_w: Option<f32>,
+    pub sensors: Vec<crate::net_telemetry::events::SysSensor>,
+}
+
+/// SDR hardware health snapshot, mirrored from TelemetryEvent::SdrHealth.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SdrHealthSnapshot {
+    pub temperature_c: Option<f32>,
+    pub tx_gains: Vec<(String, f32)>,
+    pub rx_gains: Vec<(String, f32)>,
 }
 
 pub const LAST_HEARD_MAX: usize = 50;
@@ -99,6 +150,10 @@ impl DashboardStateInner {
             brew_version: 0,
             fallback_config_active: false,
             fallback_config_reason: String::new(),
+            last_tx_visual: None,
+            last_tx_quality: None,
+            last_sdr_health: None,
+            last_sys_health: None,
         }
     }
 

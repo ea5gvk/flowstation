@@ -19,6 +19,7 @@ pub mod net_dashboard;
 pub mod net_telemetry;
 
 pub mod service_control;
+pub mod sys_telemetry;
 
 // Re-export commonly used items from router
 pub use entity_trait::TetraEntityTrait;

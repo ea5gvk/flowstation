@@ -246,6 +246,55 @@ body{
 }
 .sdr-badge-label{white-space:nowrap;}
 
+/* Host power-draw badge: lives next to the SDR badge, uses a violet accent so
+   it's visually distinct from the SDR (teal) badge. Hidden when sys_telemetry
+   can't find any power-capable sensor on the host. */
+.pwr-badge{
+  display:flex;align-items:center;gap:6px;
+  padding:5px 10px;
+  background:rgba(167,114,232,0.10);
+  border:1px solid rgba(167,114,232,0.35);
+  border-radius:6px;
+  font-family:var(--mono);font-size:10px;font-weight:600;
+  letter-spacing:0.05em;
+  color:#c8a4f5;
+  margin-left:6px;
+  cursor:default;
+  transition:background 0.15s;
+}
+.pwr-badge:hover{background:rgba(167,114,232,0.18);}
+.pwr-badge-icon{
+  font-size:11px;line-height:1;
+  filter:drop-shadow(0 0 4px rgba(167,114,232,0.5));
+}
+.pwr-badge-label{white-space:nowrap;}
+[data-theme="light"] .pwr-badge{
+  background:rgba(123,68,200,0.08);
+  border-color:rgba(123,68,200,0.3);
+  color:#6432aa;
+}
+
+/* Host hardware sensor tiles on the System tab. Compact, single-line per
+   sensor, monospace numbers so columns of values line up visually. */
+.sys-sensor-tile{
+  background:var(--bg);border:1px solid var(--border);border-radius:6px;
+  padding:8px 10px;
+  display:flex;flex-direction:column;gap:3px;
+  min-width:0;
+}
+.sys-sensor-label{
+  font-family:var(--mono);font-size:9px;font-weight:600;
+  letter-spacing:0.05em;text-transform:uppercase;color:var(--text3);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.sys-sensor-value{
+  font-family:var(--mono);font-size:13px;font-weight:600;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.sys-sensor-unit{
+  font-size:10px;font-weight:500;color:var(--text3);margin-left:2px;
+}
+
 /* Logout button: muted icon in topbar, becomes warning-red on hover. */
 .logout-btn{
   width:30px;height:30px;
@@ -418,6 +467,152 @@ td code{
   padding:4px 8px;border-radius:6px;font-family:var(--mono);font-size:11px;
 }
 .autoscroll-label{display:flex;align-items:center;gap:5px;font-family:var(--mono);font-size:11px;color:var(--text2);cursor:pointer;}
+
+/* ── RF live monitor ─────────────────────────────────────────────────────── */
+.rf-metrics{
+  display:grid;
+  grid-template-columns:repeat(5, 1fr);
+  gap:10px;
+  margin-bottom:12px;
+}
+.rf-metric{
+  background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);
+  padding:10px 14px;
+  display:flex;flex-direction:column;gap:4px;
+  min-width:0;
+}
+.rf-metric-label{
+  font-family:var(--mono);font-size:9px;font-weight:600;
+  letter-spacing:0.08em;text-transform:uppercase;color:var(--text3);
+}
+.rf-metric-value{
+  font-family:var(--mono);font-size:15px;font-weight:600;color:var(--text);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.rf-grid{
+  display:grid;
+  grid-template-columns:2fr 1fr;
+  gap:12px;
+}
+.rf-panel{
+  background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);
+  padding:14px;
+  display:flex;flex-direction:column;gap:10px;
+}
+.rf-panel-title{
+  display:flex;align-items:center;justify-content:space-between;
+  font-family:var(--mono);font-size:10px;font-weight:700;
+  letter-spacing:0.08em;text-transform:uppercase;color:var(--text2);
+}
+.rf-hint{font-weight:500;color:var(--text3);text-transform:none;letter-spacing:0;font-size:10px;}
+.rf-canvas{
+  width:100%;
+  height:260px;
+  background:var(--bg);border:1px solid var(--border);border-radius:6px;
+  display:block;
+}
+.rf-canvas.small{height:260px;}
+
+@media(max-width:900px){
+  .rf-grid{grid-template-columns:1fr;}
+  .rf-metrics{grid-template-columns:repeat(2, 1fr);}
+}
+@media(max-width:500px){
+  .rf-metrics{grid-template-columns:1fr 1fr;gap:6px;}
+  .rf-metric{padding:8px 10px;}
+  .rf-metric-value{font-size:13px;}
+  .rf-canvas{height:200px;}
+  .rf-panel{padding:10px;}
+}
+
+/* ── RF signal-quality card ──────────────────────────────────────────── */
+/* Each metric is a small tile: label, value, and a bar that fills horizontally
+   with a colour reflecting health (green/amber/red). The bar replaces the need
+   for a separate badge and gives an at-a-glance read of the whole panel. */
+.rf-quality-card{
+  background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);
+  padding:14px;margin-top:12px;
+  display:flex;flex-direction:column;gap:14px;
+}
+.rf-quality-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fit, minmax(160px, 1fr));
+  gap:10px;
+}
+.rf-qmetric{
+  background:var(--bg);border:1px solid var(--border);border-radius:6px;
+  padding:10px 12px;
+  display:flex;flex-direction:column;gap:6px;
+  min-width:0;
+}
+.rf-qmetric-label{
+  font-family:var(--mono);font-size:9px;font-weight:600;
+  letter-spacing:0.08em;text-transform:uppercase;color:var(--text3);
+}
+.rf-qmetric-value{
+  font-family:var(--mono);font-size:14px;font-weight:600;color:var(--text);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.rf-qmetric-bar{
+  height:4px;background:var(--bg3);border-radius:2px;overflow:hidden;
+  margin-top:2px;
+}
+.rf-qmetric-fill{
+  height:100%;width:0%;background:var(--accent);
+  transition:width 0.4s ease, background 0.3s;
+  border-radius:2px;
+}
+/* Status colouring is driven by JS via these classes */
+.rf-q-good .rf-qmetric-fill{background:var(--accent);}
+.rf-q-warn .rf-qmetric-fill{background:#f5a623;}
+.rf-q-bad  .rf-qmetric-fill{background:var(--danger);}
+.rf-q-good .rf-qmetric-value{color:var(--accent);}
+.rf-q-warn .rf-qmetric-value{color:#f5a623;}
+.rf-q-bad  .rf-qmetric-value{color:var(--danger);}
+
+/* ── Hardware health card ────────────────────────────────────────────── */
+.rf-hw-grid{
+  display:grid;
+  grid-template-columns:200px 1fr 1fr;
+  gap:16px;
+}
+.rf-hw-temp{
+  background:var(--bg);border:1px solid var(--border);border-radius:6px;
+  padding:14px;
+  display:flex;flex-direction:column;gap:6px;
+}
+.rf-hw-temp-value{
+  font-family:var(--mono);font-size:28px;font-weight:700;color:var(--text);
+  line-height:1;
+}
+.rf-hw-temp-state{
+  font-family:var(--mono);font-size:10px;font-weight:600;
+  letter-spacing:0.08em;text-transform:uppercase;
+}
+.rf-hw-temp-state.cold{color:var(--accent2);}
+.rf-hw-temp-state.nominal{color:var(--accent);}
+.rf-hw-temp-state.warm{color:#f5a623;}
+.rf-hw-temp-state.hot{color:var(--danger);}
+.rf-hw-gain-block{
+  background:var(--bg);border:1px solid var(--border);border-radius:6px;
+  padding:14px;
+  display:flex;flex-direction:column;gap:6px;
+  min-width:0;
+}
+.rf-hw-gain-list{
+  display:flex;flex-direction:column;gap:4px;
+  font-family:var(--mono);font-size:12px;
+}
+.rf-hw-gain-row{
+  display:flex;justify-content:space-between;
+  color:var(--text2);
+}
+.rf-hw-gain-row .stage{color:var(--text3);}
+.rf-hw-gain-row .val{color:var(--text);font-weight:600;}
+
+@media(max-width:900px){
+  .rf-hw-grid{grid-template-columns:1fr;}
+}
 
 /* ── Config editor ── */
 #config-editor{
@@ -727,6 +922,10 @@ td code{
       <span class="nav-icon">📋</span>
       <span class="nav-label" data-i18n="log">LOG</span>
     </div>
+    <div class="nav-item" onclick="showPage('rf',this)" id="nav-rf">
+      <span class="nav-icon">⚡</span>
+      <span class="nav-label" data-i18n="rf">RF</span>
+    </div>
 
     <div class="nav-section-label" data-i18n-section="manage">MANAGE</div>
     <div class="nav-item" onclick="showPage('config',this)" id="nav-config">
@@ -778,6 +977,13 @@ td code{
     <div id="sdr-badge" class="sdr-badge" style="display:none" title="Detected SDR hardware">
       <span class="sdr-badge-dot"></span>
       <span class="sdr-badge-label" id="sdr-badge-label">—</span>
+    </div>
+
+    <!-- Host power-draw badge — populated from /sys via sys_telemetry. Stays hidden
+         when no power-capable sensor is found (e.g. non-Pi, non-x86 hosts). -->
+    <div id="pwr-badge" class="pwr-badge" style="display:none" title="Host system power draw">
+      <span class="pwr-badge-icon">⚡</span>
+      <span class="pwr-badge-label" id="pwr-badge-label">—</span>
     </div>
 
     <div class="topbar-right">
@@ -1009,6 +1215,133 @@ td code{
       </div>
     </div>
 
+    <!-- ── RF ── -->
+    <!-- Live TX DSP monitor — works on any SDR because the analysis is done on the
+         complex baseband samples FlowStation generates internally, BEFORE they reach
+         the radio. We do not rely on receive-side feedback. -->
+    <div class="page" id="page-rf">
+
+      <!-- Top stat strip: instantaneous big-number metrics -->
+      <div class="rf-metrics">
+        <div class="rf-metric">
+          <div class="rf-metric-label" data-i18n="rf_freq">Center freq</div>
+          <div class="rf-metric-value" id="rf-freq">—</div>
+        </div>
+        <div class="rf-metric">
+          <div class="rf-metric-label" data-i18n="rf_rate">Sample rate</div>
+          <div class="rf-metric-value" id="rf-rate">—</div>
+        </div>
+        <div class="rf-metric">
+          <div class="rf-metric-label" data-i18n="rf_rms">RMS</div>
+          <div class="rf-metric-value" id="rf-rms">—</div>
+        </div>
+        <div class="rf-metric">
+          <div class="rf-metric-label" data-i18n="rf_peak">Peak</div>
+          <div class="rf-metric-value" id="rf-peak">—</div>
+        </div>
+        <div class="rf-metric">
+          <div class="rf-metric-label" data-i18n="rf_age">Snapshot</div>
+          <div class="rf-metric-value" id="rf-age" data-i18n="rf_waiting">waiting…</div>
+        </div>
+      </div>
+
+      <!-- Visualizers grid: spectrum + constellation -->
+      <div class="rf-grid">
+        <div class="rf-panel">
+          <div class="rf-panel-title">
+            <span data-i18n="rf_spectrum">TX DSP Spectrum (pre-PA)</span>
+            <span class="rf-hint" data-i18n="rf_hint_spectrum">live · 512-bin FFT</span>
+          </div>
+          <canvas id="rf-spectrum" class="rf-canvas" width="900" height="260"></canvas>
+        </div>
+        <div class="rf-panel">
+          <div class="rf-panel-title">
+            <span data-i18n="rf_constellation">TX DSP Constellation</span>
+            <span class="rf-hint" data-i18n="rf_hint_constellation">π/4-DQPSK</span>
+          </div>
+          <canvas id="rf-constellation" class="rf-canvas small" width="420" height="260"></canvas>
+        </div>
+      </div>
+
+      <!-- Waterfall: time-vs-frequency heatmap, scrolls downward -->
+      <div class="rf-panel" style="margin-top:12px">
+        <div class="rf-panel-title">
+          <span data-i18n="rf_waterfall">TX Spectrum Waterfall</span>
+          <span class="rf-hint" data-i18n="rf_hint_waterfall">rolling · viridis</span>
+        </div>
+        <canvas id="rf-waterfall" class="rf-canvas" style="height:320px"></canvas>
+      </div>
+
+      <!-- Signal Quality strip — derived metrics with health badges (good/warn/bad) -->
+      <div class="rf-quality-card">
+        <div class="rf-panel-title">
+          <span data-i18n="rf_quality">Signal Quality</span>
+          <span class="rf-hint" data-i18n="rf_hint_quality">measured pre-PA · derived from same DSP snapshot</span>
+        </div>
+        <div class="rf-quality-grid">
+          <div class="rf-qmetric" id="rf-q-evm-wrap">
+            <div class="rf-qmetric-label" data-i18n="rf_evm">EVM</div>
+            <div class="rf-qmetric-value" id="rf-evm">—</div>
+            <div class="rf-qmetric-bar"><div class="rf-qmetric-fill" id="rf-evm-bar"></div></div>
+          </div>
+          <div class="rf-qmetric" id="rf-q-papr-wrap">
+            <div class="rf-qmetric-label" data-i18n="rf_papr">PAPR</div>
+            <div class="rf-qmetric-value" id="rf-papr">—</div>
+            <div class="rf-qmetric-bar"><div class="rf-qmetric-fill" id="rf-papr-bar"></div></div>
+          </div>
+          <div class="rf-qmetric" id="rf-q-cl-wrap">
+            <div class="rf-qmetric-label" data-i18n="rf_carrier">Carrier leak</div>
+            <div class="rf-qmetric-value" id="rf-carrier">—</div>
+            <div class="rf-qmetric-bar"><div class="rf-qmetric-fill" id="rf-carrier-bar"></div></div>
+          </div>
+          <div class="rf-qmetric" id="rf-q-obw-wrap">
+            <div class="rf-qmetric-label" data-i18n="rf_obw">Occupied BW (99%)</div>
+            <div class="rf-qmetric-value" id="rf-obw">—</div>
+            <div class="rf-qmetric-bar"><div class="rf-qmetric-fill" id="rf-obw-bar"></div></div>
+          </div>
+          <div class="rf-qmetric" id="rf-q-dc-wrap">
+            <div class="rf-qmetric-label" data-i18n="rf_dc">DC offset (I/Q)</div>
+            <div class="rf-qmetric-value" id="rf-dc">—</div>
+            <div class="rf-qmetric-bar"><div class="rf-qmetric-fill" id="rf-dc-bar"></div></div>
+          </div>
+          <div class="rf-qmetric" id="rf-q-iqa-wrap">
+            <div class="rf-qmetric-label" data-i18n="rf_iqa">IQ amplitude imbalance</div>
+            <div class="rf-qmetric-value" id="rf-iqa">—</div>
+            <div class="rf-qmetric-bar"><div class="rf-qmetric-fill" id="rf-iqa-bar"></div></div>
+          </div>
+          <div class="rf-qmetric" id="rf-q-iqp-wrap">
+            <div class="rf-qmetric-label" data-i18n="rf_iqp">IQ phase imbalance</div>
+            <div class="rf-qmetric-value" id="rf-iqp">—</div>
+            <div class="rf-qmetric-bar"><div class="rf-qmetric-fill" id="rf-iqp-bar"></div></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Hardware Health — temperature + actual gain readback from the SDR. Updated every ~5s. -->
+      <div class="rf-quality-card">
+        <div class="rf-panel-title">
+          <span data-i18n="rf_hw_health">Hardware Health</span>
+          <span class="rf-hint"><span data-i18n="rf_hint_health">polled every 5s</span> · <span id="rf-hw-age">—</span></span>
+        </div>
+        <div class="rf-hw-grid">
+          <div class="rf-hw-temp">
+            <div class="rf-qmetric-label" data-i18n="rf_temp">SDR Temperature</div>
+            <div class="rf-hw-temp-value" id="rf-temp">—</div>
+            <div class="rf-hw-temp-state" id="rf-temp-state">—</div>
+          </div>
+          <div class="rf-hw-gain-block">
+            <div class="rf-qmetric-label" data-i18n="rf_tx_gain">TX Gain Stages (actual)</div>
+            <div class="rf-hw-gain-list" id="rf-tx-gains">—</div>
+          </div>
+          <div class="rf-hw-gain-block">
+            <div class="rf-qmetric-label" data-i18n="rf_rx_gain">RX Gain Stages (actual)</div>
+            <div class="rf-hw-gain-list" id="rf-rx-gains">—</div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
     <!-- ── CONFIG ── -->
     <div class="page" id="page-config">
       <div class="card">
@@ -1102,6 +1435,22 @@ td code{
         </div>
         <div class="card-body">
           <pre id="sysSoapy" style="font-family:var(--mono);font-size:11px;color:var(--text2);white-space:pre-wrap;word-break:break-all;margin:0;padding:0">—</pre>
+        </div>
+      </div>
+
+      <!-- Host hardware sensors (temps, voltages, currents, power) -->
+      <!-- Populated from /sys via sys_telemetry. Layout adapts: if no sensors are
+           found (non-Linux, locked-down kernel) the whole card is hidden. -->
+      <div class="card" id="sys-sensors-card" style="display:none">
+        <div class="card-head">
+          <div class="card-title" data-i18n="sys_sensors">Host Hardware Sensors</div>
+          <div class="card-actions">
+            <span id="sys-sensors-power-total" style="font-family:var(--mono);font-size:12px;color:#c8a4f5;font-weight:600"></span>
+          </div>
+        </div>
+        <div class="card-body" style="padding:14px 18px">
+          <div id="sys-sensors-empty" style="font-size:12px;color:var(--text3);font-style:italic;display:none" data-i18n="sys_sensors_empty">No sensors detected on this host.</div>
+          <div id="sys-sensors-grid" style="display:grid;grid-template-columns:repeat(auto-fill, minmax(160px, 1fr));gap:8px"></div>
         </div>
       </div>
 
@@ -1207,7 +1556,20 @@ const LANGS={
   en:{
     bts_ip:'BTS IP',offline:'OFFLINE',online:'ONLINE',
     brew_online:'ONLINE',brew_offline:'OFFLINE',
-    stations:'Radios',calls:'Calls',lastheard:'Last Heard',log:'Log',config:'Config',
+    stations:'Radios',calls:'Calls',lastheard:'Last Heard',log:'Log',rf:'RF',config:'Config',
+    rf_freq:'Center freq',rf_rate:'Sample rate',rf_rms:'RMS',rf_peak:'Peak',rf_age:'Snapshot',
+    rf_waiting:'waiting…',rf_live:'live',rf_stale:'stale',
+    rf_spectrum:'TX DSP Spectrum (pre-PA)',rf_constellation:'TX DSP Constellation',
+    rf_hint_spectrum:'live · 512-bin FFT',rf_hint_constellation:'π/4-DQPSK',
+    rf_waterfall:'TX Spectrum Waterfall',rf_hint_waterfall:'rolling · viridis',
+    rf_quality:'Signal Quality',rf_hint_quality:'measured pre-PA · derived from same DSP snapshot',
+    rf_evm:'EVM',rf_papr:'PAPR',rf_carrier:'Carrier leak',rf_obw:'Occupied BW (99%)',
+    rf_dc:'DC offset (I/Q)',rf_iqa:'IQ amplitude imbalance',rf_iqp:'IQ phase imbalance',
+    rf_hw_health:'Hardware Health',rf_hint_health:'polled every 5s',
+    rf_temp:'SDR Temperature',rf_tx_gain:'TX Gain Stages (actual)',rf_rx_gain:'RX Gain Stages (actual)',
+    rf_temp_cold:'cold',rf_temp_nominal:'nominal',rf_temp_warm:'warm',rf_temp_hot:'hot',rf_temp_na:'no sensor',
+    rf_no_gains:'unavailable',rf_just_now:'just now',
+
     terminals:'Radios',registered:'registered',
     active_calls:'Active Calls',circuits:'circuits in use',
     registered_terminals:'Registered Radios',
@@ -1244,7 +1606,7 @@ const LANGS={
     system:'System',sys_info:'System Info',sys_hostname:'Hostname',sys_uptime:'Uptime',
     sys_version:'FS Version',sys_os:'OS',sys_config:'Active Config',
     sys_cpu:'CPU',sys_cpu_load:'CPU Load',sys_ram:'RAM',sys_temp:'CPU Temp',
-    sys_rf:'RF Hardware (SoapySDR)',sys_autorefresh:'Auto-refresh 5s',
+    sys_sensors:'Host Hardware Sensors',sys_sensors_empty:'No sensors detected on this host.',sys_rf:'RF Hardware (SoapySDR)',sys_autorefresh:'Auto-refresh 5s',
     profile_edit_title:'Edit Config Profile',profile_edit_btn:'Edit',
     profile_edit_save_ok:'✓ Saved',profile_edit_save_fail:'✗ Save failed',
     sys_os:'OS',sys_version:'FS Version',sys_config:'Active Config',
@@ -1256,7 +1618,20 @@ const LANGS={
   ro:{
     bts_ip:'IP BTS',offline:'DECONECTAT',online:'CONECTAT',
     brew_online:'ONLINE',brew_offline:'OFFLINE',
-    stations:'Radiouri',calls:'Apeluri',lastheard:'Ultima Activitate',log:'Log',config:'Config',
+    stations:'Radiouri',calls:'Apeluri',lastheard:'Ultima Activitate',log:'Log',rf:'RF',config:'Config',
+    rf_freq:'Frecvență centru',rf_rate:'Rată eșantion',rf_rms:'RMS',rf_peak:'Vârf',rf_age:'Captură',
+    rf_waiting:'în așteptare…',rf_live:'live',rf_stale:'expirat',
+    rf_spectrum:'Spectru TX DSP (pre-PA)',rf_constellation:'Constelație TX DSP',
+    rf_hint_spectrum:'live · FFT 512-bin',rf_hint_constellation:'π/4-DQPSK',
+    rf_waterfall:'Cascadă Spectru TX',rf_hint_waterfall:'derulant · viridis',
+    rf_quality:'Calitate Semnal',rf_hint_quality:'măsurat pre-PA · din același snapshot DSP',
+    rf_evm:'EVM',rf_papr:'PAPR',rf_carrier:'Scurgere portantă',rf_obw:'Bandă ocupată (99%)',
+    rf_dc:'Offset DC (I/Q)',rf_iqa:'Dezechilibru amplitudine IQ',rf_iqp:'Dezechilibru fază IQ',
+    rf_hw_health:'Stare Hardware',rf_hint_health:'citit la 5s',
+    rf_temp:'Temperatură SDR',rf_tx_gain:'Câștig TX (actual)',rf_rx_gain:'Câștig RX (actual)',
+    rf_temp_cold:'rece',rf_temp_nominal:'nominal',rf_temp_warm:'cald',rf_temp_hot:'fierbinte',rf_temp_na:'fără senzor',
+    rf_no_gains:'indisponibil',rf_just_now:'acum',
+
     terminals:'Radiouri',registered:'înregistrate',
     active_calls:'Apeluri Active',circuits:'circuite active',
     registered_terminals:'Radiouri Înregistrate',
@@ -1293,7 +1668,7 @@ const LANGS={
     system:'Sistem',sys_info:'Info Sistem',sys_hostname:'Hostname',sys_uptime:'Uptime',
     sys_os:'OS',sys_version:'Versiune FS',sys_config:'Config Activ',
     sys_cpu:'CPU',sys_cpu_load:'Încărcare CPU',sys_ram:'RAM',sys_temp:'Temp CPU',
-    sys_rf:'Hardware RF (SoapySDR)',sys_autorefresh:'Auto-refresh 5s',
+    sys_sensors:'Senzori Hardware Gazdă',sys_sensors_empty:'Niciun senzor detectat.',sys_rf:'Hardware RF (SoapySDR)',sys_autorefresh:'Auto-refresh 5s',
     profile_edit_title:'Editare Profil Config',profile_edit_btn:'Editează',
     profile_edit_save_ok:'✓ Salvat',profile_edit_save_fail:'✗ Salvare eșuată',
     sys_profiles:'Profile Config',sys_activate:'Activează & Repornire',
@@ -1304,7 +1679,20 @@ const LANGS={
   de:{
     bts_ip:'BTS-IP',offline:'OFFLINE',online:'ONLINE',
     brew_online:'ONLINE',brew_offline:'OFFLINE',
-    stations:'Radios',calls:'Anrufe',lastheard:'Zuletzt Gehört',log:'Log',config:'Config',
+    stations:'Radios',calls:'Anrufe',lastheard:'Zuletzt Gehört',log:'Log',rf:'RF',config:'Config',
+    rf_freq:'Mittenfrequenz',rf_rate:'Abtastrate',rf_rms:'RMS',rf_peak:'Spitze',rf_age:'Aufnahme',
+    rf_waiting:'wartet…',rf_live:'live',rf_stale:'veraltet',
+    rf_spectrum:'TX-DSP-Spektrum (vor PA)',rf_constellation:'TX-DSP-Konstellation',
+    rf_hint_spectrum:'live · 512-bin FFT',rf_hint_constellation:'π/4-DQPSK',
+    rf_waterfall:'TX-Spektrum-Wasserfall',rf_hint_waterfall:'rollend · viridis',
+    rf_quality:'Signalqualität',rf_hint_quality:'gemessen vor PA · aus selbem DSP-Snapshot',
+    rf_evm:'EVM',rf_papr:'PAPR',rf_carrier:'Trägerleckage',rf_obw:'Belegte BW (99%)',
+    rf_dc:'DC-Offset (I/Q)',rf_iqa:'IQ-Amplitudenungleichgewicht',rf_iqp:'IQ-Phasenungleichgewicht',
+    rf_hw_health:'Hardware-Zustand',rf_hint_health:'alle 5s abgefragt',
+    rf_temp:'SDR-Temperatur',rf_tx_gain:'TX-Verstärkung (aktuell)',rf_rx_gain:'RX-Verstärkung (aktuell)',
+    rf_temp_cold:'kalt',rf_temp_nominal:'nominal',rf_temp_warm:'warm',rf_temp_hot:'heiß',rf_temp_na:'kein Sensor',
+    rf_no_gains:'nicht verfügbar',rf_just_now:'gerade eben',
+
     terminals:'Radios',registered:'registriert',
     active_calls:'Aktive Anrufe',circuits:'Schaltkreise aktiv',
     registered_terminals:'Registrierte Radios',
@@ -1341,7 +1729,7 @@ const LANGS={
     system:'System',sys_info:'Systeminfo',sys_hostname:'Hostname',sys_uptime:'Laufzeit',
     sys_os:'OS',sys_version:'FS-Version',sys_config:'Aktive Konfig',
     sys_cpu:'CPU',sys_cpu_load:'CPU-Auslastung',sys_ram:'RAM',sys_temp:'CPU-Temp',
-    sys_rf:'RF-Hardware (SoapySDR)',sys_autorefresh:'Auto-Aktualisierung 5s',
+    sys_sensors:'Host-Hardware-Sensoren',sys_sensors_empty:'Keine Sensoren erkannt.',sys_rf:'RF-Hardware (SoapySDR)',sys_autorefresh:'Auto-Aktualisierung 5s',
     profile_edit_title:'Konfigprofil bearbeiten',profile_edit_btn:'Bearbeiten',
     profile_edit_save_ok:'✓ Gespeichert',profile_edit_save_fail:'✗ Speichern fehlgeschlagen',
     sys_profiles:'Konfigprofile',sys_activate:'Aktivieren & Neustart',
@@ -1352,7 +1740,20 @@ const LANGS={
   es:{
     bts_ip:'IP BTS',offline:'SIN CONEXIÓN',online:'EN LÍNEA',
     brew_online:'EN LÍNEA',brew_offline:'SIN CONEXIÓN',
-    stations:'Radios',calls:'Llamadas',lastheard:'Última Actividad',log:'Log',config:'Config',
+    stations:'Radios',calls:'Llamadas',lastheard:'Última Actividad',log:'Log',rf:'RF',config:'Config',
+    rf_freq:'Frecuencia central',rf_rate:'Tasa de muestreo',rf_rms:'RMS',rf_peak:'Pico',rf_age:'Captura',
+    rf_waiting:'esperando…',rf_live:'en vivo',rf_stale:'obsoleto',
+    rf_spectrum:'Espectro TX DSP (pre-PA)',rf_constellation:'Constelación TX DSP',
+    rf_hint_spectrum:'en vivo · FFT 512-bin',rf_hint_constellation:'π/4-DQPSK',
+    rf_waterfall:'Cascada Espectro TX',rf_hint_waterfall:'desplazándose · viridis',
+    rf_quality:'Calidad de Señal',rf_hint_quality:'medido pre-PA · del mismo snapshot DSP',
+    rf_evm:'EVM',rf_papr:'PAPR',rf_carrier:'Fuga portadora',rf_obw:'BW ocupada (99%)',
+    rf_dc:'Offset DC (I/Q)',rf_iqa:'Desequilibrio amplitud IQ',rf_iqp:'Desequilibrio fase IQ',
+    rf_hw_health:'Estado Hardware',rf_hint_health:'consultado cada 5s',
+    rf_temp:'Temperatura SDR',rf_tx_gain:'Ganancia TX (real)',rf_rx_gain:'Ganancia RX (real)',
+    rf_temp_cold:'frío',rf_temp_nominal:'nominal',rf_temp_warm:'caliente',rf_temp_hot:'muy caliente',rf_temp_na:'sin sensor',
+    rf_no_gains:'no disponible',rf_just_now:'ahora',
+
     terminals:'Radios',registered:'registrados',
     active_calls:'Llamadas Activas',circuits:'circuitos en uso',
     registered_terminals:'Radios Registrados',
@@ -1389,7 +1790,7 @@ const LANGS={
     system:'Sistema',sys_info:'Info del Sistema',sys_hostname:'Hostname',sys_uptime:'Tiempo activo',
     sys_os:'OS',sys_version:'Versión FS',sys_config:'Config Activa',
     sys_cpu:'CPU',sys_cpu_load:'Carga CPU',sys_ram:'RAM',sys_temp:'Temp CPU',
-    sys_rf:'Hardware RF (SoapySDR)',sys_autorefresh:'Auto-actualización 5s',
+    sys_sensors:'Sensores del Sistema',sys_sensors_empty:'No se detectaron sensores.',sys_rf:'Hardware RF (SoapySDR)',sys_autorefresh:'Auto-actualización 5s',
     profile_edit_title:'Editar Perfil Config',profile_edit_btn:'Editar',
     profile_edit_save_ok:'✓ Guardado',profile_edit_save_fail:'✗ Error al guardar',
     sys_profiles:'Perfiles de Config',sys_activate:'Activar y Reiniciar',
@@ -1400,7 +1801,20 @@ const LANGS={
   hu:{
     bts_ip:'BTS IP',offline:'OFFLINE',online:'ONLINE',
     brew_online:'ONLINE',brew_offline:'OFFLINE',
-    stations:'Rádiók',calls:'Hívások',lastheard:'Utoljára Hallott',log:'Napló',config:'Konfig',
+    stations:'Rádiók',calls:'Hívások',lastheard:'Utoljára Hallott',log:'Napló',rf:'RF',config:'Konfig',
+    rf_freq:'Központi frekvencia',rf_rate:'Mintavételezési ráta',rf_rms:'RMS',rf_peak:'Csúcs',rf_age:'Pillanatkép',
+    rf_waiting:'várakozás…',rf_live:'élő',rf_stale:'elavult',
+    rf_spectrum:'TX DSP spektrum (PA előtt)',rf_constellation:'TX DSP konstelláció',
+    rf_hint_spectrum:'élő · 512-bin FFT',rf_hint_constellation:'π/4-DQPSK',
+    rf_waterfall:'TX Spektrum Vízesés',rf_hint_waterfall:'gördülő · viridis',
+    rf_quality:'Jelminőség',rf_hint_quality:'PA előtt mérve · ugyanazon DSP pillanatképből',
+    rf_evm:'EVM',rf_papr:'PAPR',rf_carrier:'Vivőszivárgás',rf_obw:'Foglalt sávszélesség (99%)',
+    rf_dc:'DC eltolás (I/Q)',rf_iqa:'IQ amplitúdó egyensúlytalanság',rf_iqp:'IQ fázis egyensúlytalanság',
+    rf_hw_health:'Hardver állapot',rf_hint_health:'5 másodpercenként',
+    rf_temp:'SDR hőmérséklet',rf_tx_gain:'TX erősítés (aktuális)',rf_rx_gain:'RX erősítés (aktuális)',
+    rf_temp_cold:'hideg',rf_temp_nominal:'normál',rf_temp_warm:'meleg',rf_temp_hot:'forró',rf_temp_na:'nincs szenzor',
+    rf_no_gains:'nem elérhető',rf_just_now:'most',
+
     terminals:'Rádiók',registered:'regisztrált',
     active_calls:'Aktív hívások',circuits:'aktív áramkör',
     registered_terminals:'Regisztrált rádiók',
@@ -1435,11 +1849,25 @@ const LANGS={
     sys_active_badge:'AKTÍV',sys_no_profiles:'Nem található .toml profil a könyvtárban.',
     sys_activate_confirm:'Váltás a(z) "{name}" profilra és újraindítás?\nAz aktuális konfig mentésre kerül.',
     sys_bts:'BTS kapcsolat',
+    sys_sensors:'Gazdagép szenzorok',sys_sensors_empty:'Nem észlelhetők szenzorok.',
   },
   zh:{
     bts_ip:'BTS IP',offline:'离线',online:'在线',
     brew_online:'在线',brew_offline:'离线',
-    stations:'终端',calls:'通话',lastheard:'最近通话',log:'日志',config:'配置',
+    stations:'终端',calls:'通话',lastheard:'最近通话',log:'日志',rf:'RF',config:'配置',
+    rf_freq:'中心频率',rf_rate:'采样率',rf_rms:'RMS',rf_peak:'峰值',rf_age:'快照',
+    rf_waiting:'等待中…',rf_live:'实时',rf_stale:'已过期',
+    rf_spectrum:'TX DSP 频谱（功放前）',rf_constellation:'TX DSP 星座图',
+    rf_hint_spectrum:'实时 · 512 点 FFT',rf_hint_constellation:'π/4-DQPSK',
+    rf_waterfall:'TX 频谱瀑布图',rf_hint_waterfall:'滚动 · viridis 配色',
+    rf_quality:'信号质量',rf_hint_quality:'功放前测量 · 来自同一 DSP 快照',
+    rf_evm:'EVM',rf_papr:'PAPR',rf_carrier:'载波泄漏',rf_obw:'占用带宽 (99%)',
+    rf_dc:'直流偏置 (I/Q)',rf_iqa:'IQ 幅度不平衡',rf_iqp:'IQ 相位不平衡',
+    rf_hw_health:'硬件状态',rf_hint_health:'每 5 秒轮询',
+    rf_temp:'SDR 温度',rf_tx_gain:'TX 增益（实际）',rf_rx_gain:'RX 增益（实际）',
+    rf_temp_cold:'冷',rf_temp_nominal:'正常',rf_temp_warm:'温',rf_temp_hot:'热',rf_temp_na:'无传感器',
+    rf_no_gains:'不可用',rf_just_now:'刚刚',
+
     terminals:'终端',registered:'已注册',
     active_calls:'活跃通话',circuits:'占用信道',
     registered_terminals:'已注册终端',
@@ -1476,7 +1904,7 @@ const LANGS={
     system:'系统',sys_info:'系统信息',sys_hostname:'主机名',sys_uptime:'运行时间',
     sys_version:'FS 版本',sys_os:'操作系统',sys_config:'当前配置',
     sys_cpu:'CPU',sys_cpu_load:'CPU 负载',sys_ram:'内存',sys_temp:'CPU 温度',
-    sys_rf:'RF 硬件 (SoapySDR)',sys_autorefresh:'自动刷新 5秒',
+    sys_sensors:'主机硬件传感器',sys_sensors_empty:'未检测到传感器。',sys_rf:'RF 硬件 (SoapySDR)',sys_autorefresh:'自动刷新 5秒',
     profile_edit_title:'编辑配置文件',profile_edit_btn:'编辑',
     profile_edit_save_ok:'✓ 已保存',profile_edit_save_fail:'✗ 保存失败',
     sys_profiles:'配置文件',sys_activate:'激活并重启',
@@ -1532,7 +1960,7 @@ function closeMobileSidebar(){
 }
 
 // ── Page navigation ───────────────────────────────────────────────────────
-const PAGE_TITLES={stations:'stations',calls:'calls',lastheard:'lastheard',log:'log',config:'config',system:'system'};
+const PAGE_TITLES={stations:'stations',calls:'calls',lastheard:'lastheard',log:'log',rf:'rf',config:'config',system:'system'};
 function showPage(name,el){
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
@@ -1622,6 +2050,12 @@ function handleMsg(msg){
       if(msg.log&&msg.log.length){document.getElementById('log-container').innerHTML='';msg.log.forEach(e=>appendLog(e));}
       setBrewStatus(!!msg.brew_online,msg.brew_version||0);
       if(msg.fallback_config_active){showFallbackBanner(msg.fallback_config_reason||'');}
+      // If the server already has recent RF snapshots, paint them instantly
+      // so the RF page has data before the next emit cycle.
+      if(msg.last_tx_visual){handleTxVisual(msg.last_tx_visual);}
+      if(msg.last_tx_quality){handleTxQuality(msg.last_tx_quality);}
+      if(msg.last_sdr_health){handleSdrHealth(msg.last_sdr_health);}
+      if(msg.last_sys_health){handleSysHealth(msg.last_sys_health);}
       renderAll();break;
     case 'brew_status':
       setBrewStatus(!!msg.connected,msg.brew_version||0);break;
@@ -1668,6 +2102,10 @@ function handleMsg(msg){
       pushLastHeard({issi:msg.issi,activity:msg.activity,dest:msg.dest,ts:new Date().toTimeString().slice(0,8)});
       renderLastHeard();break;
     case 'log':appendLog(msg);break;
+    case 'tx_visual':handleTxVisual(msg);break;
+    case 'tx_quality':handleTxQuality(msg);break;
+    case 'sdr_health':handleSdrHealth(msg);break;
+    case 'sys_health':handleSysHealth(msg);break;
   }
 }
 
@@ -2226,6 +2664,590 @@ if(document.cookie.split(';').some(c=>c.trim().startsWith('fs_auth='))){
   const lb=document.getElementById('logout-btn');
   if(lb) lb.style.display='flex';
 }
+
+// ── RF live monitor rendering ──────────────────────────────────────────────
+// We receive tx_visual + tx_quality messages: visual carries a 512-bin spectrum
+// (i16 dB-tenths, fftshift'd) and up to 192 IQ samples for the constellation.
+// Plus a richer set of derived metrics (EVM, PAPR, etc) we paint as health bars.
+// All drawing is done on Canvas 2D — no external libs.
+
+const rfState = {
+  lastTs: 0,
+  lastHwTs: 0,
+  sampleRate: 0,
+  centerFreq: 0,
+  // Waterfall ring buffer — rows × FFT bins. Newest row at index 0; we shift on push.
+  // Each row stores normalized [0..1] magnitudes so we can recolour on theme change.
+  waterfall: [],
+  waterfallMaxRows: 200,
+};
+
+function rfThemeColors(){
+  // Read theme variables from CSS so colors track theme switches.
+  const cs = getComputedStyle(document.documentElement);
+  return {
+    bg:      cs.getPropertyValue('--bg').trim()      || '#0a1118',
+    grid:    cs.getPropertyValue('--border').trim()  || '#243244',
+    text:    cs.getPropertyValue('--text2').trim()   || '#b5c0d0',
+    text3:   cs.getPropertyValue('--text3').trim()   || '#7a8a9c',
+    accent:  cs.getPropertyValue('--accent').trim()  || '#00d4a8',
+    accent2: cs.getPropertyValue('--accent2').trim() || '#4da6ff',
+    danger:  cs.getPropertyValue('--danger').trim()  || '#ff4d5e',
+  };
+}
+
+function rfResizeCanvas(id){
+  // HiDPI canvas: resize the backing store to match CSS pixels × devicePixelRatio.
+  // Reset transform first or repeated calls compound the scale.
+  const c = document.getElementById(id);
+  if(!c) return null;
+  const dpr = window.devicePixelRatio || 1;
+  const rect = c.getBoundingClientRect();
+  const w = Math.max(rect.width|0, 100);
+  const h = Math.max(rect.height|0, 100);
+  if(c.width !== w*dpr || c.height !== h*dpr){
+    c.width = w*dpr;
+    c.height = h*dpr;
+  }
+  const ctx = c.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return {canvas:c, ctx, w, h};
+}
+
+// The DSP emits TWO separate events for the RF page:
+//
+//   * tx_visual  — every ~200 ms.  Carries spectrum + IQ + RMS/peak.  Used for
+//     the spectrum trace, constellation, waterfall and the top-row RMS/Peak
+//     readout.  Fast cadence so the animation feels live.
+//
+//   * tx_quality — once per second.  Carries the derived metrics (EVM, PAPR,
+//     carrier leak, OBW, DC offset, IQ imbalance).  Slow cadence so the
+//     numeric cards don't flicker.  We additionally smooth across 3 messages
+//     (≈3 s window) so they sit still.
+
+// Rolling-average smoothing for the Signal Quality numbers + RMS/Peak.
+// We average across SMOOTH_WINDOW most-recent samples so the values settle
+// quickly enough to track real changes (a few seconds) without flickering.
+const SMOOTH_WINDOW = 3;
+const rfSmooth = {
+  rms_dbfs: [], peak_dbfs: [],
+  evm_pct: [], papr_db: [],
+  carrier_leakage_db: [], occupied_bandwidth_hz: [],
+  dc_offset_i: [], dc_offset_q: [],
+  iq_amplitude_imbalance_db: [], iq_phase_imbalance_deg: [],
+};
+function rfPushAvg(key, v){
+  if(!isFinite(v)) return v;
+  const arr = rfSmooth[key];
+  arr.push(v);
+  if(arr.length > SMOOTH_WINDOW) arr.shift();
+  let s = 0; for(const x of arr) s += x;
+  return s / arr.length;
+}
+
+function handleTxVisual(msg){
+  rfState.lastTs = Date.now();
+  rfState.sampleRate = msg.sample_rate || 0;
+  rfState.centerFreq = msg.center_freq_hz || 0;
+
+  // RMS/Peak in the top strip — these come in at the fast cadence so we
+  // smooth them before painting (otherwise the dB number jumps a couple of
+  // tenths every 200 ms which reads as flicker).
+  const rms  = rfPushAvg('rms_dbfs',  msg.rms_dbfs);
+  const peak = rfPushAvg('peak_dbfs', msg.peak_dbfs);
+  const freqMHz = (rfState.centerFreq / 1e6);
+  const rateK   = (rfState.sampleRate / 1e3);
+  setText('rf-freq', isFinite(freqMHz) && freqMHz>0 ? freqMHz.toFixed(3)+' MHz' : '—');
+  setText('rf-rate', isFinite(rateK)   && rateK  >0 ? rateK.toFixed(1)+' kS/s'  : '—');
+  setText('rf-rms',  isFinite(rms)  ? rms.toFixed(1)  +' dBFS' : '—');
+  setText('rf-peak', isFinite(peak) ? peak.toFixed(1) +' dBFS' : '—');
+  setText('rf-age',  t('rf_live')||'live');
+
+  // Visual feeds redraw on every message — that's the whole point.
+  const spec = (msg.spectrum_db_tenths || []).map(v => v / 10);
+  drawRfSpectrum(spec, rfState.sampleRate);
+  drawRfConstellation(msg.constellation_iq || []);
+  pushWaterfall(spec);
+  drawRfWaterfall();
+}
+
+function handleTxQuality(msg){
+  // All quality metrics go through the rolling smoother before being painted.
+  const evm  = rfPushAvg('evm_pct',                   msg.evm_pct);
+  const papr = rfPushAvg('papr_db',                   msg.papr_db);
+  const cl   = rfPushAvg('carrier_leakage_db',        msg.carrier_leakage_db);
+  const obw  = rfPushAvg('occupied_bandwidth_hz',     msg.occupied_bandwidth_hz);
+  const dci  = rfPushAvg('dc_offset_i',               msg.dc_offset_i);
+  const dcq  = rfPushAvg('dc_offset_q',               msg.dc_offset_q);
+  const iqa  = rfPushAvg('iq_amplitude_imbalance_db', msg.iq_amplitude_imbalance_db);
+  const iqp  = rfPushAvg('iq_phase_imbalance_deg',    msg.iq_phase_imbalance_deg);
+
+  paintQuality('rf-evm',     'rf-q-evm-wrap',  fmtPct(evm, 2),       evalEvm(evm));
+  paintQuality('rf-papr',    'rf-q-papr-wrap', fmtDb(papr, 1),       evalPapr(papr));
+  paintQuality('rf-carrier', 'rf-q-cl-wrap',   fmtDb(cl, 1, true),   evalCarrierLeakage(cl));
+  paintQuality('rf-obw',     'rf-q-obw-wrap',  fmtKhz(obw),          evalObw(obw));
+  paintQuality('rf-dc',      'rf-q-dc-wrap',   fmtDcPair(dci, dcq),  evalDcOffset(dci, dcq));
+  paintQuality('rf-iqa',     'rf-q-iqa-wrap',  fmtDb(iqa, 2, true),  evalIqAmpImbal(iqa));
+  paintQuality('rf-iqp',     'rf-q-iqp-wrap',
+                isFinite(iqp) ? iqp.toFixed(2)+'°' : '—',
+                evalIqPhaseImbal(iqp));
+}
+
+function handleSdrHealth(msg){
+  rfState.lastHwTs = Date.now();
+  setText('rf-hw-age', t('rf_just_now')||'just now');
+
+  // Temperature with named state. Thresholds chosen so a typical LimeSDR running
+  // at room temp (~45-55°C) reads "nominal", >65 is "warm", >80 is "hot".
+  const tempEl = document.getElementById('rf-temp');
+  const stateEl = document.getElementById('rf-temp-state');
+  if(tempEl && stateEl){
+    if(msg.temperature_c == null){
+      tempEl.textContent = '—';
+      stateEl.textContent = t('rf_temp_na')||'no sensor';
+      stateEl.className = 'rf-hw-temp-state';
+    } else {
+      const tc = msg.temperature_c;
+      tempEl.textContent = tc.toFixed(1) + ' °C';
+      let cls = 'nominal', label = t('rf_temp_nominal')||'nominal';
+      if(tc < 20){ cls='cold'; label = t('rf_temp_cold')||'cold'; }
+      else if(tc > 80){ cls='hot'; label = t('rf_temp_hot')||'hot'; }
+      else if(tc > 65){ cls='warm'; label = t('rf_temp_warm')||'warm'; }
+      stateEl.textContent = label;
+      stateEl.className = 'rf-hw-temp-state ' + cls;
+    }
+  }
+  renderGainList('rf-tx-gains', msg.tx_gains || []);
+  renderGainList('rf-rx-gains', msg.rx_gains || []);
+}
+
+function renderGainList(id, gains){
+  const el = document.getElementById(id);
+  if(!el) return;
+  if(!gains.length){ el.innerHTML = '<span style="color:var(--text3)">'+(t('rf_no_gains')||'unavailable')+'</span>'; return; }
+  el.innerHTML = gains.map(([name, db]) =>
+    `<div class="rf-hw-gain-row"><span class="stage">${name}</span><span class="val">${db.toFixed(1)} dB</span></div>`
+  ).join('');
+}
+
+// ── Host system health (temps, voltages, currents, power) ──────────────────
+// Drives two UI surfaces:
+//   1. The violet PWR badge in the topbar (only shown when total_power_w is known).
+//   2. A sensor grid on the System tab (shown when any sensors are present).
+
+function handleSysHealth(msg){
+  // Topbar badge
+  const badge = document.getElementById('pwr-badge');
+  const lbl   = document.getElementById('pwr-badge-label');
+  if(badge && lbl){
+    if(msg && typeof msg.total_power_w === 'number' && isFinite(msg.total_power_w) && msg.total_power_w > 0){
+      lbl.textContent = msg.total_power_w.toFixed(1) + ' W';
+      badge.style.display = 'flex';
+      badge.title = 'Host power draw — '+(msg.sensors||[]).length+' sensor(s) reporting';
+    } else {
+      badge.style.display = 'none';
+    }
+  }
+
+  // System-tab sensor grid
+  const card  = document.getElementById('sys-sensors-card');
+  const grid  = document.getElementById('sys-sensors-grid');
+  const empty = document.getElementById('sys-sensors-empty');
+  const totEl = document.getElementById('sys-sensors-power-total');
+  if(!card || !grid) return;
+
+  const sensors = (msg && msg.sensors) || [];
+  if(sensors.length === 0){
+    // Nothing detected — leave the card hidden so we don't clutter the System tab.
+    card.style.display = 'none';
+    return;
+  }
+  card.style.display = '';
+
+  if(empty) empty.style.display = 'none';
+
+  // Sort: power first (most interesting), then temp, voltage, current. Within
+  // a kind, keep server order (which itself sorts by hwmon chip discovery order).
+  const kindOrder = {power:0, temperature:1, voltage:2, current:3};
+  const sorted = sensors.slice().sort((a,b) => (kindOrder[a.kind]||9) - (kindOrder[b.kind]||9));
+
+  grid.innerHTML = sorted.map(s => {
+    const unit = sensorUnit(s.kind);
+    const dp   = s.kind === 'temperature' ? 1
+               : s.kind === 'voltage'     ? 3
+               : s.kind === 'current'     ? 3
+               : 2;
+    const valColor = sensorColor(s.kind, s.value);
+    return `<div class="sys-sensor-tile">
+      <div class="sys-sensor-label" title="${escHtml(s.name)}">${escHtml(s.name)}</div>
+      <div class="sys-sensor-value" style="color:${valColor}">${s.value.toFixed(dp)} <span class="sys-sensor-unit">${unit}</span></div>
+    </div>`;
+  }).join('');
+
+  // Power total in card header
+  if(totEl){
+    if(typeof msg.total_power_w === 'number' && isFinite(msg.total_power_w) && msg.total_power_w > 0){
+      totEl.textContent = '⚡ ' + msg.total_power_w.toFixed(2) + ' W total';
+    } else {
+      totEl.textContent = '';
+    }
+  }
+}
+
+function sensorUnit(kind){
+  switch(kind){
+    case 'temperature': return '°C';
+    case 'voltage':     return 'V';
+    case 'current':     return 'A';
+    case 'power':       return 'W';
+    default:            return '';
+  }
+}
+
+// Colour the value: temperatures get warm tints, power values are violet,
+// voltages/currents stay neutral (just monospace).
+function sensorColor(kind, v){
+  if(kind === 'temperature'){
+    if(v >= 80) return 'var(--danger)';
+    if(v >= 65) return '#f5a623';
+    if(v >= 50) return 'var(--accent)';
+    return 'var(--accent2)';
+  }
+  if(kind === 'power') return '#c8a4f5';
+  return 'var(--text)';
+}
+
+function setText(id, txt){
+  const e = document.getElementById(id);
+  if(e) e.textContent = txt;
+}
+
+// ── Formatters ─────────────────────────────────────────────────────────────
+function fmtPct(v, dp){ return isFinite(v) ? v.toFixed(dp||1)+' %' : '—'; }
+function fmtDb(v, dp, signed){
+  if(!isFinite(v)) return '—';
+  return (signed && v >= 0 ? '+' : '') + v.toFixed(dp||1) + ' dB';
+}
+function fmtKhz(hz){ return isFinite(hz)&&hz>0 ? (hz/1000).toFixed(1)+' kHz' : '—'; }
+function fmtDcPair(i, q){
+  if(!isFinite(i) || !isFinite(q)) return '—';
+  return i.toFixed(4)+' / '+q.toFixed(4);
+}
+
+// ── Health classifiers ─────────────────────────────────────────────────────
+// Each returns {status: 'good'|'warn'|'bad', pct: 0..100} for bar fill width.
+function evalEvm(v){
+  if(!isFinite(v)) return {status:'good', pct:0};
+  // ETSI EN 300 392-2 §6.5.4 spec is ≤10% for a TETRA subscriber.
+  // For TX from an amateur SDR (LimeSDR/SXceiver/µCell etc) what actually shows up
+  // is typically 5-15%. Be generous: <8% good, <15% warn, ≥15% bad.
+  if(v < 8)  return {status:'good', pct: Math.min(100, v/8*40)};
+  if(v < 15) return {status:'warn', pct: 40 + Math.min(60, (v-8)/7*40)};
+  return {status:'bad', pct: 80 + Math.min(20, (v-15)/15*20)};
+}
+function evalPapr(v){
+  if(!isFinite(v)) return {status:'good', pct:0};
+  // TETRA π/4-DQPSK theoretical PAPR is ~3.5 dB. Real DSP output with RRC
+  // pulse-shaping sits 4-7 dB. <7 good, <10 warn, ≥10 means clipping risk.
+  if(v < 7)  return {status:'good', pct: Math.min(100, v/7*50)};
+  if(v < 10) return {status:'warn', pct: 50 + (v-7)/3*30};
+  return {status:'bad', pct: Math.min(100, 80 + (v-10)/3*20)};
+}
+function evalCarrierLeakage(v){
+  if(!isFinite(v)) return {status:'good', pct:0};
+  // Direct-conversion SDRs (SXceiver, µCell, LimeSDR) typically sit -25 to -35 dB.
+  // -30 dB or better is good, -20 to -30 is warn, above -20 is bad (visible spur).
+  if(v < -30) return {status:'good', pct: Math.max(10, 100 + v + 30)};
+  if(v < -20) return {status:'warn', pct: 60 + (-20 - v)/10*20};
+  return {status:'bad', pct: Math.min(100, 80 + (v + 20)/20*20)};
+}
+function evalObw(v){
+  if(!isFinite(v) || v <= 0) return {status:'good', pct:0};
+  // TETRA channel spacing is 25 kHz. A clean signal sits ~22-24 kHz wide.
+  // <24 kHz good, <26 kHz warn (touching channel edges), ≥26 kHz bad (ACI risk).
+  const k = v/1000;
+  if(k < 24) return {status:'good', pct: Math.min(100, k/24*80)};
+  if(k < 26) return {status:'warn', pct: 80 + (k-24)/2*15};
+  return {status:'bad', pct: Math.min(100, 95 + (k-26)/10*5)};
+}
+function evalDcOffset(i, q){
+  if(!isFinite(i) || !isFinite(q)) return {status:'good', pct:0};
+  // Magnitude of DC vector. Realistic thresholds for amateur SDRs:
+  // <0.03 good, <0.08 warn, ≥0.08 bad (causes visible centre spike).
+  const mag = Math.hypot(i, q);
+  if(mag < 0.03) return {status:'good', pct: mag/0.03*40};
+  if(mag < 0.08) return {status:'warn', pct: 40 + (mag-0.03)/0.05*40};
+  return {status:'bad', pct: Math.min(100, 80 + (mag-0.08)/0.08*20)};
+}
+function evalIqAmpImbal(v){
+  if(!isFinite(v)) return {status:'good', pct:0};
+  // <0.5 dB good, <1.5 dB warn, >1.5 dB bad. Amateur SDRs sit ~0.2-0.6 dB typically.
+  const a = Math.abs(v);
+  if(a < 0.5) return {status:'good', pct: a/0.5*40};
+  if(a < 1.5) return {status:'warn', pct: 40 + (a-0.5)/1*40};
+  return {status:'bad', pct: Math.min(100, 80 + (a-1.5)/2*20)};
+}
+function evalIqPhaseImbal(v){
+  if(!isFinite(v)) return {status:'good', pct:0};
+  // <2° good, <5° warn, >5° bad. Sub-1° is professional-grade.
+  const a = Math.abs(v);
+  if(a < 2) return {status:'good', pct: a/2*40};
+  if(a < 5) return {status:'warn', pct: 40 + (a-2)/3*40};
+  return {status:'bad', pct: Math.min(100, 80 + (a-5)/5*20)};
+}
+
+function paintQuality(valueId, wrapId, valueText, evalResult){
+  setText(valueId, valueText);
+  const wrap = document.getElementById(wrapId);
+  if(!wrap) return;
+  wrap.classList.remove('rf-q-good','rf-q-warn','rf-q-bad');
+  wrap.classList.add('rf-q-' + evalResult.status);
+  const bar = wrap.querySelector('.rf-qmetric-fill');
+  if(bar) bar.style.width = evalResult.pct.toFixed(0) + '%';
+}
+
+function drawRfSpectrum(spec, sampleRate){
+  const r = rfResizeCanvas('rf-spectrum');
+  if(!r || !spec.length) return;
+  const {ctx, w, h} = r;
+  const col = rfThemeColors();
+
+  ctx.fillStyle = col.bg;
+  ctx.fillRect(0, 0, w, h);
+
+  // Y axis: dynamic dB range. Clamp to a sensible window so noise floor wiggles
+  // don't make the spectrum jump around.
+  let minDb = -90, maxDb = 0;
+  for(const v of spec){ if(isFinite(v)){ if(v<minDb) minDb = v; if(v>maxDb) maxDb = v; } }
+  minDb = Math.max(Math.floor(minDb/10)*10 - 5, -130);
+  maxDb = Math.min(Math.ceil(maxDb/10)*10 + 5, 10);
+  if(maxDb - minDb < 30) maxDb = minDb + 30;
+
+  ctx.strokeStyle = col.grid;
+  ctx.lineWidth = 1;
+  ctx.font = '10px ui-monospace, Cascadia Code, Consolas, monospace';
+  ctx.fillStyle = col.text3;
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+
+  for(let db = Math.ceil(minDb/20)*20; db <= maxDb; db += 20){
+    const y = h - (db - minDb)/(maxDb - minDb) * h;
+    ctx.beginPath();
+    ctx.moveTo(40, y); ctx.lineTo(w, y);
+    ctx.stroke();
+    ctx.fillText(db+' dB', 36, y);
+  }
+
+  const halfRateKHz = (sampleRate || 600000) / 2 / 1000;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'bottom';
+  const numTicks = 8;
+  for(let i = 0; i <= numTicks; i++){
+    const x = 40 + (w - 40) * i / numTicks;
+    ctx.beginPath();
+    ctx.moveTo(x, 0); ctx.lineTo(x, h - 14);
+    ctx.stroke();
+    const offKHz = -halfRateKHz + 2*halfRateKHz * i/numTicks;
+    ctx.fillText((offKHz>=0?'+':'')+offKHz.toFixed(0), x, h - 2);
+  }
+
+  ctx.strokeStyle = col.accent;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  for(let i = 0; i < spec.length; i++){
+    const x = 40 + (w - 40) * i / (spec.length - 1);
+    const y = h - 14 - (spec[i] - minDb)/(maxDb - minDb) * (h - 14);
+    if(i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+}
+
+function drawRfConstellation(iqInt16){
+  const r = rfResizeCanvas('rf-constellation');
+  if(!r) return;
+  const {ctx, w, h} = r;
+  const col = rfThemeColors();
+
+  ctx.fillStyle = col.bg;
+  ctx.fillRect(0, 0, w, h);
+
+  const size = Math.min(w, h) - 20;
+  const cx = w / 2;
+  const cy = h / 2;
+
+  ctx.strokeStyle = col.grid;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(cx - size/2, cy); ctx.lineTo(cx + size/2, cy);
+  ctx.moveTo(cx, cy - size/2); ctx.lineTo(cx, cy + size/2);
+  ctx.stroke();
+
+  ctx.strokeStyle = col.grid;
+  ctx.beginPath();
+  ctx.arc(cx, cy, size/2 * 0.66, 0, Math.PI*2);
+  ctx.stroke();
+
+  ctx.fillStyle = col.text3;
+  for(let k = 0; k < 8; k++){
+    const a = k * Math.PI/4;
+    const x = cx + Math.cos(a) * size/2 * 0.66;
+    const y = cy - Math.sin(a) * size/2 * 0.66;
+    ctx.beginPath();
+    ctx.arc(x, y, 2.5, 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  const SCALE = 1.5 / 32767;
+  ctx.fillStyle = col.accent;
+  for(let i = 0; i + 1 < iqInt16.length; i += 2){
+    const re = iqInt16[i]   * SCALE;
+    const im = iqInt16[i+1] * SCALE;
+    const x = cx + re * (size/2 * 0.66);
+    const y = cy - im * (size/2 * 0.66);
+    ctx.beginPath();
+    ctx.arc(x, y, 1.8, 0, Math.PI*2);
+    ctx.fill();
+  }
+}
+
+// ── Waterfall ──────────────────────────────────────────────────────────────
+// Maintain a rolling buffer of recent spectra. Each new snapshot lands at the
+// top of the canvas; older rows scroll down. Colours come from a viridis-style
+// palette so the contrast works for daltonism (no red-green dependence).
+
+function pushWaterfall(specDb){
+  if(!specDb || !specDb.length) return;
+  // Normalize to [0..1] using a fixed reference window so colours don't shift wildly.
+  // We keep a moving reference of the maximum to anchor the bright end.
+  const REF_MIN = -100, REF_MAX = 0;
+  const normalized = new Float32Array(specDb.length);
+  for(let i = 0; i < specDb.length; i++){
+    let v = (specDb[i] - REF_MIN) / (REF_MAX - REF_MIN);
+    if(!isFinite(v)) v = 0;
+    if(v < 0) v = 0;
+    if(v > 1) v = 1;
+    normalized[i] = v;
+  }
+  rfState.waterfall.unshift(normalized);
+  if(rfState.waterfall.length > rfState.waterfallMaxRows){
+    rfState.waterfall.length = rfState.waterfallMaxRows;
+  }
+}
+
+// Viridis approximation: 5-stop colour map mov→albastru→teal→verde-galben→galben.
+// Hand-tuned RGB stops so the bottom is dark blue (low magnitude) and the top is
+// bright yellow (peak). Linear interpolation between stops keeps it monotonic.
+function viridisColor(t){
+  const stops = [
+    [0.00, 68, 1, 84],
+    [0.25, 59, 82, 139],
+    [0.50, 33, 145, 140],
+    [0.75, 94, 201, 98],
+    [1.00, 253, 231, 37],
+  ];
+  if(t <= 0) return [stops[0][1], stops[0][2], stops[0][3]];
+  if(t >= 1) return [stops[4][1], stops[4][2], stops[4][3]];
+  for(let i = 0; i < stops.length - 1; i++){
+    if(t >= stops[i][0] && t <= stops[i+1][0]){
+      const a = stops[i], b = stops[i+1];
+      const f = (t - a[0]) / (b[0] - a[0]);
+      return [
+        Math.round(a[1] + (b[1]-a[1])*f),
+        Math.round(a[2] + (b[2]-a[2])*f),
+        Math.round(a[3] + (b[3]-a[3])*f),
+      ];
+    }
+  }
+  return [0,0,0];
+}
+
+function parseHexRgb(hex){
+  if(!hex || hex[0] !== '#') return null;
+  const s = hex.length === 7 ? hex.slice(1) : (hex.length === 4 ?
+    hex[1]+hex[1]+hex[2]+hex[2]+hex[3]+hex[3] : null);
+  if(!s) return null;
+  const n = parseInt(s, 16);
+  if(isNaN(n)) return null;
+  return [(n>>16)&0xff, (n>>8)&0xff, n&0xff];
+}
+
+function drawRfWaterfall(){
+  const r = rfResizeCanvas('rf-waterfall');
+  if(!r || !rfState.waterfall.length) return;
+  const {ctx, w, h} = r;
+  const col = rfThemeColors();
+  // Background colour as RGB for the noise-floor mask. We replace viridis(0)≈purple
+  // with the page background for bins below threshold so the waterfall reads as
+  // "signal vs nothing" instead of "purple everywhere".
+  const bgRgb = parseHexRgb(col.bg) || [10, 17, 24];
+
+  ctx.fillStyle = col.bg;
+  ctx.fillRect(0, 0, w, h);
+
+  const rows = Math.min(rfState.waterfall.length, h|0);
+  const bins = rfState.waterfall[0].length;
+  const leftPad = 40;
+  const drawW = (w - leftPad)|0;
+  if(drawW <= 0 || rows <= 0) return;
+
+  // Noise-floor threshold in [0..1]. pushWaterfall normalises -100..0 dBFS into 0..1,
+  // so 0.18 corresponds to ~-82 dBFS — well below any real TETRA signal.
+  const NOISE_FLOOR = 0.18;
+
+  const img = ctx.createImageData(drawW, rows);
+  for(let row = 0; row < rows; row++){
+    const spec = rfState.waterfall[row];
+    for(let x = 0; x < drawW; x++){
+      const binIdx = Math.min(bins - 1, ((x / drawW) * bins)|0);
+      const v = spec[binIdx];
+      const rgb = v < NOISE_FLOOR ? bgRgb : viridisColor(v);
+      const p = (row * drawW + x) * 4;
+      img.data[p]   = rgb[0];
+      img.data[p+1] = rgb[1];
+      img.data[p+2] = rgb[2];
+      img.data[p+3] = 255;
+    }
+  }
+  ctx.putImageData(img, leftPad, 0);
+
+  // Time axis on the left: tick every 30 rows ≈ 30s (one row per snapshot, ~1Hz).
+  // Only draw ticks up to the number of rows we actually have, so the axis never
+  // pretends "-180s" when we only have 30s of history.
+  ctx.font = '9px ui-monospace, Cascadia Code, Consolas, monospace';
+  ctx.fillStyle = col.text3;
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+  for(let s = 0; s <= rows; s += 30){
+    ctx.fillText('-'+s+'s', leftPad - 4, s + 1);
+    ctx.strokeStyle = col.grid;
+    ctx.beginPath();
+    ctx.moveTo(leftPad - 2, s); ctx.lineTo(leftPad, s);
+    ctx.stroke();
+  }
+}
+
+// ── Age refresh & resize ───────────────────────────────────────────────────
+setInterval(() => {
+  if(rfState.lastTs){
+    const age = (Date.now() - rfState.lastTs) / 1000;
+    if(age > 3){
+      setText('rf-age', (t('rf_stale')||'stale')+' · '+age.toFixed(0)+'s');
+    }
+  }
+  if(rfState.lastHwTs){
+    const age = (Date.now() - rfState.lastHwTs) / 1000;
+    if(age < 6) setText('rf-hw-age', age.toFixed(0)+'s');
+    else        setText('rf-hw-age', age.toFixed(0)+'s '+(t('rf_stale')||'stale'));
+  }
+}, 1000);
+
+window.addEventListener('resize', () => {
+  rfResizeCanvas('rf-spectrum');
+  rfResizeCanvas('rf-constellation');
+  rfResizeCanvas('rf-waterfall');
+  drawRfWaterfall();
+});
 
 connect();
 </script>

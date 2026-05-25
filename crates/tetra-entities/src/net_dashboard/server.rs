@@ -595,6 +595,52 @@ impl DashboardServer {
                 TelemetryEvent::TsVoiceActivity { .. } => {
                     // Handled below with rate limiting — no state update needed
                 }
+                TelemetryEvent::TxVisual {
+                    sample_rate, center_freq_hz, rms_dbfs, peak_dbfs,
+                    spectrum_db_tenths, constellation_iq,
+                } => {
+                    // Cache the visual snapshot so newly-connected dashboard clients
+                    // see something on the RF page before the next ~200 ms emit cycle.
+                    s.last_tx_visual = Some(crate::net_dashboard::state::TxVisualSnapshot {
+                        sample_rate: *sample_rate,
+                        center_freq_hz: *center_freq_hz,
+                        rms_dbfs: *rms_dbfs,
+                        peak_dbfs: *peak_dbfs,
+                        spectrum_db_tenths: spectrum_db_tenths.clone(),
+                        constellation_iq: constellation_iq.clone(),
+                    });
+                }
+                TelemetryEvent::TxQuality {
+                    papr_db, evm_pct, dc_offset_i, dc_offset_q,
+                    iq_amplitude_imbalance_db, iq_phase_imbalance_deg,
+                    carrier_leakage_db, occupied_bandwidth_hz,
+                } => {
+                    // Cache the quality numbers so late-joining clients get them
+                    // straight away rather than waiting up to a second.
+                    s.last_tx_quality = Some(crate::net_dashboard::state::TxQualitySnapshot {
+                        papr_db: *papr_db,
+                        evm_pct: *evm_pct,
+                        dc_offset_i: *dc_offset_i,
+                        dc_offset_q: *dc_offset_q,
+                        iq_amplitude_imbalance_db: *iq_amplitude_imbalance_db,
+                        iq_phase_imbalance_deg: *iq_phase_imbalance_deg,
+                        carrier_leakage_db: *carrier_leakage_db,
+                        occupied_bandwidth_hz: *occupied_bandwidth_hz,
+                    });
+                }
+                TelemetryEvent::SdrHealth { temperature_c, tx_gains, rx_gains } => {
+                    s.last_sdr_health = Some(crate::net_dashboard::state::SdrHealthSnapshot {
+                        temperature_c: *temperature_c,
+                        tx_gains: tx_gains.clone(),
+                        rx_gains: rx_gains.clone(),
+                    });
+                }
+                TelemetryEvent::SysHealth { total_power_w, sensors } => {
+                    s.last_sys_health = Some(crate::net_dashboard::state::SysHealthSnapshot {
+                        total_power_w: *total_power_w,
+                        sensors: sensors.clone(),
+                    });
+                }
             }
         }
         if let Some(json) = msg {
@@ -669,6 +715,44 @@ fn event_to_ws_msg(event: &TelemetryEvent) -> Option<String> {
             serde_json::json!({"type":"last_heard","issi":source_issi,"activity":"sds","dest":dest_issi}),
         TelemetryEvent::TsVoiceActivity { ts } =>
             serde_json::json!({"type":"ts_voice","ts":ts}),
+        TelemetryEvent::TxVisual {
+            sample_rate, center_freq_hz, rms_dbfs, peak_dbfs,
+            spectrum_db_tenths, constellation_iq,
+        } => serde_json::json!({
+            "type": "tx_visual",
+            "sample_rate": sample_rate,
+            "center_freq_hz": center_freq_hz,
+            "rms_dbfs": rms_dbfs,
+            "peak_dbfs": peak_dbfs,
+            "spectrum_db_tenths": spectrum_db_tenths,
+            "constellation_iq": constellation_iq,
+        }),
+        TelemetryEvent::TxQuality {
+            papr_db, evm_pct, dc_offset_i, dc_offset_q,
+            iq_amplitude_imbalance_db, iq_phase_imbalance_deg,
+            carrier_leakage_db, occupied_bandwidth_hz,
+        } => serde_json::json!({
+            "type": "tx_quality",
+            "papr_db": papr_db,
+            "evm_pct": evm_pct,
+            "dc_offset_i": dc_offset_i,
+            "dc_offset_q": dc_offset_q,
+            "iq_amplitude_imbalance_db": iq_amplitude_imbalance_db,
+            "iq_phase_imbalance_deg": iq_phase_imbalance_deg,
+            "carrier_leakage_db": carrier_leakage_db,
+            "occupied_bandwidth_hz": occupied_bandwidth_hz,
+        }),
+        TelemetryEvent::SdrHealth { temperature_c, tx_gains, rx_gains } => serde_json::json!({
+            "type": "sdr_health",
+            "temperature_c": temperature_c,
+            "tx_gains": tx_gains,
+            "rx_gains": rx_gains,
+        }),
+        TelemetryEvent::SysHealth { total_power_w, sensors } => serde_json::json!({
+            "type": "sys_health",
+            "total_power_w": total_power_w,
+            "sensors": sensors,
+        }),
     };
     serde_json::to_string(&v).ok()
 }
@@ -1189,11 +1273,19 @@ fn handle_ws(stream: TcpStream, state: DashboardState, clients: WsClients,
         let brew_version = s.brew_version;
         let fallback_active = s.fallback_config_active;
         let fallback_reason = s.fallback_config_reason.clone();
+        let last_tx_visual = s.last_tx_visual.clone();
+        let last_tx_quality = s.last_tx_quality.clone();
+        let last_sdr_health = s.last_sdr_health.clone();
+        let last_sys_health = s.last_sys_health.clone();
         drop(s);
         if let Ok(json) = serde_json::to_string(&serde_json::json!({
             "type": "snapshot", "ms": ms, "calls": calls, "log": logs,
             "brew_online": brew_online, "brew_version": brew_version, "last_heard": last_heard,
-            "fallback_config_active": fallback_active, "fallback_config_reason": fallback_reason
+            "fallback_config_active": fallback_active, "fallback_config_reason": fallback_reason,
+            "last_tx_visual": last_tx_visual,
+            "last_tx_quality": last_tx_quality,
+            "last_sdr_health": last_sdr_health,
+            "last_sys_health": last_sys_health,
         })) {
             let _ = ws.send(Message::Text(json));
         }

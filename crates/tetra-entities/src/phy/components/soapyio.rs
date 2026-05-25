@@ -334,6 +334,56 @@ impl SoapyIo {
     pub fn tx_enabled(&self) -> bool {
         self.tx.is_some()
     }
+
+    /// Read SDR temperature in °C if the device exposes a temp-like sensor.
+    /// LimeSDR returns "temp" via list_sensors; USRP usually "fp_temp" or similar;
+    /// SXceiver / µCell don't currently expose any sensor and this returns None.
+    /// We probe sensor names rather than hard-coding per-driver, so any future radio
+    /// that follows the Soapy convention works without code changes.
+    pub fn read_temperature_c(&self) -> Option<f32> {
+        let sensors = self.dev.list_sensors().ok()?;
+        for name in sensors {
+            let s = name.to_string();
+            let lower = s.to_lowercase();
+            if lower.contains("temp") {
+                if let Ok(val) = self.dev.read_sensor(&s) {
+                    if let Ok(parsed) = val.to_string().parse::<f32>() {
+                        return Some(parsed);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Read back the currently-active TX gain per stage, in dB.
+    /// Returns the same gain-element names the radio uses (e.g. "PAD","IAMP" on LimeSDR).
+    pub fn read_tx_gains(&self) -> Vec<(String, f32)> {
+        if !self.tx_enabled() { return Vec::new(); }
+        self.dev.list_gains(soapysdr::Direction::Tx, self.tx_ch)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|name| {
+                let s = name.to_string();
+                self.dev.gain_element(soapysdr::Direction::Tx, self.tx_ch, s.clone())
+                    .ok().map(|g| (s, g as f32))
+            })
+            .collect()
+    }
+
+    /// Read back the currently-active RX gain per stage, in dB.
+    pub fn read_rx_gains(&self) -> Vec<(String, f32)> {
+        if !self.rx_enabled() { return Vec::new(); }
+        self.dev.list_gains(soapysdr::Direction::Rx, self.rx_ch)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|name| {
+                let s = name.to_string();
+                self.dev.gain_element(soapysdr::Direction::Rx, self.rx_ch, s.clone())
+                    .ok().map(|g| (s, g as f32))
+            })
+            .collect()
+    }
 }
 
 // Messy logic related to opening a device follows...

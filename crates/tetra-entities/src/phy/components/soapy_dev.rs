@@ -9,6 +9,8 @@ use tetra_pdus::phy::traits::rxtx_dev::RxTxDev;
 use tetra_pdus::phy::traits::rxtx_dev::RxTxDevError;
 use tetra_pdus::phy::traits::rxtx_dev::TxSlotBits;
 
+use crate::net_telemetry::channel::TelemetrySink;
+use crate::net_telemetry::events::TelemetryEvent;
 use crate::phy::components::soapy_dev;
 
 use super::demodulator;
@@ -41,12 +43,19 @@ pub struct RxTxDevSoapySdr {
     sdr: soapyio::SoapyIo,
     rx_dsp: Option<RxDsp>,
     tx_dsp: Option<TxDsp>,
+    health: Option<SdrHealthMonitor>,
 }
 
 type FftPlanner = rustfft::FftPlanner<RealSample>;
 
 impl RxTxDevSoapySdr {
     pub fn new(cfg: &SharedConfig) -> Self {
+        Self::with_telemetry(cfg, None)
+    }
+
+    /// Construct with an attached telemetry sink so the TX DSP can stream
+    /// live spectrum + constellation snapshots to the dashboard.
+    pub fn with_telemetry(cfg: &SharedConfig, telemetry: Option<TelemetrySink>) -> Self {
         let mut fft_planner = rustfft::FftPlanner::new();
 
         // TODO FIXME currently no MS and MON support in the below statement; need to fix
@@ -80,6 +89,8 @@ impl RxTxDevSoapySdr {
 
         let mut sdr = soapyio::SoapyIo::new(cfg).unwrap();
 
+        let health_telemetry = telemetry.clone();
+
         Self {
             rx_dsp: if sdr.rx_enabled() {
                 Some(RxDsp::new(&mut fft_planner, &mut sdr, &phy_config))
@@ -88,10 +99,12 @@ impl RxTxDevSoapySdr {
             },
 
             tx_dsp: if sdr.tx_enabled() {
-                Some(TxDsp::new(&mut fft_planner, &mut sdr, &phy_config))
+                Some(TxDsp::new(&mut fft_planner, &mut sdr, &phy_config, telemetry))
             } else {
                 None
             },
+
+            health: health_telemetry.map(SdrHealthMonitor::new),
 
             sdr,
         }
@@ -137,6 +150,13 @@ impl RxTxDev for RxTxDevSoapySdr {
         while self.process_rx_block()? {
             // Continue producing TX signal if possible.
             while self.process_tx_block(tx_slot)? {}
+        }
+
+        // SDR health: temperature + gain readback, throttled to once every ~5 s.
+        // Done here (not on a separate thread) so we can borrow &mut self.sdr safely
+        // without locking. The Soapy reads are fast (<<1 ms typically).
+        if let Some(health) = &mut self.health {
+            health.tick(&self.sdr);
         }
 
         if let Some(rx_dsp) = &mut self.rx_dsp {
@@ -310,10 +330,11 @@ struct TxDsp {
     block_count: fcfb::BlockCount,
     initial_time: i64,
     modulators: Vec<ModulatorChannel>,
+    monitor: Option<TxSignalMonitor>,
 }
 
 impl TxDsp {
-    fn new(fft_planner: &mut FftPlanner, sdr: &mut soapyio::SoapyIo, phy_config: &PhyConfig) -> Self {
+    fn new(fft_planner: &mut FftPlanner, sdr: &mut soapyio::SoapyIo, phy_config: &PhyConfig, telemetry: Option<TelemetrySink>) -> Self {
         let sdr_sample_rate = sdr.tx_sample_rate();
         let fcfb_params = fcfb::SynthesisOutputParameters {
             ifft_size: (sdr_sample_rate / 500.0).round() as usize,
@@ -329,11 +350,16 @@ impl TxDsp {
             modulators.push(ModulatorChannel::new(fft_planner, fcfb_params, *dl_freq, modulator::Mode::Dl));
         }
 
+        let monitor = telemetry.map(|sink| {
+            TxSignalMonitor::new(fft_planner, sink, sdr_sample_rate as RealSample, sdr.tx_center_frequency().unwrap())
+        });
+
         Self {
             fcfb,
             block_count: 0,
             initial_time: 0, // TODO: get it from RX
             modulators,
+            monitor,
         }
     }
 
@@ -385,7 +411,20 @@ impl TxDsp {
             }
         }
 
-        let tx_signal = self.fcfb.process();
+        // tx_signal is borrowed from self.fcfb. We need to also touch self.monitor
+        // (different field), but Rust can't see through methods to split borrows.
+        // We copy into a small local Vec — the buffer is one fcfb output block
+        // (typically a few hundred ComplexSamples = a few KB), so the copy cost
+        // is negligible compared to the FFT we're about to do.
+        let tx_signal_vec: Vec<ComplexSample> = self.fcfb.process().to_vec();
+
+        // Live TX monitor: spectrum + IQ constellation snapshot. Internal-rate-limited
+        // to ~1 snapshot/sec so it doesn't flood the WebSocket.
+        if let Some(monitor) = self.monitor.as_mut() {
+            monitor.observe(&tx_signal_vec, tx_slot, self.block_count);
+        }
+
+        let tx_signal: &[ComplexSample] = &tx_signal_vec;
 
         // TODO: compensate for delay of SDR
         let sdr_sample_count = tx_signal.len() as SampleCount * self.block_count;
@@ -503,4 +542,472 @@ impl ModulatorChannel {
 struct MonitorDlUlPair {
     dl: DemodulatorChannel,
     ul: Option<DemodulatorChannel>,
+}
+
+// ── TX signal monitor ─────────────────────────────────────────────────────
+//
+// Snapshots the complex baseband samples that FlowStation generates BEFORE they
+// reach the SDR. Works on any radio (LimeSDR, SXceiver, µCell, USRP, Pluto) because
+// the analysis is purely internal — we look at our own DSP output, not at anything
+// the radio reads back.
+//
+// Each snapshot emits one of two TelemetryEvent variants — TxVisual (fast,
+// ~5 Hz, carries spectrum + IQ) or TxQuality (slow, ~1 Hz, carries derived
+// metrics). Split this way so the dashboard can animate the graphics live
+// while keeping the numeric readouts calm.
+//
+// Both paths share the FFT and constellation recovery, so when both are due
+// in the same call they are computed once and emitted in two messages.
+
+struct TxSignalMonitor {
+    sink: TelemetrySink,
+    sample_rate: RealSample,
+    center_frequency: f64,
+    fft: std::sync::Arc<dyn rustfft::Fft<RealSample>>,
+    fft_buffer: Vec<ComplexSample>,
+    window: Vec<RealSample>,
+    constellation_history: Vec<ComplexSample>,
+    /// Wall-clock time of the next allowed *visual* emission (spectrum + IQ).
+    /// Rate-limiting on block_count is brittle because block size varies with
+    /// sample rate (at 600 kHz one block is ~1.5 ms, at 2 MHz it's ~0.45 ms).
+    /// Using wall-clock time gives a stable emit rate regardless of SDR config.
+    next_visual_emit: std::time::Instant,
+    /// Wall-clock time of the next allowed *quality* emission (EVM, PAPR, etc).
+    /// Slower than visual so the numeric readouts don't flicker.
+    next_quality_emit: std::time::Instant,
+    /// Visual cadence — fast enough for fluid animation but not so fast that
+    /// the FFT cost dominates. ~200 ms = 5 Hz feels live.
+    visual_interval: std::time::Duration,
+    /// Quality cadence — slower so the dashboard numbers settle. 1 s is the
+    /// natural human-readable rate; combined with the front-end smoothing window
+    /// it ends up looking rock-stable.
+    quality_interval: std::time::Duration,
+}
+
+impl TxSignalMonitor {
+    const FFT_LEN: usize = 512;
+    const CONSTELLATION_POINTS: usize = 192;
+    const CONSTELLATION_ENCODE_SCALE: RealSample = 32767.0 / 1.5;
+
+    fn new(fft_planner: &mut FftPlanner, sink: TelemetrySink, sample_rate: RealSample, center_frequency: f64) -> Self {
+        let fft = fft_planner.plan_fft_forward(Self::FFT_LEN);
+        let window = (0..Self::FFT_LEN)
+            .map(|i| {
+                let phase = 2.0 * std::f32::consts::PI * i as RealSample / (Self::FFT_LEN - 1) as RealSample;
+                0.5 - 0.5 * phase.cos()
+            })
+            .collect();
+        Self {
+            sink,
+            sample_rate,
+            center_frequency,
+            fft,
+            fft_buffer: vec![ComplexSample::ZERO; Self::FFT_LEN],
+            window,
+            constellation_history: Vec::with_capacity(Self::CONSTELLATION_POINTS),
+            next_visual_emit: std::time::Instant::now(),
+            next_quality_emit: std::time::Instant::now(),
+            visual_interval: std::time::Duration::from_millis(200),
+            quality_interval: std::time::Duration::from_millis(1000),
+        }
+    }
+
+    fn observe(&mut self, samples: &[ComplexSample], _tx_slots: &[TxSlotBits], _block_count: fcfb::BlockCount) {
+        let now = std::time::Instant::now();
+        let need_visual  = now >= self.next_visual_emit;
+        let need_quality = now >= self.next_quality_emit;
+        if (!need_visual && !need_quality) || samples.len() < Self::FFT_LEN {
+            return;
+        }
+
+        // ── Power statistics (cheap; needed for both visual & quality) ────
+        // Visual needs RMS/peak for the topbar; Quality also needs them
+        // (PAPR = peak - rms) and a few derived sums.
+        let mut peak2: RealSample = 0.0;
+        let mut sum2: RealSample = 0.0;
+        // Mean accumulators for DC offset & IQ-balance estimation (only used
+        // by the quality path, but the inner loop is so tight that splitting
+        // would cost more in code complexity than the few extra adds save).
+        let mut sum_i: RealSample = 0.0;
+        let mut sum_q: RealSample = 0.0;
+        let mut sum_i2: RealSample = 0.0;
+        let mut sum_q2: RealSample = 0.0;
+        let mut sum_iq: RealSample = 0.0;
+        let n = samples.len() as RealSample;
+        for sample in samples {
+            let p = sample.norm_sqr();
+            peak2 = peak2.max(p);
+            sum2 += p;
+            if need_quality {
+                sum_i  += sample.re;
+                sum_q  += sample.im;
+                sum_i2 += sample.re * sample.re;
+                sum_q2 += sample.im * sample.im;
+                sum_iq += sample.re * sample.im;
+            }
+        }
+        let rms = (sum2 / n).sqrt();
+        let rms_dbfs  = 20.0 * rms.max(1.0e-12).log10();
+        let peak_dbfs = 20.0 * peak2.sqrt().max(1.0e-12).log10();
+
+        // ── FFT (needed for spectrum AND for carrier-leak/OBW) ────────────
+        // Take the centre FFT_LEN samples (avoids the band-edges of overlap-add
+        // fcfb output where amplitude is artificially reduced).
+        let start = (samples.len() - Self::FFT_LEN) / 2;
+        for i in 0..Self::FFT_LEN {
+            self.fft_buffer[i] = samples[start + i] * self.window[i];
+        }
+        self.fft.process(&mut self.fft_buffer);
+
+        // Linear magnitude² in unshifted order — reused below.
+        let mut mag2 = vec![0.0_f32; Self::FFT_LEN];
+        for i in 0..Self::FFT_LEN {
+            let m = self.fft_buffer[i].norm() / Self::FFT_LEN as RealSample;
+            mag2[i] = m * m;
+        }
+
+        // dB-tenths spectrum, fftshift'd (DC in middle, negative freqs on left).
+        let spectrum_db_tenths: Vec<i16> = (0..Self::FFT_LEN)
+            .map(|i| {
+                let idx = (i + Self::FFT_LEN / 2) % Self::FFT_LEN;
+                let m = mag2[idx].sqrt();
+                (20.0 * m.max(1.0e-12).log10() * 10.0)
+                    .round()
+                    .clamp(i16::MIN as RealSample, i16::MAX as RealSample) as i16
+            })
+            .collect();
+
+        // Constellation recovery is also needed for the visual path AND for EVM.
+        // We compute it once and reuse.
+        let (constellation_iq, evm_pct) = self.measured_constellation_with_evm(samples);
+
+        // ── Fast visual emit ─────────────────────────────────────────────
+        if need_visual {
+            self.next_visual_emit = now + self.visual_interval;
+            self.sink.send(TelemetryEvent::TxVisual {
+                sample_rate: self.sample_rate,
+                center_freq_hz: self.center_frequency,
+                rms_dbfs,
+                peak_dbfs,
+                spectrum_db_tenths,
+                constellation_iq,
+            });
+        }
+
+        // ── Slow quality emit ────────────────────────────────────────────
+        if need_quality {
+            self.next_quality_emit = now + self.quality_interval;
+
+            // PAPR
+            let papr_db = peak_dbfs - rms_dbfs;
+
+            // DC offset
+            let dc_offset_i = sum_i / n;
+            let dc_offset_q = sum_q / n;
+
+            // IQ amplitude imbalance (Var(I) vs Var(Q) in dB).
+            let var_i = (sum_i2 / n) - dc_offset_i * dc_offset_i;
+            let var_q = (sum_q2 / n) - dc_offset_q * dc_offset_q;
+            let iq_amplitude_imbalance_db = if var_i > 1.0e-12 && var_q > 1.0e-12 {
+                10.0 * (var_i / var_q).log10()
+            } else { 0.0 };
+
+            // IQ phase imbalance via E[I·Q] normalized by sqrt(Var(I)·Var(Q)).
+            let cov_iq = (sum_iq / n) - dc_offset_i * dc_offset_q;
+            let phase_sin = if var_i > 1.0e-12 && var_q > 1.0e-12 {
+                (cov_iq / (var_i * var_q).sqrt()).clamp(-1.0, 1.0)
+            } else { 0.0 };
+            let iq_phase_imbalance_deg = phase_sin.asin().to_degrees();
+
+            // Carrier leakage: DC-bin power vs total.
+            let dc_power = mag2[0];
+            let total_power: RealSample = mag2.iter().sum::<RealSample>().max(1.0e-12);
+            let carrier_leakage_db = 10.0 * (dc_power / total_power).max(1.0e-12).log10();
+
+            // Occupied bandwidth (ETSI 99%).
+            let occupied_bandwidth_hz = occupied_bandwidth(&mag2, self.sample_rate, 0.99);
+
+            self.sink.send(TelemetryEvent::TxQuality {
+                papr_db,
+                evm_pct,
+                dc_offset_i,
+                dc_offset_q,
+                iq_amplitude_imbalance_db,
+                iq_phase_imbalance_deg,
+                carrier_leakage_db,
+                occupied_bandwidth_hz,
+            });
+        }
+    }
+
+    /// Recover symbol-rate IQ samples AND compute RMS-normalized EVM in one pass.
+    /// Returns (interleaved I,Q,... as i16, EVM in %). EVM is computed only over the
+    /// freshly-derotated symbols in this call, not over the rolling history.
+    fn measured_constellation_with_evm(&mut self, samples: &[ComplexSample]) -> (Vec<i16>, f32) {
+        // TETRA symbol rate is 18 kbaud (π/4-DQPSK). At our typical 600 kHz SDR
+        // sample rate that's 33.3 samples/symbol.
+        let samples_per_symbol = self.sample_rate / 18_000.0;
+        if !samples_per_symbol.is_finite() || samples_per_symbol < 1.0 {
+            return (Vec::new(), 0.0);
+        }
+
+        let Some((phase, rotation, gain)) = constellation_timing_rotation_gain(samples, samples_per_symbol) else {
+            return (Vec::new(), 0.0);
+        };
+
+        let (sin_rot, cos_rot) = rotation.sin_cos();
+        // Accumulators for this call's EVM computation. RMS-normalized EVM per 3GPP TS 36.104:
+        //   EVM = sqrt( mean(|measured − ideal|²) / mean(|ideal|²) )
+        // For π/4-DQPSK the ideal points sit on the unit circle, so mean(|ideal|²) = 1.
+        let mut err_sum: RealSample = 0.0;
+        let mut err_count: usize = 0;
+        let mut sample_at = phase;
+        while sample_at < samples.len() as RealSample {
+            let idx = sample_at.round() as usize;
+            if let Some(sample) = samples.get(idx) {
+                let derotated = ComplexSample {
+                    re: (sample.re * cos_rot + sample.im * sin_rot) / gain,
+                    im: (sample.im * cos_rot - sample.re * sin_rot) / gain,
+                };
+                if derotated.norm() > 0.05 {
+                    self.constellation_history.push(derotated);
+
+                    // EVM: snap to nearest of 8 ideal π/4-DQPSK constellation points (unit circle)
+                    // and accumulate squared error.
+                    let angle = derotated.im.atan2(derotated.re).rem_euclid(std::f32::consts::TAU);
+                    let ideal_angle = (angle / std::f32::consts::FRAC_PI_4).round() * std::f32::consts::FRAC_PI_4;
+                    let ideal = ComplexSample { re: ideal_angle.cos(), im: ideal_angle.sin() };
+                    let err = derotated - ideal;
+                    err_sum += err.norm_sqr();
+                    err_count += 1;
+                }
+            }
+            sample_at += samples_per_symbol;
+        }
+
+        let evm_pct = if err_count >= 8 {
+            // sqrt(mean squared error) * 100. Ideal-power normalization factor is 1
+            // because ideal points are on the unit circle (|ideal|² = 1).
+            (err_sum / err_count as RealSample).sqrt() * 100.0
+        } else {
+            0.0
+        };
+
+        if self.constellation_history.len() > Self::CONSTELLATION_POINTS {
+            let excess = self.constellation_history.len() - Self::CONSTELLATION_POINTS;
+            self.constellation_history.drain(0..excess);
+        }
+
+        let mut points = Vec::with_capacity(self.constellation_history.len() * 2);
+        for sample in &self.constellation_history {
+            points.push(
+                (sample.re.clamp(-1.5, 1.5) * Self::CONSTELLATION_ENCODE_SCALE)
+                    .round()
+                    .clamp(i16::MIN as RealSample, i16::MAX as RealSample) as i16,
+            );
+            points.push(
+                (sample.im.clamp(-1.5, 1.5) * Self::CONSTELLATION_ENCODE_SCALE)
+                    .round()
+                    .clamp(i16::MIN as RealSample, i16::MAX as RealSample) as i16,
+            );
+        }
+        (points, evm_pct)
+    }
+}
+
+/// Find the smallest contiguous band around the centre bin that contains the
+/// requested fraction of total power. Returns the bandwidth in Hz.
+///
+/// Walks outward from the centre bin (DC after fftshift) by symmetric pairs,
+/// integrating power until the threshold is crossed. This matches the ETSI
+/// occupied-bandwidth definition (99% for OBW-99) commonly used for spectrum
+/// mask compliance.
+///
+/// `mag2_unshifted` is the magnitude-squared spectrum in standard (non-fftshift'd)
+/// FFT order — bin 0 = DC, bins 1..N/2 = positive freqs, bins N/2..N = negative.
+fn occupied_bandwidth(mag2_unshifted: &[RealSample], sample_rate: RealSample, fraction: RealSample) -> RealSample {
+    let n = mag2_unshifted.len();
+    if n < 4 { return 0.0; }
+    let total: RealSample = mag2_unshifted.iter().sum::<RealSample>();
+    if total <= 1.0e-12 { return 0.0; }
+    let target = total * fraction;
+
+    // Accumulate DC bin first, then symmetric pairs (k, N-k) representing +/- k.
+    let mut accum = mag2_unshifted[0];
+    let half = n / 2;
+    for k in 1..=half {
+        if accum >= target {
+            // (k-1) bins each side of DC produced the threshold crossing.
+            // Bandwidth covered = (2*(k-1)+1) bins → in Hz scaled by bin spacing.
+            let bins = (2 * (k - 1) + 1) as RealSample;
+            return bins * sample_rate / n as RealSample;
+        }
+        accum += mag2_unshifted[k];
+        if k != half {
+            accum += mag2_unshifted[n - k];
+        }
+    }
+    // Whole band crosses → return full sample rate as the OBW.
+    sample_rate
+}
+
+/// Sweep 64 timing offsets within one symbol period to find the best constellation
+/// sampling instant. For each candidate offset, we estimate the constellation rotation
+/// and gain, then score by squared distance to ideal π/4-DQPSK points. Lower score = better.
+fn constellation_timing_rotation_gain(
+    samples: &[ComplexSample],
+    samples_per_symbol: RealSample,
+) -> Option<(RealSample, RealSample, RealSample)> {
+    const STEPS: usize = 64;
+    let mut best: Option<(RealSample, RealSample, RealSample, RealSample)> = None;
+
+    for step in 0..STEPS {
+        let phase = samples_per_symbol * step as RealSample / STEPS as RealSample;
+        let points = constellation_points_for_phase(samples, samples_per_symbol, phase);
+        if points.len() < 8 {
+            continue;
+        }
+        let rotation = constellation_rotation(&points)?;
+        let (sin_rot, cos_rot) = rotation.sin_cos();
+        let mut radius_sum = 0.0;
+        let mut radius_count = 0usize;
+        for point in &points {
+            let derotated = ComplexSample {
+                re: point.re * cos_rot + point.im * sin_rot,
+                im: point.im * cos_rot - point.re * sin_rot,
+            };
+            let radius = derotated.norm();
+            if radius > 1.0e-5 {
+                radius_sum += radius;
+                radius_count += 1;
+            }
+        }
+        if radius_count < 8 {
+            continue;
+        }
+        let gain = radius_sum / radius_count as RealSample;
+        let mut err_sum = 0.0;
+        let mut err_count = 0usize;
+        for point in &points {
+            let derotated = ComplexSample {
+                re: (point.re * cos_rot + point.im * sin_rot) / gain,
+                im: (point.im * cos_rot - point.re * sin_rot) / gain,
+            };
+            let radius = derotated.norm();
+            if radius < 0.05 {
+                continue;
+            }
+            let angle = derotated.im.atan2(derotated.re).rem_euclid(std::f32::consts::TAU);
+            let ideal = (angle / (std::f32::consts::FRAC_PI_4)).round() * std::f32::consts::FRAC_PI_4;
+            let ideal_point = ComplexSample {
+                re: ideal.cos(),
+                im: ideal.sin(),
+            };
+            let err = derotated - ideal_point;
+            err_sum += err.norm_sqr();
+            err_count += 1;
+        }
+        if err_count < 8 {
+            continue;
+        }
+        let score = err_sum / err_count as RealSample;
+        match best {
+            Some((best_score, _, _, _)) if score >= best_score => {}
+            _ => best = Some((score, phase, rotation, gain.max(1.0e-5))),
+        }
+    }
+
+    best.map(|(_, phase, rotation, gain)| (phase, rotation, gain))
+}
+
+fn constellation_points_for_phase(samples: &[ComplexSample], samples_per_symbol: RealSample, phase: RealSample) -> Vec<ComplexSample> {
+    let mut points = Vec::new();
+    let mut sample_at = phase;
+    while sample_at < samples.len() as RealSample {
+        let idx = sample_at.round() as usize;
+        if let Some(sample) = samples.get(idx) {
+            points.push(*sample);
+        }
+        sample_at += samples_per_symbol;
+    }
+    points
+}
+
+/// Estimate the constellation rotation by treating each point as an 8th-order vector
+/// (π/4-DQPSK has 8 ideal phases) and finding the dominant angle. Returns the rotation
+/// in radians (the angle that, applied as a derotation, lines points up with the
+/// real and imaginary axes).
+fn constellation_rotation(points: &[ComplexSample]) -> Option<RealSample> {
+    let max_radius = points.iter().map(|point| point.norm()).fold(0.0, RealSample::max);
+    if max_radius <= 1.0e-6 {
+        return None;
+    }
+
+    let min_radius = max_radius * 0.25;
+    let mut sum_re = 0.0;
+    let mut sum_im = 0.0;
+    let mut weight_sum = 0.0;
+    for point in points {
+        let radius = point.norm();
+        if radius < min_radius {
+            continue;
+        }
+        let phase = point.im.atan2(point.re) * 8.0;
+        let weight = radius * radius;
+        sum_re += phase.cos() * weight;
+        sum_im += phase.sin() * weight;
+        weight_sum += weight;
+    }
+
+    if weight_sum <= 1.0e-9 {
+        None
+    } else {
+        Some(sum_im.atan2(sum_re) / 8.0)
+    }
+}
+
+// ── SDR hardware health monitor ──────────────────────────────────────────────
+//
+// Polls the radio every ~5 seconds for temperature and gain readback. Designed
+// to be cheap enough to run inline on the PHY tick loop — Soapy reads are typically
+// sub-millisecond. Emitted as TelemetryEvent::SdrHealth so the dashboard can show
+// hardware temp, real gain values, and warn the operator about thermal drift.
+//
+// Implemented as a separate type (not bundled into TxSignalMonitor) because:
+//   1. Different cadence (5 s vs 1 s).
+//   2. Different data (no DSP, just hardware introspection).
+//   3. Some SDRs don't expose any sensors — we still want TX DSP metrics on those.
+
+struct SdrHealthMonitor {
+    sink: TelemetrySink,
+    /// Wall-clock time of next emission. Initialised to "now-ish" so the first tick fires immediately.
+    next_emit: std::time::Instant,
+    /// Polling interval.
+    interval: std::time::Duration,
+}
+
+impl SdrHealthMonitor {
+    fn new(sink: TelemetrySink) -> Self {
+        Self {
+            sink,
+            next_emit: std::time::Instant::now(),
+            interval: std::time::Duration::from_secs(5),
+        }
+    }
+
+    fn tick(&mut self, sdr: &soapyio::SoapyIo) {
+        let now = std::time::Instant::now();
+        if now < self.next_emit { return; }
+        self.next_emit = now + self.interval;
+
+        let temperature_c = sdr.read_temperature_c();
+        let tx_gains = sdr.read_tx_gains();
+        let rx_gains = sdr.read_rx_gains();
+
+        self.sink.send(TelemetryEvent::SdrHealth {
+            temperature_c,
+            tx_gains,
+            rx_gains,
+        });
+    }
 }
