@@ -199,11 +199,6 @@ impl SdsBsSubentity {
             len_bits
         );
 
-        if !self.config.state_read().subscribers.is_registered(dest_ssi) {
-            tracing::warn!("SDS: dest ISSI {} from Control is not locally registered, dropping", dest_ssi);
-            return false;
-        }
-
         // SDS-TL Simple Text Message — format verificat din tetraflow-sds-bot:
         //   Byte 0: 0x82  — Protocol Identifier (SDS-TL text messaging)
         //   Byte 1: 0x04  — Message Type (Simple Text, cu TL-ACK request)
@@ -222,13 +217,41 @@ impl SdsBsSubentity {
         };
         let wrapped_len_bits = (wrapped_payload.len() * 8) as u16;
 
-        self.send_d_sds_data(
-            queue,
-            source_ssi,
-            dest_ssi,
-            if dest_is_group { SsiType::Gssi } else { SsiType::Issi },
-            SdsUserData::Type4(wrapped_len_bits, wrapped_payload),
-        );
+        // Route: local delivery (ISSI/GSSI), Brew forward, or drop.
+        // Mirrors the routing pattern used by `rx_sds_from_brew` and SDS-STATUS in this file:
+        // dashboard-originated SDS to a non-local destination should be forwarded to Brew
+        // so it can be delivered by the cell that owns the destination ISSI.
+        let is_local_issi = !dest_is_group && self.config.state_read().subscribers.is_registered(dest_ssi);
+        let is_local_group = dest_is_group && self.config.state_read().subscribers.has_group_members(dest_ssi);
+
+        if is_local_issi || is_local_group {
+            tracing::info!("SDS: local delivery from Control: {} -> {}", source_ssi, dest_ssi);
+            self.send_d_sds_data(
+                queue,
+                source_ssi,
+                dest_ssi,
+                if dest_is_group { SsiType::Gssi } else { SsiType::Issi },
+                SdsUserData::Type4(wrapped_len_bits, wrapped_payload),
+            );
+        } else if net_brew::feature_sds_enabled(&self.config) {
+            tracing::info!("SDS: forwarding Control SDS to Brew: {} -> {}", source_ssi, dest_ssi);
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Cmce,
+                dest: TetraEntity::Brew,
+                msg: SapMsgInner::CmceSdsData(CmceSdsData {
+                    source_issi: source_ssi,
+                    dest_issi: dest_ssi,
+                    user_defined_data: SdsUserData::Type4(wrapped_len_bits, wrapped_payload),
+                }),
+            });
+        } else {
+            tracing::warn!(
+                "SDS: dest ISSI {} from Control not locally registered and Brew SDS not enabled, dropping",
+                dest_ssi
+            );
+            return false;
+        }
 
         true
     }
