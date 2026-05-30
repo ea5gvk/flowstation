@@ -105,9 +105,13 @@ impl ReservationRequirement {
     /// Returns 99 when over 69 subslots are required
     pub fn to_req_slotcount(&self) -> usize {
         match self {
+            // Req1Subslot is the half-slot reservation; callers should branch on this
+            // before calling to_req_slotcount(). Return 0 as a documented fallback
+            // (the "first subslot granted" capacity encoding) so a future caller that
+            // forgets the special case logs a warning instead of crashing the worker.
             ReservationRequirement::Req1Subslot => {
-                unimplemented!();
-                // 0
+                tracing::warn!("ReservationRequirement::Req1Subslot::to_req_slotcount called; caller should branch on Req1Subslot");
+                0
             }
             ReservationRequirement::Req1Slot => 1,
             ReservationRequirement::Req2Slots => 2,
@@ -123,9 +127,13 @@ impl ReservationRequirement {
             ReservationRequirement::Req34Slots => 34,
             ReservationRequirement::Req51Slots => 51,
             ReservationRequirement::Req68Slots => 68,
+            // ReqOver68 (raw value 15) is valid wire data per ETSI Table 21.x.
+            // We don't currently schedule >68 contiguous slots, so cap at 68 and
+            // log a warning. This is far better than the old `unimplemented!()`
+            // which crashed the scheduler on any MS that requested it.
             ReservationRequirement::ReqOver68 => {
-                unimplemented!();
-                // 99
+                tracing::warn!("ReservationRequirement::ReqOver68 received; capping at 68 slots");
+                68
             }
         }
     }

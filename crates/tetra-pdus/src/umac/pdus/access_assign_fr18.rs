@@ -92,13 +92,27 @@ impl AccessAssignFr18 {
                 });
             }
             3 => {
-                // UL usage counts as CommonAndAssigned, but with traffic marker
-                let ul_usage = AccessAssignUlUsage::from_usage_marker(field1);
-                s.ul_usage = ul_usage.ok_or(PduParseErr::InvalidValue {
+                // UL usage counts as CommonAndAssigned, but with traffic marker (UMt).
+                //
+                // Per ETSI EN 300 392-2 Table 21.82, header=11 on frame 18 requires a
+                // *traffic* usage marker. Non-traffic values (Unallocated, AssignedOnly,
+                // CommonOnly, CommonAndAssigned) are forbidden here. Previously we
+                // accepted the parse and then `assert!`-ed is_traffic, which crashed the
+                // worker on the first malformed AACH burst we received (could happen on
+                // interference, a buggy MS, or hostile traffic). Return InvalidValue
+                // instead so the caller can drop the block and keep running. Credit to
+                // proxiboi69 in MidnightBlueLabs/tetra-bluestation PR #85 for spotting it.
+                let ul_usage = AccessAssignUlUsage::from_usage_marker(field1).ok_or(PduParseErr::InvalidValue {
                     field: "ul_usage",
                     value: field1 as u64,
                 })?;
-                assert!(ul_usage.unwrap().is_traffic());
+                if !ul_usage.is_traffic() {
+                    return Err(PduParseErr::InvalidValue {
+                        field: "ul_usage",
+                        value: field1 as u64,
+                    });
+                }
+                s.ul_usage = ul_usage;
 
                 s.f2_af = Some(AccessField {
                     access_code: (field2 >> 4) & 0x3,

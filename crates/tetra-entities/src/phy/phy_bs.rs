@@ -2,7 +2,7 @@ use crossbeam_channel::Sender;
 
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, BurstType, PhyBlockNum, PhyBlockType, Sap, TdmaTime, TrainingSequence};
+use tetra_core::{BitBuffer, BurstType, PhyBlockNum, PhyBlockType, Sap, TdmaTime, TrainingSequence, unimplemented_log};
 use tetra_pdus::phy::traits::rxtx_dev::RxBurstBits;
 use tetra_pdus::phy::traits::rxtx_dev::{RxTxDev, TxSlotBits};
 use tetra_saps::tp::TpUnitdataInd;
@@ -270,7 +270,8 @@ impl<D: RxTxDev> PhyBs<D> {
     }
 
     fn rx_tpc_prim(&mut self, _queue: &mut MessageQueue, _message: SapMsg) {
-        unimplemented!();
+        // TPC SAP not implemented yet. Log instead of crashing the PHY worker.
+        unimplemented_log!("rx_tpc_prim: TPC SAP not implemented");
     }
 }
 

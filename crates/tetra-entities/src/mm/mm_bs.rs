@@ -530,16 +530,56 @@ impl MmBs {
         };
         queue.push_back(msg);
 
-        // Send D-LOCATION-UPDATE-COMMAND only on genuine first attach (ItsiAttach or Demand),
-        // NOT on RoamingLocationUpdating. Motorola terminals (MTM800, MXP600) respond to
-        // D-LOCATION-UPDATE-COMMAND with another RoamingLocationUpdating instead of
-        // DemandLocationUpdating, which triggers needs_cleanup=true → Deregister → is_new=true
-        // again, creating an infinite registration loop.
+        // Decide whether to send D-LOCATION-UPDATE-COMMAND, which prompts the MS to
+        // re-send a full demand including TEI/class-of-MS and a group identity report.
+        //
+        // Per ETSI EN 300 392-2 §16.9.3.4 note 2: if the MS omits "class of MS" (or
+        // extended capabilities) and the SwMI needs it, the SwMI may accept and then
+        // send a D-LOCATION-UPDATE-COMMAND.
+        //
+        // History / tension between terminal vendors:
+        //  - Motorola MTM800/MXP600 respond to a COMMAND on a *roaming* update with yet
+        //    another RoamingLocationUpdating (not DemandLocationUpdating). If we always
+        //    sent COMMAND on roaming this produced needs_cleanup → Deregister → is_new
+        //    again, i.e. an infinite registration loop. So historically we only sent
+        //    COMMAND on a genuine first attach (is_new && !is_roaming).
+        //  - But the Motorola TPG2200 *pager* comes up (power-on, DMO→TMO) with a
+        //    RoamingLocationUpdating that carries NO group identity report and we have no
+        //    stored groups for it. Without a COMMAND it never reports its groups, so it
+        //    stays unaffiliated and shows "Unit Not Attached" until kicked (FH-BUG-027).
+        //
+        // Resolution: send COMMAND when the MS is genuinely new, OR when it has provided
+        // no groups *and* we hold no groups for it yet — regardless of roaming. The
+        // anti-loop guard is pending_command_sent: once we've sent a COMMAND we don't
+        // send another until the MS completes registration (which clears the flag), so a
+        // Motorola handset that answers a COMMAND with RoamingLocationUpdating won't be
+        // sent a second COMMAND and can't loop.
         let is_roaming = pdu.location_update_type == LocationUpdateType::RoamingLocationUpdating
             || pdu.location_update_type == LocationUpdateType::ServiceRestorationRoamingLocationUpdating;
-        if is_new && !is_roaming {
-            tracing::info!("Sending D-LOCATION UPDATE COMMAND to MS {} to prompt TEI and group report", issi);
+        let has_stored_groups = self.client_mgr
+            .get_client_by_issi(issi)
+            .map(|c| !c.groups.is_empty())
+            .unwrap_or(false);
+        let needs_group_report = !_has_groups && !has_stored_groups;
+        // Anti-loop guard: was_pending was captured at the top of this handler, BEFORE
+        // reset_registration_timer() cleared the flag. If we had already sent a COMMAND in
+        // the previous cycle and the MS is only now answering, was_pending is true and we
+        // must not send another COMMAND — this is exactly the Motorola handset case that
+        // would otherwise loop.
+        let send_command = !was_pending
+            && ((is_new && !is_roaming) || needs_group_report);
+
+        if send_command {
+            tracing::info!(
+                "Sending D-LOCATION UPDATE COMMAND to MS {} (is_new={} roaming={} needs_group_report={})",
+                issi, is_new, is_roaming, needs_group_report
+            );
             Self::send_d_location_update_command(queue, issi, handle);
+            // Mark so we don't re-issue a COMMAND (and risk a Motorola loop) before the
+            // MS has had a chance to complete this registration cycle. grace = periodic
+            // interval if configured, else a short fixed window.
+            let grace = self.config.config().cell.periodic_registration_secs.max(30);
+            self.client_mgr.set_pending_command(issi, grace);
         }
     }
 
@@ -748,7 +788,13 @@ impl MmBs {
         // confirm; the MS will keep re-requesting the remaining groups in subsequent
         // attach cycles per ETSI clause 16.4.3.
         const MAX_GROUPS_PER_ATTACH: usize = 12;
-        let giu = pdu.group_identity_uplink.unwrap();
+        // feature_check_u_attach_detach_group_identity above guarantees this is Some,
+        // but use let-else instead of .unwrap() so a future refactor that loosens that
+        // check doesn't crash the MM worker on a malformed PDU.
+        let Some(giu) = pdu.group_identity_uplink else {
+            tracing::warn!("rx_u_attach_detach_group_identity: group_identity_uplink missing after feature_check; ignoring");
+            return;
+        };
         let (giu_clamped, dropped) = if giu.len() > MAX_GROUPS_PER_ATTACH {
             tracing::warn!(
                 "ISSI {} requested attach/detach for {} groups; capped at {} per ETSI PDU size limit. MS will retry remaining in next cycle.",
@@ -841,12 +887,17 @@ impl MmBs {
         let mut deaff_groups = Vec::new();
 
         for giu in giu_vec.iter() {
-            if giu.gssi.is_none() || giu.vgssi.is_some() || giu.address_extension.is_some() {
+            // Currently only address_type=0 (plain GSSI) is implemented. Anything else
+            // (vgssi, address extension, missing gssi) is unsupported — log and skip.
+            let Some(gssi) = giu.gssi else {
+                unimplemented_log!("GroupIdentityUplink without gssi field");
+                continue;
+            };
+            if giu.vgssi.is_some() || giu.address_extension.is_some() {
                 unimplemented_log!("Only support GroupIdentityUplink with address_type 0");
                 continue;
             }
 
-            let gssi = giu.gssi.unwrap(); // can't fail
             let is_detach = giu.group_identity_detachment_uplink.is_some();
 
             if is_detach {
@@ -879,10 +930,30 @@ impl MmBs {
                             self.config.state_write().subscribers.affiliate(issi, gssi);
                             aff_groups.push(gssi);
                         }
-                        // We have added the client to this group. Add an entry to the downlink response
+                        // We have added the client to this group. Add an entry to the downlink response.
+                        //
+                        // group_identity_attachment_lifetime values (ETSI EN 300 392-2 §16.10.19):
+                        //   0 = Attachment not needed → MS keeps the group attached indefinitely
+                        //                                until an explicit detach. This is what we want
+                        //                                for scan lists / persistent group attachments.
+                        //   1 = Attachment required for the next ITSI attach → MS re-affiliates on next
+                        //                                ITSI attach (rare event: reboot, cell reselect).
+                        //   2 = Attachment not allowed for next ITSI attach → SwMI denies.
+                        //   3 = Attachment required for next location update → MS re-affiliates at every
+                        //                                LU (every few minutes), generating churn.
+                        //
+                        // We previously used 1 with a "good default" comment, but that interacted badly
+                        // with Motorola MTP-series radios in scan-list mode: those radios send the scan
+                        // list incrementally (2 GSSIs at a time, with one anchor + one new GSSI), and
+                        // expect the BS-side affiliation to persist between batches. With lifetime=1 the
+                        // MS internally drops the affiliation a few minutes later ("5-minute timer" per
+                        // dk5ras), then PTT fails with "Unit not attached" until the user changes GSSI.
+                        // Lifetime=0 makes the attachment persistent on the MS side — matching the BS
+                        // side which already keeps affiliations across attach cycles — and resolves
+                        // FH-BUG-022.
                         let gid = GroupIdentityDownlink {
                             group_identity_attachment: Some(GroupIdentityAttachment {
-                                group_identity_attachment_lifetime: 1, // re-attach after ITSI attach (ETSI default per clause 16.4.2)
+                                group_identity_attachment_lifetime: 0,
                                 class_of_usage: giu.class_of_usage.unwrap_or(0),
                             }),
                             group_identity_detachment_uplink: None,
@@ -964,7 +1035,11 @@ impl MmBs {
         use tetra_pdus::mm::fields::group_identity_attachment::GroupIdentityAttachment;
         let gid: Vec<GroupIdentityDownlink> = groups.iter().map(|&gssi| GroupIdentityDownlink {
             group_identity_attachment: Some(GroupIdentityAttachment {
-                group_identity_attachment_lifetime: 1,
+                // 0 = Attachment not needed = persistent on MS side. See the
+                // long comment in try_attach_detach_groups for why this
+                // (rather than 1 / "until next ITSI attach") is the correct
+                // choice for scan-list-heavy Motorola radios.
+                group_identity_attachment_lifetime: 0,
                 class_of_usage: 4,
             }),
             group_identity_detachment_uplink: None,

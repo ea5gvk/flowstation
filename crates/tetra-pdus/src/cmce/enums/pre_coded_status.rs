@@ -15,10 +15,22 @@ pub enum PreCodedStatus {
 
 impl From<u16> for PreCodedStatus {
     fn from(x: u16) -> Self {
+        // ETSI EN 300 392-2 Table 14.72:
+        //   0           = Emergency
+        //   1..=31743   = Reserved
+        //   31744..=32767 = SDS-TL short report (pdu_type bits 15..10 == 0b011111)
+        //   32768..=65535 = Network/User Specific
+        //
+        // SDS-TL parsing can fail (expect_value on pdu_type bits, plus future
+        // additions to ShortReportType), so fall back to Reserved(x) on Err
+        // rather than panic on an unwrap. Wire traffic is never trusted input.
         match x {
             0 => PreCodedStatus::Emergency,
-            1..=31742 => PreCodedStatus::Reserved(x),
-            31743..=32767 => PreCodedStatus::SdsTl(SdsShortReport::from_u16(x).unwrap()),
+            1..=31743 => PreCodedStatus::Reserved(x),
+            31744..=32767 => match SdsShortReport::from_u16(x) {
+                Ok(report) => PreCodedStatus::SdsTl(report),
+                Err(_) => PreCodedStatus::Reserved(x),
+            },
             32768..=65535 => PreCodedStatus::NetworkUserSpecific(x),
         }
     }

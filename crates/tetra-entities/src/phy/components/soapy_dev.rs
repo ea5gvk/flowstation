@@ -152,9 +152,11 @@ impl RxTxDev for RxTxDevSoapySdr {
             while self.process_tx_block(tx_slot)? {}
         }
 
-        // SDR health: temperature + gain readback, throttled to once every ~5 s.
-        // Done here (not on a separate thread) so we can borrow &mut self.sdr safely
-        // without locking. The Soapy reads are fast (<<1 ms typically).
+        // SDR health: temperature readback, throttled to once every ~10 s.
+        // Done here (not on a separate thread) so we can borrow &self.sdr safely
+        // without locking. Only the temperature is read live now; gains are cached after
+        // the first read because they never change and the USB readback was stalling the
+        // PHY thread (FH-BUG-023). The single remaining sensor read is cheap and rare.
         if let Some(health) = &mut self.health {
             health.tick(&self.sdr);
         }
@@ -1013,6 +1015,15 @@ struct SdrHealthMonitor {
     next_emit: std::time::Instant,
     /// Polling interval.
     interval: std::time::Duration,
+    /// Cached TX/RX gain readback. The gains are configured once at startup and never
+    /// change at runtime, so reading them back from the SDR on every health tick is
+    /// pointless — and on USB SDRs (LimeSDR Mini) each list_gains()/gain_element() call
+    /// is a synchronous USB transaction taking 5-15 ms. Doing ~9 of them every 5 s on the
+    /// PHY thread stalled TX block production for 45-135 ms, producing the "Too late to
+    /// produce TX block, skipping N blocks" warnings every 5 s (FH-BUG-023). We now read
+    /// the gains exactly once (lazily, on the first tick) and reuse the cached values.
+    cached_tx_gains: Option<Vec<(String, f32)>>,
+    cached_rx_gains: Option<Vec<(String, f32)>>,
 }
 
 impl SdrHealthMonitor {
@@ -1020,7 +1031,11 @@ impl SdrHealthMonitor {
         Self {
             sink,
             next_emit: std::time::Instant::now(),
-            interval: std::time::Duration::from_secs(5),
+            // 10 s rather than 5 s: temperature drifts slowly, and this halves the
+            // residual PHY-thread cost of the one remaining sensor read.
+            interval: std::time::Duration::from_secs(10),
+            cached_tx_gains: None,
+            cached_rx_gains: None,
         }
     }
 
@@ -1029,9 +1044,18 @@ impl SdrHealthMonitor {
         if now < self.next_emit { return; }
         self.next_emit = now + self.interval;
 
+        // Only the temperature is read live — it's a single sensor read and the value
+        // genuinely changes. Gains are cached after the first read (see field docs).
         let temperature_c = sdr.read_temperature_c();
-        let tx_gains = sdr.read_tx_gains();
-        let rx_gains = sdr.read_rx_gains();
+
+        if self.cached_tx_gains.is_none() {
+            self.cached_tx_gains = Some(sdr.read_tx_gains());
+        }
+        if self.cached_rx_gains.is_none() {
+            self.cached_rx_gains = Some(sdr.read_rx_gains());
+        }
+        let tx_gains = self.cached_tx_gains.clone().unwrap_or_default();
+        let rx_gains = self.cached_rx_gains.clone().unwrap_or_default();
 
         self.sink.send(TelemetryEvent::SdrHealth {
             temperature_c,

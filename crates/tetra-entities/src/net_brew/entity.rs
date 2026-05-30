@@ -115,7 +115,10 @@ pub struct BrewEntity {
     dl_jitter: HashMap<Uuid, VoiceJitterBuffer>,
     /// Jitter buffers that are draining after GROUP_IDLE — kept alive until empty so the
     /// last frames of a transmission are played out instead of being silently discarded.
-    draining_jitter: HashMap<Uuid, (u8, VoiceJitterBuffer)>,
+    /// The Instant records when draining started, so a buffer whose timeslot stops being
+    /// scheduled (and therefore never finishes draining naturally) can be reaped instead
+    /// of leaking across repeated PTT cycles.
+    draining_jitter: HashMap<Uuid, (u8, VoiceJitterBuffer, Instant)>,
 
     /// DL calls in hangtime keyed by dest_gssi — circuit stays open, waiting for
     /// new speaker or timeout. Only one hanging call per GSSI.
@@ -634,12 +637,17 @@ impl BrewEntity {
                 hanging.since.elapsed().as_secs_f32()
             );
 
-            // Track the call - resources will be set by NetworkCallReady
+            // Track the call. Carry over the resources the hanging circuit already
+            // had (call_id/ts/usage) as a fallback: when CMCE reuses the circuit it
+            // may not emit a fresh NetworkCallReady, and if these stayed None the call
+            // could never be re-marked as hanging on its next end — leaking the circuit
+            // and breaking reuse on subsequent PTTs. NetworkCallReady, if it does come,
+            // will simply overwrite these with identical values.
             let call = ActiveCall {
                 uuid,
-                call_id: None, // Set by NetworkCallReady
-                ts: None,      // Set by NetworkCallReady
-                usage: None,   // Set by NetworkCallReady
+                call_id: Some(hanging.call_id),
+                ts: Some(hanging.ts),
+                usage: Some(hanging.usage),
                 source_issi,
                 dest_gssi,
                 frame_count: hanging.frame_count,
@@ -716,7 +724,7 @@ impl BrewEntity {
                         "BrewEntity: GROUP_IDLE uuid={} moving {} buffered frames to drain",
                         uuid, jitter.len()
                     );
-                    self.draining_jitter.insert(uuid, (ts, jitter));
+                    self.draining_jitter.insert(uuid, (ts, jitter, Instant::now()));
                 }
             }
         }
@@ -739,6 +747,20 @@ impl BrewEntity {
 
         // Track as hanging for potential reuse (only if resources were allocated)
         if let (Some(call_id), Some(ts), Some(usage)) = (call.call_id, call.ts, call.usage) {
+            // If a hanging call already exists for this GSSI (e.g. rapid PTT cycling on
+            // the same group), the previous hanging entry's UUID would be silently
+            // overwritten and leak — its jitter/active state never cleaned and TetraPack
+            // left with a dangling session reference. Drop the stale one explicitly first.
+            if let Some(stale) = self.hanging_calls.remove(&call.dest_gssi) {
+                if stale.uuid != uuid {
+                    tracing::debug!(
+                        "BrewEntity: replacing stale hanging call gssi={} old_uuid={} new_uuid={}",
+                        call.dest_gssi, stale.uuid, uuid
+                    );
+                    self.dl_jitter.remove(&stale.uuid);
+                    self.draining_jitter.remove(&stale.uuid);
+                }
+            }
             self.hanging_calls.insert(
                 call.dest_gssi,
                 HangingCall {
@@ -844,10 +866,18 @@ impl BrewEntity {
         }
 
         // Also drain buffers from calls that ended (GROUP_IDLE) but still have frames buffered.
+        // A buffer is removed when it empties naturally, OR when it has been draining for
+        // far longer than any reasonable playout (its timeslot stopped being scheduled) —
+        // the latter guards against slow leaks under repeated PTT cycling.
+        const DRAIN_REAP_AFTER: Duration = Duration::from_secs(5);
         let finished: Vec<Uuid> = self
             .draining_jitter
             .iter_mut()
-            .filter_map(|(uuid, (ts, jitter))| {
+            .filter_map(|(uuid, (ts, jitter, started))| {
+                if started.elapsed() >= DRAIN_REAP_AFTER {
+                    // Stale: never finished draining within a sane window — reap it.
+                    return Some(*uuid);
+                }
                 if *ts != self.dltime.t {
                     return None;
                 }
@@ -861,7 +891,7 @@ impl BrewEntity {
             })
             .collect();
         for uuid in finished {
-            tracing::debug!("BrewEntity: drain complete for uuid={}", uuid);
+            tracing::debug!("BrewEntity: drain complete (or reaped) for uuid={}", uuid);
             self.draining_jitter.remove(&uuid);
         }
 
@@ -904,6 +934,16 @@ impl BrewEntity {
         self.hanging_calls.clear();
         self.dl_jitter.clear();
         self.draining_jitter.clear();
+
+        // Also clear uplink forwarding state. Without this, an MS that was transmitting
+        // (PTT held) at the moment the backhaul dropped would leave a stale ul_forwarded
+        // entry referencing a UUID the server has forgotten; after reconnect its UL voice
+        // frames would be sent against that dead UUID. A fresh PTT will re-create the
+        // entry cleanly via handle_local_call_start.
+        if !self.ul_forwarded.is_empty() {
+            tracing::debug!("BrewEntity: clearing {} stale ul_forwarded entries on release", self.ul_forwarded.len());
+            self.ul_forwarded.clear();
+        }
     }
 
     /// Handle NetworkCallReady response from CMCE

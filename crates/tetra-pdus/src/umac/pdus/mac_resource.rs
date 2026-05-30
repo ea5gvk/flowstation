@@ -94,7 +94,13 @@ impl MacResource {
 
         // Parse address type and fields
         let bits = buf.read_field(3, "addr_type")?;
-        let addr_type = MacResourceAddrType::try_from(bits).expect("invalid address type");
+        // MacResourceAddrType covers all 8 values of a 3-bit field, so this conversion
+        // cannot fail today — but propagate as InvalidValue rather than .expect() so
+        // a future enum change (or a corrupted bit-stream) doesn't crash the worker.
+        let addr_type = MacResourceAddrType::try_from(bits).map_err(|_| PduParseErr::InvalidValue {
+            field: "addr_type",
+            value: bits,
+        })?;
 
         match addr_type {
             MacResourceAddrType::NullPdu => {

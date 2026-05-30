@@ -29,7 +29,12 @@ impl SdsShortReport {
         let pdu_type = val >> 10;
         expect_value!(pdu_type, 0b011111)?;
         let raw = ((val >> 8) & 0x3) as u64;
-        let short_report_type = ShortReportType::try_from(raw).unwrap(); // never fails
+        // raw is masked to 2 bits, ShortReportType covers all 4 values today,
+        // but propagate as InvalidValue to stay panic-free if the enum changes.
+        let short_report_type = ShortReportType::try_from(raw).map_err(|_| PduParseErr::InvalidValue {
+            field: "short_report_type",
+            value: raw,
+        })?;
         let message_reference = (val & 0xFF) as u8;
 
         Ok(SdsShortReport {

@@ -443,7 +443,13 @@ impl UmacBs {
             unimplemented_log!("event labels not implemented");
             return;
         }
-        let addr = pdu.addr.unwrap();
+        // A well-formed MAC PDU must carry either addr or event_label. We already
+        // returned for event_label above; if addr is also missing the PDU is malformed
+        // — drop it instead of panicking on .unwrap().
+        let Some(addr) = pdu.addr else {
+            tracing::warn!("UMAC: rx_mac_data: PDU has neither addr nor event_label; dropping");
+            return;
+        };
 
         let (mut pdu_len_bits, is_frag_start, second_half_stolen, is_null_pdu) = {
             if let Some(len_ind) = pdu.length_ind {
@@ -468,12 +474,18 @@ impl UmacBs {
                     }
                 }
             } else {
-                // We have a capacity request
+                // We have a capacity request — per spec, MacData with cap_req must
+                // carry frag_flag. If a malformed PDU arrives without it, fall back to
+                // frag_flag=false rather than panic.
+                let frag_flag = pdu.frag_flag.unwrap_or_else(|| {
+                    tracing::warn!("rx_mac_data: cap_req PDU missing frag_flag; assuming false");
+                    false
+                });
                 tracing::trace!(
                     "rx_mac_data: cap_req {}",
-                    if pdu.frag_flag.unwrap() { "with frag_start" } else { "" }
+                    if frag_flag { "with frag_start" } else { "" }
                 );
-                (prim.pdu.get_len(), pdu.frag_flag.unwrap(), false, false)
+                (prim.pdu.get_len(), frag_flag, false, false)
             }
         };
 
@@ -523,10 +535,11 @@ impl UmacBs {
         // Handle reservation if present
         let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago. 
         if let Some(res_req) = &pdu.reservation_req {
-            let grant = self.channel_scheduler.ul_process_cap_req(msg_dltime.t, addr, res_req);
-            if let Some(grant) = grant {
-                // Schedule grant
-                self.channel_scheduler.dl_enqueue_grant(msg_dltime.t, addr, grant);
+            let grant_result = self.channel_scheduler.ul_process_cap_req(msg_dltime.t, addr, res_req);
+            if let Some((grant, usage_marker)) = grant_result {
+                // Schedule grant — marker propagates into the MAC-RESOURCE ACK
+                // so the MS can tag its reservation when continuing the burst.
+                self.channel_scheduler.dl_enqueue_grant(msg_dltime.t, addr, grant, usage_marker);
             } else {
                 tracing::warn!("rx_mac_data: No grant for reservation request {:?}", res_req);
             }
@@ -683,10 +696,11 @@ impl UmacBs {
 
         // Handle reservation if present
         if let Some(res_req) = &pdu.reservation_req {
-            let grant = self.channel_scheduler.ul_process_cap_req(msg_dltime.t, addr, res_req);
-            if let Some(grant) = grant {
-                // Schedule grant
-                self.channel_scheduler.dl_enqueue_grant(msg_dltime.t, addr, grant);
+            let grant_result = self.channel_scheduler.ul_process_cap_req(msg_dltime.t, addr, res_req);
+            if let Some((grant, usage_marker)) = grant_result {
+                // Schedule grant — marker propagates into the MAC-RESOURCE ACK
+                // so the MS can tag its reservation when continuing the burst.
+                self.channel_scheduler.dl_enqueue_grant(msg_dltime.t, addr, grant, usage_marker);
             } else {
                 tracing::warn!("rx_mac_access: No grant for reservation request {:?}", res_req);
             }
@@ -868,10 +882,11 @@ impl UmacBs {
 
         // Handle reservation if present
         if let Some(res_req) = &pdu.reservation_req {
-            let grant = self.channel_scheduler.ul_process_cap_req(msg_dltime.t, defragbuf.addr, res_req);
-            if let Some(grant) = grant {
-                // Schedule grant
-                self.channel_scheduler.dl_enqueue_grant(msg_dltime.t, defragbuf.addr, grant);
+            let grant_result = self.channel_scheduler.ul_process_cap_req(msg_dltime.t, defragbuf.addr, res_req);
+            if let Some((grant, usage_marker)) = grant_result {
+                // Schedule grant — marker propagates into the MAC-RESOURCE ACK
+                // so the MS can tag its reservation when continuing the burst.
+                self.channel_scheduler.dl_enqueue_grant(msg_dltime.t, defragbuf.addr, grant, usage_marker);
             } else {
                 tracing::warn!("rx_mac_end_ul: No grant for reservation request {:?}", res_req);
             }
@@ -984,10 +999,11 @@ impl UmacBs {
 
         // Handle reservation if present
         if let Some(res_req) = &pdu.reservation_req {
-            let grant = self.channel_scheduler.ul_process_cap_req(msg_dltime.t, defragbuf.addr, res_req);
-            if let Some(grant) = grant {
-                // Schedule grant
-                self.channel_scheduler.dl_enqueue_grant(msg_dltime.t, defragbuf.addr, grant);
+            let grant_result = self.channel_scheduler.ul_process_cap_req(msg_dltime.t, defragbuf.addr, res_req);
+            if let Some((grant, usage_marker)) = grant_result {
+                // Schedule grant — marker propagates into the MAC-RESOURCE ACK
+                // so the MS can tag its reservation when continuing the burst.
+                self.channel_scheduler.dl_enqueue_grant(msg_dltime.t, defragbuf.addr, grant, usage_marker);
             } else {
                 tracing::warn!("rx_mac_end_hu: No grant for reservation request {:?}", res_req);
             }

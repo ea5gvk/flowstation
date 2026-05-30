@@ -56,6 +56,15 @@ pub struct PrecomputedUmacPdus {
 pub struct TimeslotSchedule {
     pub ul1: Option<u32>,
     pub ul2: Option<u32>,
+    /// Usage marker (4-62) issued to an MS that received a multi-slot grant.
+    /// When set, AACH for this slot signals `Traffic(marker)` so the MS knows
+    /// the slot is reserved for it. The marker remains until both ul1 and ul2
+    /// are consumed/freed.
+    ///
+    /// Per ETSI TS 100 392-2 §23.5.1: usage markers 0 (= unallocated) and
+    /// 1-3 are reserved. 63 (= common linearisation channel) is reserved.
+    /// Valid range for BS-assigned reservations is 4..=62.
+    pub usage_marker: Option<u8>,
     // pub dl: Option<TmvUnitdataReq>,
 }
 
@@ -87,6 +96,18 @@ pub struct BsChannelScheduler {
     /// in the current frame. The second such PDU (e.g. DConnectAck MCCH) must be deferred to
     /// the next frame to avoid exceeding the 216-bit slot capacity (DConnect+DConnectAck=223 bits).
     mcch_chan_alloc_sent_this_frame: bool,
+
+    /// Per-timeslot rotating cursor for allocating usage markers to multi-slot
+    /// uplink reservations. Wraps in the valid range [4, 62] (0 = unallocated,
+    /// 1-3 reserved, 63 = common linearisation; per ETSI TS 100 392-2 §23.5.1).
+    ///
+    /// A multi-slot grant without a usage_marker leaves the MS unable to
+    /// associate AACH slot signalling with its own reservation — empirically
+    /// MS-side stacks (MXP600 etc.) abandon the burst after the first slot and
+    /// fall back to repeated random access, which never completes a
+    /// fragmented MM PDU (e.g. ULocationUpdate when re-entering coverage).
+    /// Issuing a real marker fixes that.
+    next_usage_marker: [u8; 4],
 }
 
 #[derive(Debug)]
@@ -97,9 +118,11 @@ pub enum DlSchedElem {
     /// A received MAC-ACCESS PDU still has to be acknowledged
     RandomAccessAck(TetraAddress),
 
-    /// A slotgrant response, which has to be transmitted with high priority or the delay numbers will be off
-    /// ssi and BasicSlotgrant are provided.
-    Grant(TetraAddress, BasicSlotgrant),
+    /// A slotgrant response, which has to be transmitted with high priority or the delay numbers will be off.
+    /// ssi, BasicSlotgrant, and an optional usage_marker are provided. When the grant covers >1 slot the
+    /// scheduler allocates a usage marker so AACH and the MacResource ACK can identify the reservation
+    /// (per ETSI TS 100 392-2 §21.4.3.2 and §23.5.1); single-slot grants don't need one.
+    Grant(TetraAddress, BasicSlotgrant, Option<u8>),
 
     /// A MAC-RESOURCE PDU. May be split into fragments upon processing, in which case a FragBuf will be inserted after processing the resource.
     Resource(MacResource, BitBuffer, Option<TxReporter>),
@@ -116,6 +139,7 @@ pub enum DlSchedElem {
 const EMPTY_SCHED_ELEM: TimeslotSchedule = TimeslotSchedule {
     ul1: None,
     ul2: None,
+    usage_marker: None,
     // dl: None,
 };
 const EMPTY_SCHED_CHANNEL: [TimeslotSchedule; MACSCHED_NUM_FRAMES] = [EMPTY_SCHED_ELEM; MACSCHED_NUM_FRAMES];
@@ -134,6 +158,8 @@ impl BsChannelScheduler {
             hangtime: [false, false, false, false],
             pending_ra_acks: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
             mcch_chan_alloc_sent_this_frame: false,
+            // Start each timeslot's marker cursor at 4 (first valid value).
+            next_usage_marker: [4, 4, 4, 4],
         }
     }
 
@@ -162,10 +188,23 @@ impl BsChannelScheduler {
     }
 
     pub fn is_hangtime(&self, ts: u8) -> bool {
+        // Defensive bounds check: ts must be 1..=4. Without this, a caller
+        // accidentally passing ts=0 would underflow `ts as usize - 1` to
+        // usize::MAX and panic on the array index. set_hangtime already has
+        // this guard; mirror it here. Credit to proxiboi69 in
+        // MidnightBlueLabs/tetra-bluestation PR #85.
+        if !(1..=4).contains(&ts) {
+            tracing::warn!("BsChannelScheduler::is_hangtime: invalid ts {}", ts);
+            return false;
+        }
         self.hangtime[ts as usize - 1]
     }
 
     fn is_hangtime_effective(&self, ts: u8) -> bool {
+        if !(1..=4).contains(&ts) {
+            tracing::warn!("BsChannelScheduler::is_hangtime_effective: invalid ts {}", ts);
+            return false;
+        }
         let idx = ts as usize - 1;
         if !self.hangtime[idx] {
             return false;
@@ -298,7 +337,7 @@ impl BsChannelScheduler {
 
     /// Reserves all slots designated in a grant option
     /// If only one halfslot is needed, returns 1 or 2 designating which slot was reserved
-    pub fn ul_reserve_grant(&mut self, ssi: u32, grant_timestamps: Vec<TdmaTime>, is_halfslot: bool) -> u8 {
+    pub fn ul_reserve_grant(&mut self, ssi: u32, grant_timestamps: Vec<TdmaTime>, is_halfslot: bool, usage_marker: Option<u8>) -> u8 {
         assert!(!grant_timestamps.is_empty());
         assert!(!is_halfslot || grant_timestamps.len() == 1);
         // let ts = grant_timestamps[0].t as usize;
@@ -306,6 +345,12 @@ impl BsChannelScheduler {
             let index = self.ul_ts_to_sched_index(&ts);
 
             let elem: &mut TimeslotSchedule = &mut self.ulsched[ts.t as usize - 1][index];
+            // Stamp the usage marker on the slot. AACH generation for this
+            // slot will then emit Traffic(marker) per ETSI §23.5.2, which tells
+            // the MS that holds the reservation it can transmit here.
+            if let Some(m) = usage_marker {
+                elem.usage_marker = Some(m);
+            }
             if is_halfslot {
                 if elem.ul1.is_none() {
                     elem.ul1 = Some(ssi);
@@ -328,8 +373,16 @@ impl BsChannelScheduler {
     }
 
     /// Tries to find a way to satisfy a granting request, and reserves the slots in the schedule.
-    /// If successful, returns a BasicSlotgrant with the granting delay and capacity allocation.
-    pub fn ul_process_cap_req(&mut self, timeslot: u8, addr: TetraAddress, res_req: &ReservationRequirement) -> Option<BasicSlotgrant> {
+    /// On success returns a `BasicSlotgrant` plus an optional `usage_marker`. The marker is
+    /// `Some(m)` only when the grant covers more than one slot — single-slot grants don't need
+    /// one. The marker is stored on each reserved `TimeslotSchedule` entry so AACH generation
+    /// for those slots emits `Traffic(m)` and the MS can identify its reservation.
+    pub fn ul_process_cap_req(
+        &mut self,
+        timeslot: u8,
+        addr: TetraAddress,
+        res_req: &ReservationRequirement,
+    ) -> Option<(BasicSlotgrant, Option<u8>)> {
         let is_halfslot = res_req == &ReservationRequirement::Req1Subslot;
         let requested_cap = if is_halfslot { 1 } else { res_req.to_req_slotcount() };
 
@@ -345,10 +398,21 @@ impl BsChannelScheduler {
             grant_op
         );
 
-        // If found, reserve the slots and return a BasicSlotgrant
+        // If found, reserve the slots and return a BasicSlotgrant + optional usage_marker.
         if let Some((skips, grant_timestamps)) = grant_op {
+            // For multi-slot full grants, allocate a usage marker. We do this
+            // BEFORE reserving so the marker can be embedded in the schedule.
+            // Single-slot or half-slot grants don't need a marker — the MS
+            // either has nothing to fragment (subslot) or completes the burst
+            // in the one slot (single full slot).
+            let usage_marker = if !is_halfslot && requested_cap >= 2 {
+                Some(self.alloc_usage_marker(timeslot))
+            } else {
+                None
+            };
+
             // Reserve the target granting opportunity. Get subslot (only relevant for halfslot reservation)
-            let subslot = self.ul_reserve_grant(addr.ssi, grant_timestamps, is_halfslot);
+            let subslot = self.ul_reserve_grant(addr.ssi, grant_timestamps, is_halfslot, usage_marker);
 
             // tracing::info!("After grant:")
             // self.dump_ul_schedule_full(false);
@@ -368,10 +432,13 @@ impl BsChannelScheduler {
             } else {
                 BasicSlotgrantGrantingDelay::DelayNOpportunities(skips as u8)
             };
-            Some(BasicSlotgrant {
-                capacity_allocation: cap_alloc,
-                granting_delay: grant_delay,
-            })
+            Some((
+                BasicSlotgrant {
+                    capacity_allocation: cap_alloc,
+                    granting_delay: grant_delay,
+                },
+                usage_marker,
+            ))
         } else {
             tracing::warn!(
                 "ul_process_cap_req: no suitable grant opportunity found for addr {}, res_req {:?}",
@@ -404,19 +471,57 @@ impl BsChannelScheduler {
     fn ul_get_usage(&self, ts: TdmaTime) -> AccessAssignUlUsage {
         let ul_sched = &self.ulsched[ts.t as usize - 1][self.ul_ts_to_sched_index(&ts)];
         match (ul_sched.ul1, ul_sched.ul2) {
-            (Some(_), Some(_)) => AccessAssignUlUsage::AssignedOnly,
-            (Some(_), None) => AccessAssignUlUsage::CommonAndAssigned,
+            // A reserved slot with a usage_marker gets `Traffic(marker)` so the
+            // MS that holds the reservation can identify its slot from AACH and
+            // continue a fragmented uplink burst (MacFragUl → MacEndUl). Without
+            // a marker, the MS abandons the burst after one slot — see the
+            // comment on `next_usage_marker` for the failure mode this fixes.
+            (Some(_), Some(_)) => {
+                if let Some(marker) = ul_sched.usage_marker {
+                    AccessAssignUlUsage::Traffic(marker)
+                } else {
+                    AccessAssignUlUsage::AssignedOnly
+                }
+            }
+            (Some(_), None) => {
+                if let Some(marker) = ul_sched.usage_marker {
+                    AccessAssignUlUsage::Traffic(marker)
+                } else {
+                    AccessAssignUlUsage::CommonAndAssigned
+                }
+            }
             (None, None) => AccessAssignUlUsage::CommonOnly,
             _ => unreachable!("ul2 can't be set with ul1 None"),
         }
     }
 
+    /// Allocate a fresh usage marker for a multi-slot reservation in `timeslot`.
+    /// The marker is taken from the per-timeslot rotating cursor in the valid
+    /// range [4, 62]. ETSI reserves 0 (Unallocated), 1-3, and 63 (Common
+    /// linearisation), so we skip those.
+    ///
+    /// We don't track outstanding markers — the cursor just wraps. With only
+    /// a handful of in-flight reservations per timeslot at any moment and 59
+    /// valid markers to choose from, accidental reuse is improbable, and even
+    /// if it happens the consequence is benign (the other MS would see its
+    /// marker re-issued in a different slot and re-attempt).
+    fn alloc_usage_marker(&mut self, timeslot: u8) -> u8 {
+        let idx = (timeslot as usize - 1).min(3);
+        let marker = self.next_usage_marker[idx];
+        // Advance cursor, wrapping in [4, 62].
+        let next = if marker >= 62 { 4 } else { marker + 1 };
+        self.next_usage_marker[idx] = next;
+        marker
+    }
+
     ////////// DOWNLINK SCHEDULING /////////
 
-    /// Registers that we should transmit a MAC-RESOURCE or similar with a grant, somewhere this tick
-    pub fn dl_enqueue_grant(&mut self, ts: u8, addr: TetraAddress, grant: BasicSlotgrant) {
-        tracing::debug!("dl_enqueue_grant: ts {} enqueueing PDU {:?} for addr {}", ts, grant, addr);
-        let elem = DlSchedElem::Grant(addr, grant);
+    /// Registers that we should transmit a MAC-RESOURCE or similar with a grant, somewhere this tick.
+    /// `usage_marker` is set when the grant covers >1 slot — the MS uses it to identify the reservation
+    /// when continuing the burst on the second slot (per ETSI §21.4.3.2). Single-slot grants pass None.
+    pub fn dl_enqueue_grant(&mut self, ts: u8, addr: TetraAddress, grant: BasicSlotgrant, usage_marker: Option<u8>) {
+        tracing::debug!("dl_enqueue_grant: ts {} enqueueing PDU {:?} for addr {} marker {:?}", ts, grant, addr, usage_marker);
+        let elem = DlSchedElem::Grant(addr, grant, usage_marker);
         self.dltx_queues[ts as usize - 1].push(elem);
     }
 
@@ -660,7 +765,7 @@ impl BsChannelScheduler {
 
         let mut i = 0;
         while i < queue.len() {
-            if matches!(queue[i], DlSchedElem::Grant(_, _) | DlSchedElem::RandomAccessAck(_)) {
+            if matches!(queue[i], DlSchedElem::Grant(..) | DlSchedElem::RandomAccessAck(_)) {
                 let elem = queue.remove(i);
                 taken.push(elem);
             } else {
@@ -683,10 +788,13 @@ impl BsChannelScheduler {
                 i += 1;
             } else {
                 // Found a to-be-discarded element.
-                // Remove, warn, and call tx_reporter::mark_discarded() if appliccable
+                // Remove, log, and call tx_reporter::mark_discarded() if applicable.
+                // Logged at debug because this fires during normal hangtime entry/exit
+                // races and isn't an anomaly worth surfacing as a warning. Per
+                // proxiboi69 in MidnightBlueLabs/tetra-bluestation PR #85.
                 let elem = queue.remove(i);
                 item_was_discarded = true;
-                tracing::warn!("dl_drop_all_except_stolen: discarding scheduled {:?} on ts {}", elem, timeslot);
+                tracing::debug!("dl_drop_all_except_stolen: discarding scheduled {:?} on ts {}", elem, timeslot);
 
                 match elem {
                     DlSchedElem::Resource(_, _, tx_reporter) => {
@@ -725,7 +833,7 @@ impl BsChannelScheduler {
         for elem in grants_and_acks {
             // Try to find existing resource for this address
             let addr = match &elem {
-                DlSchedElem::Grant(addr, _) => addr,
+                DlSchedElem::Grant(addr, _, _) => addr,
                 DlSchedElem::RandomAccessAck(addr) => addr,
                 _ => unreachable!("BUG: unhandled match variant -- should never be reached")
             };
@@ -734,13 +842,22 @@ impl BsChannelScheduler {
                 Some(DlSchedElem::Resource(pdu, _sdu, _repeat)) => {
                     // Integrate grant into the resource
                     match &elem {
-                        DlSchedElem::Grant(_, grant) => {
+                        DlSchedElem::Grant(_, grant, usage_marker) => {
                             tracing::debug!(
-                                "dl_integrate_sched_elems_for_timeslot: Integrating grant {:?} into resource for addr {}",
+                                "dl_integrate_sched_elems_for_timeslot: Integrating grant {:?} into resource for addr {} marker {:?}",
                                 grant,
-                                addr
+                                addr,
+                                usage_marker,
                             );
                             pdu.slot_granting_element = Some(grant.clone());
+                            // Carry the marker through so the MS knows what to
+                            // tag its reservation with on the next UL slot.
+                            // Don't overwrite a marker we already set (e.g.
+                            // when the grant came after an ACK that already
+                            // populated it).
+                            if pdu.usage_marker.is_none() {
+                                pdu.usage_marker = *usage_marker;
+                            }
                         }
                         DlSchedElem::RandomAccessAck(_) => {
                             tracing::debug!(
@@ -756,13 +873,16 @@ impl BsChannelScheduler {
                     // No resource for this address was found, create a new one
 
                     let pdu = match &elem {
-                        DlSchedElem::Grant(_, grant) => {
+                        DlSchedElem::Grant(_, grant, usage_marker) => {
                             tracing::debug!(
-                                "dl_integrate_sched_elems_for_timeslot: Creating new resource for addr {} with grant {:?}",
+                                "dl_integrate_sched_elems_for_timeslot: Creating new resource for addr {} with grant {:?} marker {:?}",
                                 addr,
-                                grant
+                                grant,
+                                usage_marker,
                             );
-                            Self::dl_make_minimal_resource(addr, Some(grant.clone()), false)
+                            let mut pdu = Self::dl_make_minimal_resource(addr, Some(grant.clone()), false);
+                            pdu.usage_marker = *usage_marker;
+                            pdu
                         }
                         DlSchedElem::RandomAccessAck(_) => {
                             tracing::debug!(
@@ -918,7 +1038,7 @@ impl BsChannelScheduler {
         let q = self.dltx_queues.get_mut(slot).unwrap();
 
         // Return grants first
-        if let Some(i) = q.iter().position(|e| matches!(e, DlSchedElem::Grant(_, _))) {
+        if let Some(i) = q.iter().position(|e| matches!(e, DlSchedElem::Grant(..))) {
             return Some(q.remove(i));
         }
 
@@ -1141,10 +1261,15 @@ impl BsChannelScheduler {
         // tracing::warn!("start finalize");
         // self.dump_ul_schedule_full(true);
 
-        // Clear UL schedule for this timeslot
+        // Clear UL schedule for this timeslot. Releasing the usage_marker
+        // alongside ul1/ul2 keeps the marker pool from leaking — once both
+        // slots of a reservation have been consumed, the marker is free to
+        // be re-issued. (If a reservation extends over multiple frames this
+        // gets called once per consumed slot pair, which is correct.)
         let index = self.ul_ts_to_sched_index(&ts.add_timeslots(-4));
         self.ulsched[ts.t as usize - 1][index].ul1 = None;
         self.ulsched[ts.t as usize - 1][index].ul2 = None;
+        self.ulsched[ts.t as usize - 1][index].usage_marker = None;
 
         // tracing::warn!("end finalize");
         // self.dump_ul_schedule_full(true);
@@ -1173,18 +1298,46 @@ impl BsChannelScheduler {
                     assert!(dl_traffic_usage.is_none(), "DL ts 1 can't be traffic");
                     assert!(ul_traffic_usage.is_none(), "UL ts 1 can't be traffic (is this allowed?"); // TODO FIXME check spec
 
-                    // Always CommonOnly on TS1 (MCCH). Per ETSI 23.5.2.2.2, the MS
-                    // with a grant transmits in granted slots without checking the AACH.
+                    // TS1 (MCCH) DL is always CommonControl — that doesn't
+                    // change for individual reservations.
                     aach.dl_usage = AccessAssignDlUsage::CommonControl;
-                    aach.ul_usage = AccessAssignUlUsage::CommonOnly;
-                    aach.f1_af1 = Some(AccessField {
-                        access_code: 0,
-                        base_frame_len: 4,
-                    });
-                    aach.f2_af2 = Some(AccessField {
-                        access_code: 0,
-                        base_frame_len: 4,
-                    });
+
+                    // UL behaviour: when this slot has an active uplink
+                    // reservation with a usage_marker (i.e. a multi-slot grant
+                    // we issued previously), the AACH must announce
+                    // `Traffic(marker)` per ETSI TS 100 392-2 §23.5.2 so the
+                    // MS holding the reservation can identify "its" slot and
+                    // continue the fragmented burst with MacEndUl. Without
+                    // this, the MS sees CommonOnly, treats the slot as random
+                    // access, and abandons the burst after the first frag —
+                    // leaving location updates / re-attaches stuck in an
+                    // infinite random-access loop (the symptom we observed
+                    // when an MS re-entered coverage and couldn't TX/RX).
+                    let ul_usage_for_slot = self.ul_get_usage(ts);
+                    match ul_usage_for_slot {
+                        AccessAssignUlUsage::Traffic(_) => {
+                            // Reservation in flight: hand the marker through
+                            // AACH so the MS commits to its assigned slot.
+                            aach.ul_usage = ul_usage_for_slot;
+                            // For Traffic UL usage we don't emit f1/f2 access
+                            // fields — the slot is fully allocated.
+                        }
+                        _ => {
+                            // No reservation: default MCCH behaviour. MS with
+                            // a fresh grant transmits in granted slots without
+                            // checking AACH per ETSI 23.5.2.2.2; common slots
+                            // remain open for random access by other MSs.
+                            aach.ul_usage = AccessAssignUlUsage::CommonOnly;
+                            aach.f1_af1 = Some(AccessField {
+                                access_code: 0,
+                                base_frame_len: 4,
+                            });
+                            aach.f2_af2 = Some(AccessField {
+                                access_code: 0,
+                                base_frame_len: 4,
+                            });
+                        }
+                    }
                 }
                 2..=4 => {
                     // Additional channels (TS2..TS4).
@@ -1514,7 +1667,7 @@ mod tests {
         let u3 = sched.ul_get_usage(TdmaTime { t: 1, f: 3, m: 1, h: 0 });
         tracing::info!("usage ts 1/2/3: {:?}/{:?}/{:?}", u1, u2, u3);
 
-        let cap_alloc1 = grant1.unwrap().capacity_allocation;
+        let cap_alloc1 = grant1.unwrap().0.capacity_allocation;
         assert_eq!(
             cap_alloc1,
             BasicSlotgrantCapAlloc::FirstSubslotGranted,
@@ -1524,7 +1677,7 @@ mod tests {
         let grant2 = sched.ul_process_cap_req(1, addr, &resreq);
         tracing::info!("grant2: {:?}", grant2);
         assert!(grant2.is_some(), "ul_process_cap_req should return Some, but got None");
-        let cap_alloc2 = grant2.unwrap().capacity_allocation;
+        let cap_alloc2 = grant2.unwrap().0.capacity_allocation;
         assert_eq!(
             cap_alloc2,
             BasicSlotgrantCapAlloc::SecondSubslotGranted,
@@ -1561,12 +1714,12 @@ mod tests {
         tracing::info!("usage ts 1/2/3: {:?}/{:?}/{:?}", u1, u2, u3);
 
         assert!(grant1.is_some());
-        let cap_alloc1 = grant1.unwrap().capacity_allocation;
+        let cap_alloc1 = grant1.unwrap().0.capacity_allocation;
         assert_eq!(cap_alloc1, BasicSlotgrantCapAlloc::FirstSubslotGranted);
 
         sched.dump_ul_schedule(true);
         let resreq2 = ReservationRequirement::Req3Slots;
-        let Some(grant2) = sched.ul_process_cap_req(1, addr, &resreq2) else {
+        let Some((grant2, _marker)) = sched.ul_process_cap_req(1, addr, &resreq2) else {
                 tracing::error!("BUG: unexpected message or state -- routing error"); return;
             };
         tracing::info!("grant2: {:?}", grant2);
@@ -1598,7 +1751,7 @@ mod tests {
             granting_delay: BasicSlotgrantGrantingDelay::CapAllocAtNextOpportunity,
         };
 
-        sched.dl_enqueue_grant(ts.t, addr, grant);
+        sched.dl_enqueue_grant(ts.t, addr, grant, None);
         sched.dl_enqueue_random_access_ack(ts.t, addr);
 
         sched.dump_ul_schedule(true);

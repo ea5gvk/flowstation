@@ -428,7 +428,9 @@ impl MleMs {
 
     fn rx_tlmc_prim(&mut self, _queue: &mut MessageQueue, _message: SapMsg) {
         tracing::trace!("rx_tlmc_prim");
-        unimplemented!("rx_tlmc_prim");
+        // TLMC SAP not implemented yet. Log instead of panicking so an unexpected
+        // primitive doesn't kill the whole MLE worker.
+        unimplemented_log!("rx_tlmc_prim called but TLMC SAP is not implemented");
         // match &message.msg {
         //     _ => {
         //         panic!();
@@ -488,7 +490,7 @@ impl MleMs {
 
     fn rx_tlpd_prim(&mut self, _queue: &mut MessageQueue, _message: SapMsg) {
         tracing::trace!("rx_tlpd_prim");
-        unimplemented!("rx_tlpd_prim");
+        unimplemented_log!("rx_tlpd_prim called but TLPD SAP is not implemented");
         // match &message.msg {
         //     _ => {
         //         panic!();
