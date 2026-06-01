@@ -1181,7 +1181,7 @@ fn handle_connection(
         let mut body = vec![0u8; content_length];
         let _ = buf.read_exact(&mut body);
         let body_str = String::from_utf8_lossy(&body);
-        serve_whitelist_post(buf.into_inner(), &shared_config, &config_path, body_str.as_ref());
+        serve_whitelist_post(buf.into_inner(), &shared_config, &config_path, body_str.as_ref(), &cmd_tx);
     } else if req_line.contains("GET /api/wx") {
         let mut buf = BufReader::new(stream);
         loop {
@@ -1650,6 +1650,7 @@ fn serve_whitelist_post(
     shared_config: &Option<tetra_config::bluestation::SharedConfig>,
     config_path: &str,
     body: &str,
+    cmd_tx: &Arc<Mutex<Option<CmdSender>>>,
 ) {
     use crate::net_dashboard::whitelist;
 
@@ -1672,7 +1673,31 @@ fn serve_whitelist_post(
         state.issi_whitelist_override = Some(list.clone());
     }
 
-    // 2) Persist to TOML so it survives a restart.
+    // 2) Enforce immediately on terminals that are ALREADY registered. The whitelist is
+    //    only checked at registration time, so without this an enabling edit would leave
+    //    disallowed radios connected (looks like access control never turned on) and a
+    //    removal would only take effect when the terminal next re-registers — i.e. on a
+    //    reboot. Kick every currently-registered ISSI the new list no longer allows; it
+    //    re-registers and is then rejected by MM. Empty list = open network = kick nobody.
+    if !list.is_empty() {
+        let to_kick: Vec<u32> = {
+            let state = cfg.state_read();
+            state
+                .subscribers
+                .all_registered_issis()
+                .filter(|issi| !list.contains(issi))
+                .collect()
+        };
+        for issi in to_kick {
+            tracing::info!(
+                "Dashboard: whitelist change — kicking non-whitelisted ISSI {}",
+                issi
+            );
+            send_control_cmd(cmd_tx, ControlCommand::KickMs { issi });
+        }
+    }
+
+    // 3) Persist to TOML so it survives a restart.
     if let Err(e) = whitelist::write_whitelist_to_toml(config_path, &list) {
         tracing::warn!("Dashboard: whitelist applied at runtime but failed to persist to TOML: {}", e);
         // Runtime change still took effect; report partial success so the operator knows

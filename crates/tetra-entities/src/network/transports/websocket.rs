@@ -178,6 +178,86 @@ fn parse_digest_challenge(header: &str) -> HashMap<String, String> {
 }
 
 /// Build an Authorization header for HTTP Digest Auth
+/// Find the first occurrence of `needle` in `hay`.
+fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Parse a `Content-Length` value (case-insensitive) out of a header block.
+fn parse_content_length(headers: &str) -> Option<usize> {
+    headers
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+        .and_then(|l| l.splitn(2, ':').nth(1))
+        .and_then(|v| v.trim().parse::<usize>().ok())
+}
+
+/// Read a complete HTTP/1.1 response from the auth stream.
+///
+/// A single `read()` can return only part of the response when it spans multiple
+/// TCP/TLS records — that is what made the Brew handshake flaky over real networks
+/// (a 200 whose endpoint URI lives in the body, or a 401 whose `WWW-Authenticate`
+/// header had not arrived in the first segment). This loops until the message is
+/// actually complete:
+///   * headers fully received (terminated by CRLF CRLF); then
+///   * a non-200 (e.g. 401) carries its answer in the headers, so we stop there;
+///   * a 200 needs its body — bounded by `Content-Length` when present, otherwise
+///     until the body line is terminated.
+/// The socket read timeout bounds the whole loop, so it can never hang.
+fn read_http_response(stream: &mut AuthStream) -> Result<String, NetworkError> {
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 4096];
+
+    loop {
+        if let Some(hdr_end) = find_subslice(&buf, b"\r\n\r\n") {
+            let header_len = hdr_end + 4;
+            let headers = String::from_utf8_lossy(&buf[..hdr_end]);
+            let status_line = headers.lines().next().unwrap_or("");
+            let is_200 = status_line.contains("200");
+
+            if !is_200 {
+                // 401 / redirect / error: everything we need is in the headers.
+                break;
+            }
+            // 200: the endpoint URI is in the body — make sure we have all of it.
+            if let Some(n) = parse_content_length(&headers) {
+                if buf.len() >= header_len + n {
+                    break;
+                }
+            } else if buf[header_len..].contains(&b'\n') {
+                // No Content-Length, but the body line is terminated -> complete.
+                break;
+            }
+            // otherwise: 200 headers but body still incomplete -> read more
+        }
+
+        match stream.read(&mut chunk) {
+            Ok(0) => break, // peer closed the connection
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // read timeout fired: stop with what we have rather than hang
+                break;
+            }
+            Err(e) => return Err(NetworkError::ConnectionFailed(format!("HTTP read failed: {}", e))),
+        }
+
+        if buf.len() > 64 * 1024 {
+            return Err(NetworkError::ConnectionFailed("HTTP response too large".to_string()));
+        }
+    }
+
+    if buf.is_empty() {
+        return Err(NetworkError::ConnectionFailed("empty HTTP response".to_string()));
+    }
+    Ok(String::from_utf8_lossy(&buf).to_string())
+}
+
 fn build_digest_response(
     username: &str,
     password: &str,
@@ -263,6 +343,7 @@ impl WebSocketTransport {
              Host: {}\r\n\
              User-Agent: {}\r\n\
              X-Brew-Version: 1\r\n\
+             X-Brew-Mode: Basestation\r\n\
              \r\n",
             endpoint_path, host, self.config.user_agent
         );
@@ -270,16 +351,7 @@ impl WebSocketTransport {
             .write_all(request.as_bytes())
             .map_err(|e| NetworkError::ConnectionFailed(format!("HTTP write failed: {}", e)))?;
 
-        let mut response_buf = vec![0u8; 4096];
-        let n = stream
-            .read(&mut response_buf)
-            .map_err(|e| NetworkError::ConnectionFailed(format!("HTTP read failed: {}", e)))?;
-
-        if n == 0 {
-            return Err(NetworkError::ConnectionFailed("empty HTTP response".to_string()));
-        }
-
-        let response = String::from_utf8_lossy(&response_buf[..n]).to_string();
+        let response = read_http_response(&mut stream)?;
         tracing::debug!("WebSocketTransport: HTTP response:\n{}", response.trim());
 
         let lines: Vec<&str> = response.split("\r\n").collect();
@@ -342,6 +414,7 @@ impl WebSocketTransport {
                  Host: {}\r\n\
                  User-Agent: {}\r\n\
                  X-Brew-Version: 1\r\n\
+                 X-Brew-Mode: Basestation\r\n\
                  Authorization: {}\r\n\
                  \r\n",
                 endpoint_path, host, self.config.user_agent, auth_header
@@ -350,16 +423,7 @@ impl WebSocketTransport {
                 .write_all(auth_request.as_bytes())
                 .map_err(|e| NetworkError::ConnectionFailed(format!("auth HTTP write failed: {}", e)))?;
 
-            let mut auth_buf = vec![0u8; 4096];
-            let n2 = stream2
-                .read(&mut auth_buf)
-                .map_err(|e| NetworkError::ConnectionFailed(format!("auth HTTP read failed: {}", e)))?;
-
-            if n2 == 0 {
-                return Err(NetworkError::ConnectionFailed("empty auth HTTP response".to_string()));
-            }
-
-            let auth_response = String::from_utf8_lossy(&auth_buf[..n2]).to_string();
+            let auth_response = read_http_response(&mut stream2)?;
             tracing::debug!("WebSocketTransport: auth response:\n{}", auth_response.trim());
 
             let auth_status = auth_response.split("\r\n").next().unwrap_or("");

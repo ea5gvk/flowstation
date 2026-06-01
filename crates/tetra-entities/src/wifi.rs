@@ -122,9 +122,15 @@ pub fn available() -> bool {
 pub fn scan() -> Result<Vec<WifiScanResult>, WifiError> {
     // Field order chosen so we can split on the terse colon separator nmcli
     // emits in `-t` (terse) mode. INUSE is '*' when active, blank otherwise.
+    // `--rescan auto` lets NetworkManager decide: it forces a fresh scan only when its
+    // cached results are stale, otherwise it returns the cache. `--rescan yes` forces a
+    // scan every call and nmcli rejects it ("Scanning not allowed immediately following
+    // previous scan") when called again within its rate-limit window — which is exactly
+    // what made the scan fail every time the WiFi tab was reopened shortly after the first
+    // scan. `auto` is reliable on repeated opens and still refreshes when genuinely stale.
     let out = run_nmcli(&[
         "-t", "-f", "IN-USE,SSID,SIGNAL,SECURITY",
-        "device", "wifi", "list", "--rescan", "yes",
+        "device", "wifi", "list", "--rescan", "auto",
     ])?;
 
     // Build a set of saved SSIDs so we can mark them in the scan results.
