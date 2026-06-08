@@ -342,13 +342,28 @@ impl SdsBsSubentity {
             sds.user_defined_data.length_bits()
         );
 
-        if !self.config.state_read().subscribers.is_registered(sds.dest_issi) {
-            tracing::warn!("SDS: dest ISSI {} from Brew is not locally registered, dropping", sds.dest_issi);
-            return;
-        }
+        // Mirror the RF ingress routing (route above): try individual delivery FIRST so an ISSI
+        // that numerically collides with a GSSI still delivers individually, then fall back to
+        // group delivery when the dest is a GSSI with locally-affiliated members (FH-FEAT-032 R2 —
+        // previously a group-addressed Brew SDS was dropped because is_registered() only matches
+        // individual ISSIs). Two short read borrows, each O(1), identical to sds_bs.rs:302-303.
+        let is_local_issi = self.config.state_read().subscribers.is_registered(sds.dest_issi);
+        let is_local_group =
+            !is_local_issi && self.config.state_read().subscribers.has_group_members(sds.dest_issi);
 
-        // Send D-SDS-DATA downlink to the local MS. Schedule on next ts1 to ensure it gets sent on the MCCH
-        self.send_d_sds_data(queue, sds.source_issi, sds.dest_issi, SsiType::Issi, sds.user_defined_data);
+        if is_local_issi {
+            // Send D-SDS-DATA downlink to the local MS on the MCCH.
+            tracing::info!("SDS: local delivery from Brew: {} -> {}", sds.source_issi, sds.dest_issi);
+            self.send_d_sds_data(queue, sds.source_issi, sds.dest_issi, SsiType::Issi, sds.user_defined_data);
+        } else if is_local_group {
+            tracing::info!("SDS: group delivery from Brew: {} -> GSSI {}", sds.source_issi, sds.dest_issi);
+            self.send_d_sds_data(queue, sds.source_issi, sds.dest_issi, SsiType::Gssi, sds.user_defined_data);
+        } else {
+            tracing::warn!(
+                "SDS: dest SSI {} from Brew is neither a local ISSI nor a group with members, dropping",
+                sds.dest_issi
+            );
+        }
     }
 
     /// Handle incoming SDS data from Control entity (network-originated SDS)

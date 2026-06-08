@@ -572,8 +572,10 @@ impl<T: NetworkTransport> BrewWorker<T> {
                     if gt.mnemonic.is_some() {
                         let _ = self.event_sender.send(BrewEvent::VersionDetected { version: 1 });
                     }
-                    if !net_brew::is_brew_gssi_routable(&self.config, gt.destination) {
-                        tracing::warn!("BrewWorker: dropping GROUP_TX to non-routable GSSI {}", gt.destination);
+                    // Inbound admission (FH-FEAT-032 R3): a Brew-originated group call must NOT be
+                    // gated by the outbound-only `whitelisted_ssis`; only `local_ssi_ranges` reject it.
+                    if !net_brew::is_brew_inbound_allowed(&self.config, gt.destination) {
+                        tracing::warn!("BrewWorker: dropping GROUP_TX to inactive/local-only GSSI {}", gt.destination);
                         return;
                     };
                     let _ = self.event_sender.send(BrewEvent::GroupCallStart {

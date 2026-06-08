@@ -4,6 +4,22 @@ use crate::net_telemetry::{TelemetryEvent, channel::TelemetrySink};
 use tetra_pdus::mm::enums::energy_saving_mode::EnergySavingMode;
 use tetra_pdus::mm::fields::class_of_ms::ClassOfMs;
 
+/// Frame-based energy-economy monitoring cycle length, in TDMA frames, per ETSI EN 300 392-2
+/// Table 23.9 (an EE MS wakes for 1 frame then sleeps N: EG1 sleeps 1 → cycle 2, EG2 sleeps 2 →
+/// cycle 3, EG3 sleeps 5 → cycle 6). The BS caps Eg4–Eg7 to Eg3 to keep call-setup latency bounded,
+/// so only StayAlive / Eg1 / Eg2 / Eg3 are ever granted or stored. Returns `None` for StayAlive
+/// (no monitoring window — the MS is always reachable). Single source of truth for both the grant
+/// (`grant_energy_saving`) and the republished window, so the two can never drift apart.
+pub(crate) const fn ee_cycle_frames(mode: EnergySavingMode) -> Option<u8> {
+    match mode {
+        EnergySavingMode::StayAlive => None,
+        EnergySavingMode::Eg1 => Some(2),
+        EnergySavingMode::Eg2 => Some(3),
+        // Eg3..Eg7 capped to Eg3 (sleep 5 frames → cycle 6).
+        _ => Some(6),
+    }
+}
+
 #[derive(Debug)]
 pub enum ClientMgrErr {
     ClientNotFound { issi: u32 },
@@ -276,17 +292,15 @@ impl MmClientMgr {
     /// scheduler can defer unsolicited traffic to a sleeping MS's wake window. Yields
     /// (issi, monitoring_frame, monitoring_multiframe, cycle_len) for every client that is actually
     /// in an energy-saving mode (not StayAlive) and has a valid monitoring window. StayAlive MSs are
-    /// omitted (their absence means "always reachable"). cycle_len = (Eg mode as u8) + 1 (Eg1=2…).
+    /// omitted (their absence means "always reachable"). cycle_len is the FRAME-based cycle from
+    /// [`ee_cycle_frames`] (Eg1=2, Eg2=3, Eg3=6 — ETSI Table 23.9).
     pub fn ee_monitoring_windows(&self) -> impl Iterator<Item = (u32, u8, u8, u8)> + '_ {
         self.clients.values().filter_map(|c| {
-            if c.energy_saving_mode == EnergySavingMode::StayAlive {
-                return None;
-            }
+            let cycle_len = ee_cycle_frames(c.energy_saving_mode)?;
             let frame = c.monitoring_frame?;
             let mframe = c.monitoring_multiframe?;
-            let cycle_len = (c.energy_saving_mode as u8).saturating_add(1);
             // Guard against a malformed window so the scheduler never gates on garbage.
-            if cycle_len < 2 || !(1..=18).contains(&frame) {
+            if cycle_len < 2 || !(1..=18).contains(&frame) || !(1..=60).contains(&mframe) {
                 return None;
             }
             Some((c.issi, frame, mframe, cycle_len))

@@ -48,6 +48,43 @@ html,body{height:100%;overflow:hidden;}
   --card-shadow:0 1px 3px rgba(0,0,200,0.15);
 }
 
+/* ── Touchscreen mode (FH-FEAT-008) ──────────────────────────────────────────
+   Opt-in via body.touch-mode (persisted in localStorage), OR auto-enabled on a
+   coarse-pointer device unless the user opted out (body.no-touch-mode). Class-based
+   so it composes with the dark/light/blue data-themes; scoped so the desktop
+   (fine pointer, no class) is completely unaffected. Targets >=44px tap targets. */
+body.touch-mode{font-size:18px;}
+body.touch-mode .btn,
+body.touch-mode .btn-sm{min-height:44px;padding:10px 16px;font-size:13px;}
+body.touch-mode .nav-item{min-height:44px;padding:11px 14px;font-size:15px;}
+body.touch-mode .theme-btn,
+body.touch-mode .lang-btn,
+body.touch-mode .touch-btn{min-height:40px;padding:8px 12px;font-size:13px;}
+body.touch-mode .logout-btn{width:42px;height:42px;font-size:18px;}
+body.touch-mode input[type="text"],
+body.touch-mode input[type="number"],
+body.touch-mode input[type="password"],
+body.touch-mode input[type="range"],
+body.touch-mode select,
+body.touch-mode textarea{min-height:44px;font-size:15px;}
+@media (pointer:coarse){
+  body:not(.no-touch-mode){font-size:18px;}
+  body:not(.no-touch-mode) .btn,
+  body:not(.no-touch-mode) .btn-sm{min-height:44px;padding:10px 16px;}
+  body:not(.no-touch-mode) .nav-item{min-height:44px;padding:11px 14px;font-size:15px;}
+  body:not(.no-touch-mode) input,
+  body:not(.no-touch-mode) select,
+  body:not(.no-touch-mode) textarea{min-height:44px;}
+}
+/* Touch toggle — its OWN class (never .theme-btn) so setTheme()'s active-reset
+   can't desync its highlight from the actual touch state. */
+.touch-btn{
+  background:var(--bg3);color:var(--text2);border:1px solid var(--border);
+  border-radius:6px;padding:5px 10px;font-size:12px;font-weight:600;cursor:pointer;
+}
+.touch-btn:hover{color:var(--text);}
+.touch-btn.active{background:var(--accent);color:var(--bg);border-color:var(--accent);}
+
 /* ── Layout shell ── */
 body{
   background:var(--bg);color:var(--text);
@@ -1235,6 +1272,8 @@ tbody td{transition:background .12s ease;}
         <button class="theme-btn" data-t="light" onclick="setTheme('light',this)">Light</button>
         <button class="theme-btn" data-t="blue" onclick="setTheme('blue',this)">Blue</button>
       </div>
+      <!-- Touchscreen-mode toggle (FH-FEAT-008). Distinct class from .theme-btn. -->
+      <button class="touch-btn" id="touch-toggle" onclick="toggleTouchMode()" title="Touchscreen mode">Touch</button>
       <div class="lang-picker">
         <button class="lang-btn active" onclick="setLang('en',this)">EN</button>
         <button class="lang-btn" onclick="setLang('ro',this)">RO</button>
@@ -1245,6 +1284,8 @@ tbody td{transition:background .12s ease;}
       </div>
       <!-- Logout: clears session cookie and redirects to /login. Hidden when auth is off. -->
       <button class="logout-btn" id="logout-btn" onclick="doLogout()" title="Log out" style="display:none">⏻</button>
+      <!-- Login: shown only in anonymous public-overview mode (FH-FEAT-033). -->
+      <button class="logout-btn" id="login-btn" onclick="window.location='/login'" title="Log in" style="display:none">🔑</button>
     </div>
   </div>
 
@@ -1259,6 +1300,42 @@ tbody td{transition:background .12s ease;}
 
   <!-- Content -->
   <div id="content">
+
+    <!-- ── PUBLIC OVERVIEW (FH-FEAT-033) — shown only to anonymous visitors when public_overview is on ── -->
+    <div class="page" id="page-public">
+      <div class="stat-grid">
+        <div class="stat-card green">
+          <div class="stat-label">Radios</div>
+          <div class="stat-value accent" id="pub-ms">—</div>
+          <div class="stat-sub">registered</div>
+          <div class="stat-icon">📡</div>
+        </div>
+        <div class="stat-card blue">
+          <div class="stat-label">Active Calls</div>
+          <div class="stat-value blue" id="pub-calls">—</div>
+          <div class="stat-sub">circuits in use</div>
+          <div class="stat-icon">☎</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">RF</div>
+          <div class="stat-value" id="pub-rf" style="font-size:20px">—</div>
+          <div class="stat-sub" id="pub-freq">—</div>
+          <div class="stat-icon">📶</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Network</div>
+          <div class="stat-value" id="pub-brew" style="font-size:20px">—</div>
+          <div class="stat-sub" id="pub-ver">—</div>
+          <div class="stat-icon">🔗</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><div class="card-title">Cell Status</div></div>
+        <div style="padding:14px 18px;font-size:13px;opacity:.7">
+          Read-only public overview — log in for full access and controls.
+        </div>
+      </div>
+    </div>
 
     <!-- ── RADIOS ── -->
     <div class="page active" id="page-stations">
@@ -1811,6 +1888,17 @@ tbody td{transition:background .12s ease;}
         </div>
       </div>
 
+      <!-- Display brightness (FH-FEAT-008) — hidden unless a backlight panel exists -->
+      <div class="card" id="brightness-card" style="display:none">
+        <div class="card-head">
+          <div class="card-title">Display Brightness</div>
+          <div class="card-actions"><span id="brightness-val" style="font-family:var(--mono);font-size:13px;color:var(--text2)">—</span></div>
+        </div>
+        <div class="card-body" style="padding:16px 18px">
+          <input type="range" id="brightness-slider" min="0" max="255" step="1" value="128" oninput="onBrightnessInput(this.value)" style="width:100%">
+        </div>
+      </div>
+
       <!-- System info + CPU/RAM -->
       <div class="card">
         <div class="card-head">
@@ -2015,7 +2103,7 @@ const LANGS={
     fallback_title:'⚠ FALLBACK CONFIG ACTIVE — Primary config failed to load',
     sds_msg_label:'Message',cancel:'Cancel',send:'Send',
     th_issi:'ISSI',th_groups:'Groups',th_ee:'EE',th_signal:'Signal',
-    tg_selected:'Selected talkgroup (last keyed up)',tg_scan_hint:'Scanned/affiliated talkgroups — selected one is marked ▶',
+    tg_selected:'Selected talkgroup (last keyed up)',
     tg_affiliated_short:'affiliated',tg_affiliated_hint:'Other talkgroups this radio is affiliated to (kept attached on the BS even when scan is off on the device)',
     th_status:'Status',th_last_seen:'Last seen',th_actions:'Actions',
     th_id:'ID',th_type:'Type',th_caller:'Caller',
@@ -2034,7 +2122,7 @@ const LANGS={
     update_confirm:'Pull latest from main and rebuild?\nThe service will restart automatically.',
     update_running:'Updating… do not close this window.',
     update_done_ok:'✓ Update complete. Restarting…',
-    update_done_err:'✗ Update failed. See log above.',
+    update_done_err:'✗ Update failed. See log below.',
     update_close:'Close',
     system:'System',sys_info:'System Info',sys_hostname:'Hostname',sys_uptime:'Uptime',
     sys_version:'FS Version',sys_os:'OS',sys_config:'Active Config',
@@ -2086,7 +2174,7 @@ const LANGS={
     sds_title:'⬡ Trimite Mesaj SDS',sds_dest:'ISSI Destinatar',
     sds_msg_label:'Mesaj',cancel:'Anulează',send:'Trimite',
     th_issi:'ISSI',th_groups:'Grupuri',th_ee:'EE',th_signal:'Semnal',
-    tg_selected:'Grup selectat (ultima transmisie)',tg_scan_hint:'Grupuri scanate/afiliate — cel selectat este marcat cu ▶',
+    tg_selected:'Grup selectat (ultima transmisie)',
     tg_affiliated_short:'afiliate',tg_affiliated_hint:'Alte grupuri la care radio-ul este afiliat (rămân atașate la BS chiar și când scan e oprit din statie)',
     th_status:'Status',th_last_seen:'Văzut',th_actions:'Acțiuni',
     th_id:'ID',th_type:'Tip',th_caller:'Apelant',
@@ -2105,7 +2193,7 @@ const LANGS={
     update_confirm:'Descarcă ultima versiune din main și recompilează?\nServiciul va reporni automat.',
     update_running:'Se actualizează… nu închide fereastra.',
     update_done_ok:'✓ Update finalizat. Se repornește…',
-    update_done_err:'✗ Update eșuat. Vezi logul de mai sus.',
+    update_done_err:'✗ Update eșuat. Vezi logul de mai jos.',
     update_close:'Închide',
     system:'Sistem',sys_info:'Info Sistem',sys_hostname:'Hostname',sys_uptime:'Uptime',
     sys_os:'OS',sys_version:'Versiune FS',sys_config:'Config Activ',
@@ -2173,7 +2261,7 @@ const LANGS={
     update_confirm:'Neueste Version von main holen und neu bauen?\nDer Dienst startet automatisch neu.',
     update_running:'Aktualisierung läuft… Fenster nicht schließen.',
     update_done_ok:'✓ Update abgeschlossen. Neustart…',
-    update_done_err:'✗ Update fehlgeschlagen. Siehe Log oben.',
+    update_done_err:'✗ Update fehlgeschlagen. Siehe Log unten.',
     update_close:'Schließen',
     system:'System',sys_info:'Systeminfo',sys_hostname:'Hostname',sys_uptime:'Laufzeit',
     sys_os:'OS',sys_version:'FS-Version',sys_config:'Aktive Konfig',
@@ -2241,7 +2329,7 @@ const LANGS={
     update_confirm:'¿Obtener la última versión de main y recompilar?\nEl servicio se reiniciará automáticamente.',
     update_running:'Actualizando… no cierres esta ventana.',
     update_done_ok:'✓ Actualización completa. Reiniciando…',
-    update_done_err:'✗ Actualización fallida. Ver log arriba.',
+    update_done_err:'✗ Actualización fallida. Ver log abajo.',
     update_close:'Cerrar',
     system:'Sistema',sys_info:'Info del Sistema',sys_hostname:'Hostname',sys_uptime:'Tiempo activo',
     sys_os:'OS',sys_version:'Versión FS',sys_config:'Config Activa',
@@ -2369,7 +2457,7 @@ const LANGS={
     update_confirm:'是否从 main 分支拉取最新代码并重新构建？\n服务将自动重启。',
     update_running:'正在更新… 请不要关闭此窗口',
     update_done_ok:'✓ 更新完成，正在重启…',
-    update_done_err:'✗ 更新失败，请查看上方日志',
+    update_done_err:'✗ 更新失败，请查看下方日志',
     update_close:'关闭',
     system:'系统',sys_info:'系统信息',sys_hostname:'主机名',sys_uptime:'运行时间',
     sys_version:'FS 版本',sys_os:'操作系统',sys_config:'当前配置',
@@ -2413,6 +2501,24 @@ function setTheme(theme,btn){
   else document.querySelectorAll('.theme-btn').forEach(d=>{if(d.dataset.t===theme)d.classList.add('active');});
 }
 
+// ── Touch mode (FH-FEAT-008) ─────────────────────────────────────────────────
+// '1' = forced on, '0' = forced off, null = auto (on for coarse pointers).
+let touchMode=localStorage.getItem('fs_touch');
+function applyTouchMode(){
+  const coarse=window.matchMedia&&window.matchMedia('(pointer:coarse)').matches;
+  const on=touchMode==='1'||(touchMode===null&&coarse);
+  document.body.classList.toggle('touch-mode',on);
+  document.body.classList.toggle('no-touch-mode',touchMode==='0');
+  const b=document.getElementById('touch-toggle');if(b)b.classList.toggle('active',on);
+}
+function toggleTouchMode(){
+  const coarse=window.matchMedia&&window.matchMedia('(pointer:coarse)').matches;
+  const currentlyOn=touchMode==='1'||(touchMode===null&&coarse);
+  touchMode=currentlyOn?'0':'1';
+  localStorage.setItem('fs_touch',touchMode);
+  applyTouchMode();
+}
+
 // ── Sidebar ───────────────────────────────────────────────────────────────
 let sidebarCollapsed=localStorage.getItem('sb_collapsed')==='1';
 function toggleSidebar(){
@@ -2439,7 +2545,7 @@ function showPage(name,el){
   else{const nav=document.getElementById('nav-'+name);if(nav)nav.classList.add('active');}
   document.getElementById('topbar-title').textContent=t(name)||name;
   if(name==='config'){loadConfig();loadWhitelist();loadWx();}
-  if(name==='system'){loadSystemInfo();loadConfigProfiles();loadLiveSds();}
+  if(name==='system'){loadSystemInfo();loadConfigProfiles();loadLiveSds();loadBrightness();}
   else if(sysAutoRefreshTimer){clearInterval(sysAutoRefreshTimer);sysAutoRefreshTimer=null;const cb=document.getElementById('sys-autorefresh');if(cb)cb.checked=false;}
   if(name==='wifi')wifiRefresh();
   if(window.innerWidth<=700)closeMobileSidebar();
@@ -3097,21 +3203,16 @@ function renderStations(){
       :`<span class="badge badge-dim" style="font-size:9px">${g}</span>`;
     if(gl.length>1){
       const gList=gl.slice().sort((a,b)=>(b===sel)-(a===sel)||a-b).map(gBadge).join(' ');
-      // When we know which TG is selected, show a neutral "+N afiliate" badge instead of
-      // "⚡ SCAN". The user perceives "SCAN" as a live statement about the radio scanning,
-      // but on the BS side we have no signal for that — only the static set of affiliated
-      // groups (which the radio keeps re-attaching with lifetime=0 even after scan is
-      // turned off locally). Saying "+N afiliate" is honest: these N groups are affiliated
-      // alongside the selected one. The orange "⚡ SCAN" label is kept only when we have
-      // no selected TG yet (e.g. just after a restart and before any PTT) — there the
-      // operator-facing distinction between selected and scanned is genuinely unknown.
-      let extraBadge;
-      if(sel!=null){
-        const others=gl.filter(g=>g!==sel).length;
-        extraBadge=`<span class="badge badge-dim" style="font-size:9px;margin-right:4px" title="${t('tg_affiliated_hint')}">+${others} ${t('tg_affiliated_short')}</span>`;
-      } else {
-        extraBadge=`<span class="badge" style="background:rgba(255,165,0,0.15);color:#ffaa00;border-color:rgba(255,165,0,0.4);font-weight:700;font-size:9px;margin-right:4px" title="${t('tg_scan_hint')}">⚡ SCAN</span>`;
-      }
+      // Always show a neutral "+N affiliated" badge — never "⚡ SCAN" (FH-BUG-032). On the BS
+      // side we have NO signal that the radio is actively scanning; we only have the static set
+      // of affiliated groups, which the radio keeps re-attaching with lifetime=0 even after scan
+      // is turned off on the device (intentional — see FH-BUG-022). "⚡ SCAN" was read by
+      // operators as a live "this radio is scanning" claim, which we cannot back up. "+N
+      // affiliated" is honest: these N groups are affiliated alongside the selected one (if any).
+      // With a selected TG, the selected one is marked ▶ and N excludes it; with none selected
+      // yet (e.g. before the first PTT), N counts them all.
+      const others=sel!=null?gl.filter(g=>g!==sel).length:gl.length;
+      const extraBadge=`<span class="badge badge-dim" style="font-size:9px;margin-right:4px" title="${t('tg_affiliated_hint')}">+${others} ${t('tg_affiliated_short')}</span>`;
       grps=`${extraBadge}${gList}`;
     } else if(gl.length===1){
       grps=`<span class="badge badge-blue">${gl[0]}</span>`;
@@ -3312,6 +3413,29 @@ let sysAutoRefreshTimer = null;
 function toggleSysAutoRefresh(on) {
   if (sysAutoRefreshTimer) { clearInterval(sysAutoRefreshTimer); sysAutoRefreshTimer = null; }
   if (on) sysAutoRefreshTimer = setInterval(loadSystemInfo, 5000);
+}
+
+// ── Display brightness (FH-FEAT-008) ─────────────────────────────────────────
+// Debounced POST so dragging the slider doesn't flood the endpoint; status probe
+// on page open reveals the card only when the backend reports a panel present.
+let _brTimer=null;
+function onBrightnessInput(v){
+  const lbl=document.getElementById('brightness-val');if(lbl)lbl.textContent=v;
+  clearTimeout(_brTimer);
+  _brTimer=setTimeout(()=>{
+    fetch('/api/system/brightness',{method:'POST',headers:{'Content-Type':'application/json'},credentials:'same-origin',body:JSON.stringify({value:parseInt(v,10)})}).catch(()=>{});
+  },150);
+}
+function loadBrightness(){
+  fetch('/api/system/brightness',{credentials:'same-origin'}).then(r=>r.json()).then(d=>{
+    if(!d||!d.present)return;
+    const card=document.getElementById('brightness-card');if(card)card.style.display='';
+    const sl=document.getElementById('brightness-slider');
+    if(sl){
+      sl.max=d.max_brightness||255;
+      if(typeof d.brightness==='number'){sl.value=d.brightness;const lbl=document.getElementById('brightness-val');if(lbl)lbl.textContent=d.brightness;}
+    }
+  }).catch(()=>{});
 }
 
 async function loadSystemInfo(){
@@ -3590,6 +3714,7 @@ setInterval(()=>{
 if(sidebarCollapsed)document.getElementById('sidebar').classList.add('collapsed');
 setLang(currentLang);
 setTheme(currentTheme);
+applyTouchMode();
 
 // Logout: hits /api/logout (clears the session cookie server-side) and navigates
 // to /login. We surface the button only when auth is actually in effect — detected
@@ -4190,10 +4315,6 @@ window.addEventListener('resize', () => {
   drawRfWaterfall();
 });
 
-connect();
-// Probe NetworkManager availability once at boot — toggles the WiFi nav item.
-wifiProbeAvailable();
-
 // ── GitHub update-check ─────────────────────────────────────────────────────
 // Best-effort: query GitHub for the latest release once at boot (and when the
 // config page is opened). If a newer version exists, reveal the header badge and
@@ -4214,7 +4335,50 @@ async function checkUpdate(){
     }
   }catch{/* silent */}
 }
-checkUpdate();
+
+// ── Boot gating (FH-FEAT-033) ───────────────────────────────────────────────
+// When the dashboard has auth enabled AND public_overview is on, an anonymous
+// visitor is served the SPA shell but must NOT open the WS or hit privileged
+// endpoints. Probe one privileged endpoint: 401 => anonymous (public mode);
+// 200 => either a no-auth deployment or an authenticated admin — behave as before.
+async function boot(){
+  const hasAuthMarker = document.cookie.split(';').some(c=>c.trim().startsWith('fs_auth='));
+  let anonymous = false;
+  if(!hasAuthMarker){
+    try{ const r = await fetch('/api/system', {credentials:'same-origin'}); anonymous = (r.status===401); }
+    catch{ anonymous = false; }
+  }
+  if(anonymous){ enterPublicMode(); return; }
+  connect();
+  wifiProbeAvailable(); // toggles the WiFi nav item
+  checkUpdate();
+}
+function enterPublicMode(){
+  // Anonymous read-only mode: hide every admin nav item + logout, reveal Login, show only the
+  // public overview page, and poll the narrow public snapshot. No WS, no privileged fetches.
+  document.querySelectorAll('.nav-item').forEach(n=>{ n.style.display='none'; });
+  const lb=document.getElementById('login-btn'); if(lb) lb.style.display='inline-flex';
+  const lo=document.getElementById('logout-btn'); if(lo) lo.style.display='none';
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
+  const pp=document.getElementById('page-public'); if(pp) pp.classList.add('active');
+  pollPublic();
+  setInterval(pollPublic, 3000);
+}
+async function pollPublic(){
+  try{
+    const r=await fetch('/api/public', {credentials:'same-origin'});
+    if(!r.ok) return;
+    const d=await r.json();
+    const setT=(id,v)=>{ const e=document.getElementById(id); if(e) e.textContent=v; };
+    setT('pub-ms', d.registered_ms ?? '—');
+    setT('pub-calls', (d.active_calls ?? 0) + (d.active_calls ? ' ('+d.group_calls+'G / '+d.individual_calls+'I)' : ''));
+    setT('pub-freq', d.center_freq_hz ? (d.center_freq_hz/1e6).toFixed(4)+' MHz' : '—');
+    setT('pub-rf', d.rf_active ? 'Active' : 'Idle');
+    setT('pub-brew', d.brew_online ? 'Online' : 'Offline');
+    setT('pub-ver', d.stack_version || '—');
+  }catch{/* silent */}
+}
+boot();
 </script>
 </body>
 </html>

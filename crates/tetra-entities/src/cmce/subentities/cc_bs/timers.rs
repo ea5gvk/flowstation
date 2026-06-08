@@ -504,6 +504,7 @@ impl CcBsSubentity {
         tracing::warn!("UL inactivity timeout on ts={}, forcing TX ceased for call_id={}", ts, call_id);
 
         let dest_gssi = call.dest_gssi;
+        let is_network_origin = matches!(call.origin, CallOrigin::Network { .. });
         call.tx_active = false;
         call.hangtime_start = Some(self.dltime);
 
@@ -516,7 +517,15 @@ impl CcBsSubentity {
             msg: SapMsgInner::CmceCallControl(CallControl::FloorReleased { call_id, ts }),
         });
 
-        if net_brew::is_brew_gssi_routable(&self.config, dest_gssi) {
+        // Notify Brew the floor was released. Network-origin calls mirror the inbound admission
+        // predicate (FH-FEAT-032 R3) so an admitted foreign/non-whitelisted GSSI still propagates
+        // floor events; local-origin calls keep the outbound routing predicate.
+        let notify_brew = if is_network_origin {
+            net_brew::is_brew_inbound_allowed(&self.config, dest_gssi)
+        } else {
+            net_brew::is_brew_gssi_routable(&self.config, dest_gssi)
+        };
+        if notify_brew {
             queue.push_back(SapMsg {
                 sap: Sap::Control,
                 src: TetraEntity::Cmce,

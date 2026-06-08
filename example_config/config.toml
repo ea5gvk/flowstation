@@ -43,6 +43,11 @@ backend = "SoapySdr"
 # DEBUG/TEST CODE. Capture files grow fast.
 # dl_tx_file = "./dl_output.bin"    # Debug; uncomment to save generated DL RF samples
 # ul_rx_file = "./ul_output.bin"    # Debug; uncomment to save received UL RF samples
+#
+# Read-side counterparts: replay RF samples FROM a file instead of the SDR.
+# Leave commented for normal (live SDR) operation.
+# ul_input_file = "./ul_input.bin"  # Debug; feed recorded UL RF samples in place of the radio
+# dl_input_file = "./dl_input.bin"  # Debug; feed recorded DL RF samples in place of generation
 
 [phy_io.soapysdr]
 # Transmit tx(dl) and receive rx(ul) frequencies in Hz
@@ -52,6 +57,15 @@ rx_freq = 433025000
 
 # Adjust if your SDR has a non-negligible tuning error
 # ppm_err = 0.0
+
+# Optional sample rate (samples/sec) applied to both RX and TX.
+# If unset, the device-specific default is used.
+# sample_rate = 1800000
+
+# Optional RX/TX channel index for multi-channel SDRs (e.g. LimeSDR, USRP).
+# If unset, the device default channel (usually 0) is used.
+# rx_channel = 0
+# tx_channel = 0
 
 ################################################################################################
 ## OPTIONAL: specific device, antenna, gain selection                                        ##
@@ -68,10 +82,26 @@ rx_freq = 433025000
 # rx_antenna = "LNAW"
 # tx_antenna = "BAND2"
 
-# Optional gain values (override device defaults)
-# Check valid gain names with SoapySDRUtil --probe
-# tx_gain_pad = 50.0
+################################################################################################
+## GAIN ELEMENTS                                                                             ##
+## Gains are per-element and REPEATABLE: add one line per gain stage your device exposes,    ##
+## named  rx_gain_<element>  /  tx_gain_<element> . The <element> name comes from the device ##
+## — list the valid names with:   SoapySDRUtil --probe                                       ##
+## (e.g. PlutoSDR: PGA ; LimeSDR: LNA, TIA, PGA, PAD ; etc.)                                  ##
+##                                                                                           ##
+## Values MUST be numbers (integer or float). A non-numeric value aborts startup with        ##
+## "RX/TX gain value must be a number". NOTE: a bare  rx_gain = 30  is NOT accepted — only    ##
+## rx_gain_<element>. Any element you omit falls back to the device default.                  ##
+################################################################################################
+
+# Example: set multiple RX gain stages
 # rx_gain_lna = 30.0
+# rx_gain_tia = 9.0
+# rx_gain_pga = 12.0
+
+# Example: set multiple TX gain stages
+# tx_gain_pad = 50.0
+# tx_gain_iamp = 0.0
 
 ###############################################################################
 
@@ -145,6 +175,32 @@ voice_service = true
 # Default: 3600 (1 hour). Valid range when non-zero: 60–86400.
 # periodic_registration_secs = 3600
 
+# ─────────────────────────────────────────────────────────────────────────────
+# OPTIONAL: additional cell service flags (advertised in the SYSINFO broadcast).
+# Leave at their defaults unless you know what you are changing.
+# registration              = true   # cell accepts MS registration (location updating)
+# deregistration            = true   # cell accepts MS deregistration
+# priority_cell             = false  # advertise this cell as a priority cell for reselection
+# no_minimum_mode           = false  # cell never falls back to minimum mode
+# migration                 = false  # cell supports inter-network migration
+# circuit_mode_data_service = false  # advertise circuit-mode data service
+# aie_service               = false  # advertise Air Interface Encryption (AIE) service
+# sndcp_service             = false  # advertise TETRA packet-data (SNDCP) service
+# advanced_link             = false  # advertise the advanced (enhanced data) link
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OPTIONAL: SYNC / low-level cell parameters. Defaults are fine for nearly all
+# deployments — only touch these if you understand the ETSI MAC/MLE fields.
+# neighbor_cell_broadcast = 0       # 2-bit D-MLE-SYNC neighbor-cell broadcast mode (default 0)
+# late_entry_supported    = false   # advertise late-entry support in D-MLE-SYNC (default false)
+# system_code             = 3       # SYNC system code; 3 = ETSI EN 300 392-2 V3.1.1 (default 3)
+# sharing_mode            = 0       # carrier sharing mode (0 = continuous transmission; default 0)
+# ts_reserved_frames      = 0       # timeshare reserved frames per multiframe (default 0)
+# u_plane_dtx             = false   # advertise U-plane DTX (discontinuous TX) support (default false)
+# frame_18_ext            = false   # frame-18 extension flag in SYNC (default false)
+# ms_txpwr_max_cell       = 4       # max MS TX power index (Table 18.57; 4 = 30 dBm / 1 W; default 4)
+# subscriber_class        = 0xFFFF  # 16-bit mask of subscriber classes allowed on this cell (default all)
+
 ###############################################################################
 # OPTIONAL: Neighbor Cell Broadcast (NCB)
 #
@@ -175,6 +231,21 @@ voice_service = true
 # subscriber_class = 0xFFFF             # 16 bits, which subscriber classes can access
 # timeshare_cell_information_or_security_parameters = 0  # 0-31
 # tdma_frame_offset = 0                 # 0-63, TDMA frame offset vs our cell
+#
+# Optional per-neighbor BS service details — advertise which services the neighbor
+# supports (mirrors the top-level cell service flags). Omit to leave unset.
+# [cell_info.neighbor_cells_ca.bs_service_details]
+# registration = true                 # neighbor accepts registration
+# deregistration = true               # neighbor accepts deregistration
+# priority_cell = false               # neighbor is a priority cell
+# no_minimum_mode = false             # neighbor never enters minimum mode
+# migration = false                   # neighbor supports migration
+# system_wide_services = false        # neighbor offers system-wide services
+# voice_service = true                # neighbor offers voice service
+# circuit_mode_data_service = false   # neighbor offers circuit-mode data
+# sndcp_service = false               # neighbor offers packet data (SNDCP)
+# aie_service = false                 # neighbor offers air-interface encryption
+# advanced_link = false               # neighbor offers the advanced (enhanced data) link
 #
 # Example with two neighbors:
 # [[cell_info.neighbor_cells_ca]]
@@ -236,6 +307,13 @@ voice_service = true
 #   "restart"   — restarts the FlowStation service (equivalent to systemctl restart tetra)
 #   "shutdown"  — stops the FlowStation service (must be restarted manually or via systemd)
 #   "kick_all"  — deregisters all currently registered terminals; they re-attach immediately
+#   "ip"        — replies (SDS to the requester) with the host's primary IP address
+#   "temp"      — replies (SDS to the requester) with the host CPU/SoC temperature
+#   "info"      — replies (SDS to the requester) with version + IP + temperature
+#
+# The "ip"/"temp"/"info" actions answer the requesting radio with a text SDS, so the operator
+# can query a station (e.g. on a hotspot with an unknown IP) straight from the radio menu.
+# Only authorized_issis get a reply.
 #
 # [cell_info.sds_command_control]
 # authorized_issis = [2260570, 2260571]   # ISSIs allowed to send commands
@@ -251,6 +329,18 @@ voice_service = true
 # [[cell_info.sds_command_control.commands]]
 # status_code = 32003
 # action = "kick_all"
+#
+# [[cell_info.sds_command_control.commands]]
+# status_code = 32010
+# action = "ip"
+#
+# [[cell_info.sds_command_control.commands]]
+# status_code = 32011
+# action = "temp"
+#
+# [[cell_info.sds_command_control.commands]]
+# status_code = 32012
+# action = "info"
 ###############################################################################
 
 ###############################################################################
@@ -294,8 +384,8 @@ voice_service = true
 # Live view of terminals, active calls, log, config editor, kick and SDS.
 #
 # [dashboard]
-# port = 8080
-# bind = "0.0.0.0"
+# port = 8080                    # HTTP port the dashboard listens on (default: 8080; must not be 0)
+# bind = "0.0.0.0"               # bind address (default: 0.0.0.0 = all interfaces; use 127.0.0.1 for localhost-only)
 #
 # OPTIONAL: HTTP Basic Auth — protect the dashboard with a username and password.
 # When set, the browser will show a native login dialog on first access.
@@ -309,6 +399,12 @@ voice_service = true
 # username = "admin"
 # password = "changeme"
 #
+# OPTIONAL: public read-only overview (FH-FEAT-033). When true AND username/password
+# are set, anonymous visitors see a small read-only status page (radio count, active
+# calls, frequency/RF state, network status) and a Log in button — but no controls,
+# config, or raw telemetry. Requires auth to be set; inert otherwise. Default: false.
+# public_overview = true
+#
 # OPTIONAL: explicit path to the FlowStation git source directory used by the
 # "Update" button. By default the dashboard auto-detects by walking up from the
 # binary path looking for a .git directory, then trying /opt/tetra-bluestation,
@@ -316,6 +412,42 @@ voice_service = true
 # outside the git clone (e.g. binary copied to /usr/local/bin/, sources in /opt/...)
 # or if auto-detection finds the wrong directory.
 # source_dir = "/opt/tetra-bluestation"
+
+###############################################################################
+
+# OPTIONAL: Telemetry export — push live BTS state to a remote collector over a
+# WebSocket connection. Inert unless this whole section is present.
+#
+# If you include it, both `host` and `port` are REQUIRED (no default) — an empty
+# [telemetry] header will fail to parse. Uncomment and fill in your collector.
+#
+# [telemetry]
+# host = "telemetry.example.com"     # collector hostname or IP (required)
+# port = 443                          # collector port (required)
+# use_tls = true                      # OPTIONAL: wss:// instead of ws:// (default false; required if ca_cert set)
+# ca_cert = "/etc/tetra-bluestation/telemetry-ca.der"  # OPTIONAL: DER CA cert for private-CA TLS; needs use_tls
+# OPTIONAL: HTTP Basic Auth — set both username and password, or neither.
+# Basic Auth is base64 (not encrypted); only safe over the internet with use_tls = true.
+# username = "bts"
+# password = "changeme"
+
+###############################################################################
+
+# OPTIONAL: Control endpoint — outbound control/management connection. When present,
+# FlowStation connects to an external control server over WebSocket. Omit this whole
+# section to disable it (off by default).
+#
+# host and port are REQUIRED if the section is present.
+#
+# [command]
+# host = "control.example.com"        # control server address (required when present)
+# port = 443                          # control server port (required when present)
+# use_tls = true                      # OPTIONAL: wss:// (default false; required if ca_cert set)
+# ca_cert = "/etc/tetra-bluestation/control-ca.der"  # OPTIONAL: DER CA cert for private-CA TLS; needs use_tls
+# OPTIONAL: HTTP Basic Auth — set both username and password, or neither.
+# Basic Auth is base64 (not encrypted); use use_tls = true for anything off-host.
+# username = "station"
+# password = "changeme"
 
 ###############################################################################
 
@@ -355,6 +487,10 @@ voice_service = true
 # Format: {"issi": 2260570, "rssi_dbfs": -42.3}
 # feature_rssi_export = false
 
-# Uncomment to allow only calls for selected SSIs to be forwarded through Brew.
-# If left commented, all calls (outside local_ssi_ranges) are allowed through Brew.
+# OPTIONAL: restrict OUTBOUND Brew forwarding to selected SSIs.
+# This is an OUTBOUND-only filter (FH-FEAT-032 R3): only calls/SDS TO these SSIs are
+# forwarded from this cell out to Brew. INBOUND Brew traffic is NOT filtered by this
+# list — incoming calls/SDS from Brew are still delivered regardless of the whitelist
+# (only local_ssi_ranges rejects inbound). If left commented, all calls outside
+# local_ssi_ranges are forwarded to Brew.
 # whitelisted_ssis = [91]

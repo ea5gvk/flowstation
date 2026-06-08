@@ -245,14 +245,119 @@ fn resolve_source_dir(override_dir: Option<&str>) -> Result<std::path::PathBuf, 
     ))
 }
 
+/// Spawn an already-configured command, streaming its stdout+stderr into the update log line by
+/// line (so a long `cargo build` shows live progress instead of looking hung — FH-BUG-035), and
+/// return the collected stdout on success. On spawn/exit failure it logs an error, marks the update
+/// `finish(false)`, and returns `None`.
+fn stream_cmd(update: &SharedUpdateState, mut cmd: std::process::Command, label: String) -> Option<String> {
+    use std::io::{BufRead, BufReader};
+    update.lock().unwrap().append(&label);
+    cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let mut u = update.lock().unwrap();
+            u.append(&format!("ERROR: failed to start '{}': {}", label.trim_start_matches("$ "), e));
+            u.finish(false);
+            return None;
+        }
+    };
+    // stderr on a side thread (cargo writes its progress there), stdout collected on this one.
+    let err_handle = child.stderr.take().map(|err| {
+        let u = std::sync::Arc::clone(update);
+        std::thread::spawn(move || {
+            for line in BufReader::new(err).lines().map_while(Result::ok) {
+                u.lock().unwrap().append(&line);
+            }
+        })
+    });
+    let mut collected = String::new();
+    if let Some(out) = child.stdout.take() {
+        for line in BufReader::new(out).lines().map_while(Result::ok) {
+            update.lock().unwrap().append(&line);
+            collected.push_str(&line);
+            collected.push('\n');
+        }
+    }
+    if let Some(h) = err_handle {
+        let _ = h.join();
+    }
+    match child.wait() {
+        Ok(s) if s.success() => Some(collected),
+        Ok(s) => {
+            let mut u = update.lock().unwrap();
+            u.append(&format!("ERROR: exited with {}", s));
+            u.finish(false);
+            None
+        }
+        Err(e) => {
+            let mut u = update.lock().unwrap();
+            u.append(&format!("ERROR: wait failed: {}", e));
+            u.finish(false);
+            None
+        }
+    }
+}
+
+/// Locate the `cargo` binary. Under a systemd service the process PATH usually omits `~/.cargo/bin`
+/// (where rustup installs cargo), so `Command::new("cargo")` fails with ENOENT even though an
+/// interactive SSH shell finds it (FH-BUG-037). We resolve an absolute path from $CARGO, the user's
+/// home, and well-known install locations, falling back to a bare PATH lookup.
+fn find_cargo() -> std::path::PathBuf {
+    use std::path::{Path, PathBuf};
+    if let Ok(c) = std::env::var("CARGO") {
+        let p = PathBuf::from(c);
+        if p.is_file() {
+            return p;
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let p = Path::new(&home).join(".cargo/bin/cargo");
+        if p.is_file() {
+            return p;
+        }
+    }
+    // Root/system-owned locations only — safe to run as a possibly-privileged service identity.
+    for cand in [
+        "/usr/local/cargo/bin/cargo",
+        "/root/.cargo/bin/cargo",
+        "/usr/local/bin/cargo",
+        "/usr/bin/cargo",
+    ] {
+        let p = PathBuf::from(cand);
+        if p.is_file() {
+            return p;
+        }
+    }
+    // Fall back to a bare PATH lookup. We deliberately do NOT scan other users' home directories:
+    // running the first `~/.cargo/bin/cargo` found under /home as the service identity would let any
+    // local user plant a binary we'd execute. If the service has no cargo on PATH, the operator can
+    // point us at one via the $CARGO environment variable.
+    PathBuf::from("cargo")
+}
+
+/// Whether the running binary was built from the repository's current commit. `binary_git_hash` is
+/// the abbreviated hash baked into `tetra_core::STACK_VERSION` at build time; `repo_head` is the
+/// full HEAD hash. Returns `None` when the build embedded no usable hash (so we can't tell). This is
+/// the source of truth for "is the binary actually up to date" — comparing git HEAD vs origin alone
+/// wrongly reports success after a merge that landed but whose build then failed (FH-BUG-035/037).
+fn binary_built_from(binary_git_hash: &str, repo_head: &str) -> Option<bool> {
+    let h = binary_git_hash.strip_suffix("-modified").unwrap_or(binary_git_hash);
+    if h.is_empty() || h == "unknown" {
+        return None;
+    }
+    Some(repo_head.starts_with(h))
+}
+
 /// Run git pull + cargo build --release in a background thread.
 /// Steps:
 ///   1. Resolve source dir (config override -> walk-up -> well-known paths -> CWD)
 ///   2. Validate it is a git repository
-///   3. Backup config.toml -> config.toml.bak
-///   4. git fetch + compare commits
-///   5. git merge --ff-only origin/main
-///   6. cargo build --release
+///   3. git fetch + compare commits
+///   4. If commits differ: backup config.toml -> config.toml.bak, then git merge --ff-only
+///   5. Rebuild only if the merge landed OR the running binary's embedded git hash != repo HEAD
+///      (so a previously-failed build is not mistaken for "already up to date")
+///   6. cargo build --release (cargo resolved explicitly; output streamed live)
 ///   7. systemctl restart <service>  (after short delay)
 fn run_update(update: SharedUpdateState, config_path: String, source_dir_override: Option<String>) {
     macro_rules! log {
@@ -277,37 +382,18 @@ fn run_update(update: SharedUpdateState, config_path: String, source_dir_overrid
 
     log!(update, "Source dir: {}", src_dir.display());
 
-    /// Run a command, stream stdout+stderr into the log, return Ok(stdout) or Err.
+    /// Run a command, streaming stdout+stderr into the log; return collected stdout or None.
     fn run_cmd_output(
         update: &SharedUpdateState,
         program: &str,
         args: &[&str],
         dir: &std::path::Path,
     ) -> Option<String> {
-        let line = format!("$ {} {}", program, args.join(" "));
-        tracing::info!("UPDATE: {}", line);
-        update.lock().unwrap().append(&line);
-
-        match std::process::Command::new(program).args(args).current_dir(dir).output() {
-            Ok(out) => {
-                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-                for l in stdout.lines() { update.lock().unwrap().append(l); }
-                for l in stderr.lines() { update.lock().unwrap().append(l); }
-                if out.status.success() {
-                    Some(stdout)
-                } else {
-                    update.lock().unwrap().append(&format!("ERROR: exited with {}", out.status));
-                    update.lock().unwrap().finish(false);
-                    None
-                }
-            }
-            Err(e) => {
-                update.lock().unwrap().append(&format!("ERROR: failed to run '{}': {}", program, e));
-                update.lock().unwrap().finish(false);
-                None
-            }
-        }
+        let label = format!("$ {} {}", program, args.join(" "));
+        tracing::info!("UPDATE: {}", label);
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(args).current_dir(dir);
+        stream_cmd(update, cmd, label)
     }
 
     let src_str = src_dir.to_str().unwrap_or(".");
@@ -369,36 +455,72 @@ fn run_update(update: SharedUpdateState, config_path: String, source_dir_overrid
     log!(update, "Local  commit: {}", &local_commit[..local_commit.len().min(12)]);
     log!(update, "Remote commit: {}", &remote_commit[..remote_commit.len().min(12)]);
 
-    if local_commit == remote_commit {
-        log!(update, "Already up to date — nothing to do.");
+    // Step 5: sync the working tree to origin/main when the commits differ.
+    let mut merged = false;
+    if local_commit != remote_commit {
+        // Show what changed.
+        let _ = run_cmd_output(&update, "git", &["-C", src_str, "log", "--oneline", "HEAD..origin/main"], &src_dir);
+
+        // Backup config before touching anything.
+        let backup_path = format!("{}.bak", config_path);
+        match std::fs::copy(&config_path, &backup_path) {
+            Ok(_)  => log!(update, "Config backed up → {}", backup_path),
+            Err(e) => log!(update, "WARNING: config backup failed: {} (continuing)", e),
+        }
+
+        // Fast-forward merge (only changed files are touched on disk).
+        log!(update, "--- git merge (fast-forward only) ---");
+        if run_cmd_output(&update, "git", &["-C", src_str, "merge", "--ff-only", "origin/main"], &src_dir).is_none() {
+            return;
+        }
+        merged = true;
+    }
+
+    // Step 6: decide whether a rebuild is actually required. We compare the git hash BAKED INTO the
+    // running binary (tetra_core::STACK_VERSION) against the repository HEAD — not merely git HEAD
+    // vs origin. This is what makes a previously-FAILED build recoverable: after a merge lands but
+    // the build fails, git already points at origin, yet the running binary is still the old one, so
+    // "git up to date" must NOT be reported as "updated" (FH-BUG-035 / FH-BUG-037).
+    let repo_head = if merged { remote_commit.as_str() } else { local_commit.as_str() };
+    let binary_current = binary_built_from(tetra_core::GIT_HASH, repo_head);
+    if !merged && binary_current != Some(false) {
+        match binary_current {
+            Some(true) => log!(update, "Already up to date — running {} matches the repository.", tetra_core::STACK_VERSION),
+            _ => log!(update, "Repository is up to date; running {} (build hash not verifiable).", tetra_core::STACK_VERSION),
+        }
         update.lock().unwrap().finish(true);
         return;
     }
-
-    // Step 5: show what changed
-    let _ = run_cmd_output(&update, "git", &["-C", src_str, "log", "--oneline",
-        &format!("HEAD..origin/main")], &src_dir);
-
-    // Step 6: backup config before touching anything
-    let backup_path = format!("{}.bak", config_path);
-    match std::fs::copy(&config_path, &backup_path) {
-        Ok(_)  => log!(update, "Config backed up → {}", backup_path),
-        Err(e) => log!(update, "WARNING: config backup failed: {} (continuing)", e),
+    if !merged {
+        log!(update, "Repository is current but the running binary ({}) predates it — rebuilding.", tetra_core::STACK_VERSION);
     }
 
-    // Step 7: fast-forward merge (only changed files are touched on disk)
-    log!(update, "--- git merge (fast-forward only) ---");
-    if run_cmd_output(&update, "git", &["-C", src_str, "merge", "--ff-only", "origin/main"], &src_dir).is_none() {
+    // Step 7: build. cargo lives in ~/.cargo/bin, which the systemd service PATH usually omits, so
+    // resolve it explicitly and put its directory on PATH for the rustc/rustup shims (FH-BUG-037).
+    // Output is streamed live so a long compile shows progress instead of looking hung (FH-BUG-035).
+    log!(update, "--- cargo build --release ---");
+    let cargo = find_cargo();
+    log!(update, "Using cargo: {}", cargo.display());
+    let mut build = std::process::Command::new(&cargo);
+    build.args(["build", "--release"]).current_dir(&src_dir);
+    // Put cargo's own directory on PATH so the rustc/rustup shims resolve under the service's minimal
+    // PATH. Only for an ABSOLUTE cargo: a bare "cargo" has an empty parent, and prepending "" (or
+    // appending to an empty PATH) injects an empty entry that Unix treats as the current directory —
+    // which would let a planted `rustc`/`cc` in the source tree run during the build.
+    if cargo.is_absolute() {
+        if let Some(bin) = cargo.parent().filter(|p| !p.as_os_str().is_empty()) {
+            let new_path = match std::env::var("PATH") {
+                Ok(p) if !p.is_empty() => format!("{}:{}", bin.display(), p),
+                _ => bin.display().to_string(),
+            };
+            build.env("PATH", new_path);
+        }
+    }
+    if stream_cmd(&update, build, "$ cargo build --release".to_string()).is_none() {
         return;
     }
 
-    // Step 8: incremental build (cargo only recompiles changed crates)
-    log!(update, "--- cargo build --release (incremental) ---");
-    if run_cmd_output(&update, "cargo", &["build", "--release"], &src_dir).is_none() {
-        return;
-    }
-
-    // Step 9: done — schedule restart
+    // Step 8: done — schedule restart.
     log!(update, "--- Build successful. Restarting service in 2s... ---");
     update.lock().unwrap().finish(true);
 
@@ -422,6 +544,9 @@ pub struct DashboardServer {
     /// Authentication credentials. None = no auth (open access). When set, requests
     /// must carry a valid `fs_session` cookie obtained from `POST /api/login`.
     auth: Option<(String, String)>,
+    /// When true AND `auth` is Some, anonymous visitors get a read-only public overview instead of
+    /// being bounced to /login. Inert without auth. (FH-FEAT-033)
+    public_overview: bool,
     /// In-memory session store backing the cookie auth.
     sessions: SharedSessionStore,
     /// Last time a ts_voice WS message was broadcast per TS (indexed 0..3 for TS1..TS4)
@@ -447,6 +572,7 @@ impl DashboardServer {
             update_state: Arc::new(Mutex::new(UpdateState::new())),
             source_dir_override: None,
             auth: None,
+            public_overview: false,
             sessions: Arc::new(Mutex::new(SessionStore::new())),
             ts_last_broadcast: std::sync::Mutex::new([now; 4]),
             radioid: crate::net_dashboard::radioid::RadioIdCache::new(radioid_path),
@@ -472,6 +598,12 @@ impl DashboardServer {
         self.auth = auth;
     }
 
+    /// Enable the anonymous read-only public overview (only effective when auth is set).
+    /// Must be called BEFORE `start()`, which captures the flag into the server thread.
+    pub fn set_public_overview(&mut self, on: bool) {
+        self.public_overview = on;
+    }
+
     /// Mark that the stack started on the fallback config, with the reason why.
     /// The dashboard will display a persistent warning banner.
     pub fn set_fallback_config(&self, reason: String) {
@@ -490,6 +622,7 @@ impl DashboardServer {
         let update_state = Arc::clone(&self.update_state);
         let source_dir_override = self.source_dir_override.clone();
         let auth = self.auth.clone();
+        let public_overview = self.public_overview;
         let shared_config = self.shared_config.clone();
         let sessions = Arc::clone(&self.sessions);
         let radioid = self.radioid.clone();
@@ -515,7 +648,7 @@ impl DashboardServer {
                     let radioid = radioid.clone();
                     std::thread::Builder::new()
                         .name("dashboard-conn".into())
-                        .spawn(move || handle_connection(stream, state, clients, config_path, cmd_tx, update_state, source_dir_override, auth, shared_config, sessions, radioid))
+                        .spawn(move || handle_connection(stream, state, clients, config_path, cmd_tx, update_state, source_dir_override, auth, shared_config, sessions, radioid, public_overview))
                         .ok();
                 }
             })
@@ -618,7 +751,11 @@ impl DashboardServer {
                 }
                 TelemetryEvent::BrewConnected { connected, server_version } => {
                     s.brew_online = *connected;
-                    if *connected { s.brew_version = *server_version; }
+                    // Version is monotonic within a run (FH-BUG: brew shown as v0). The transport
+                    // reports 0 ("unknown") on every (re)connect and v1 is only learned later
+                    // (lazily, from a v1-flavoured group call); an unconditional assignment let a
+                    // reconnect DOWNGRADE a confirmed v1 back to v0. Only ever raise it.
+                    if *connected { s.brew_version = s.brew_version.max(*server_version); }
                 }
                 TelemetryEvent::SdsActivity { source_issi, dest_issi } => {
                     s.push_last_heard(*source_issi, "sds", *dest_issi);
@@ -891,6 +1028,7 @@ fn handle_connection(
     shared_config: Option<tetra_config::bluestation::SharedConfig>,
     sessions: SharedSessionStore,
     radioid: crate::net_dashboard::radioid::RadioIdCache,
+    public_overview: bool,
 ) {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
 
@@ -1006,12 +1144,34 @@ fn handle_connection(
                 let _ = buf.read_line(&mut line);
                 if line == "\r\n" || line.is_empty() || line == "\n" { break; }
             }
+            let inner = buf.into_inner();
+            let is_root = req_line.starts_with("GET / ")
+                || req_line.starts_with("GET /?")
+                || req_line == "GET / HTTP/1.1";
+
+            // Public overview (FH-FEAT-033): when enabled, an anonymous visitor may load the SPA
+            // shell and read the narrow public snapshot — nothing else. Every other route (config,
+            // controls, /ws, raw telemetry) still falls through to the redirect/401 below, so the
+            // admin surface stays fully behind the session wall.
+            if public_overview && is_root {
+                serve_html(inner);
+                return;
+            }
+            if public_overview
+                && (req_line.starts_with("GET /api/public ")
+                    || req_line.starts_with("GET /api/public?")
+                    || req_line == "GET /api/public HTTP/1.1")
+            {
+                serve_public_snapshot(inner, &state);
+                return;
+            }
+
             // For GET / (the dashboard SPA): redirect to /login so the browser navigates.
             // For API requests: 401 so JS code can detect and refresh.
-            if req_line.starts_with("GET / ") || req_line.starts_with("GET /?") || req_line == "GET / HTTP/1.1" {
-                http_redirect(buf.into_inner(), "/login");
+            if is_root {
+                http_redirect(inner, "/login");
             } else {
-                http_response(buf.into_inner(), 401, "Unauthorized — please log in");
+                http_response(inner, 401, "Unauthorized — please log in");
             }
             return;
         }
@@ -1019,7 +1179,33 @@ fn handle_connection(
 
     if req_line.contains("/ws") {
         handle_ws(stream, state, clients, cmd_tx, update_state, auth);
-    } else if req_line.contains("GET /api/system") {
+    } else if req_line.contains("GET /api/system/brightness") {
+        // Backlight status probe (FH-FEAT-008) — lets the UI hide the slider on a panel-less host.
+        drain_http_headers(&mut stream);
+        let st = crate::backlight::status();
+        let body = serde_json::to_string(&st).unwrap_or_else(|_| "{}".to_string());
+        http_json_response(stream, 200, &body);
+    } else if req_line.contains("POST /api/system/brightness") {
+        // Set backlight brightness (FH-FEAT-008). Body: {"value": 0..=255}.
+        let body = read_http_body(&mut stream);
+        let req: serde_json::Value = match serde_json::from_slice(&body) {
+            Ok(v) => v,
+            Err(e) => { http_response(stream, 400, &format!("invalid JSON: {e}")); return; }
+        };
+        let value = req.get("value").and_then(|v| v.as_u64()).unwrap_or(u64::MAX);
+        if value > u64::from(crate::backlight::MAX_VALUE) {
+            http_response(stream, 400, "value must be 0-255");
+            return;
+        }
+        tracing::info!("Dashboard: set backlight brightness {}", value);
+        let body = match crate::backlight::set_brightness(value as u32) {
+            Ok(()) => serde_json::json!({ "ok": true }).to_string(),
+            Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }).to_string(),
+        };
+        http_json_response(stream, 200, &body);
+    } else if req_line.contains("GET /api/system ") {
+        // NOTE: trailing space is load-bearing — without it `contains` would also swallow
+        // `GET /api/system/brightness`. The frontend's `fetch('/api/system')` still matches.
         let mut buf = BufReader::new(stream);
         loop {
             let mut line = String::new();
@@ -2153,6 +2339,34 @@ fn save_config_profile(config_path: &str, profile_name: &str, content: &str) -> 
         .map_err(|e| format!("failed to write profile: {}", e))
 }
 
+/// GET /api/public — anonymous read-only overview (FH-FEAT-033). Projects ONLY non-sensitive,
+/// already-public scalars from the dashboard's own state — never SharedConfig/StackState, and never
+/// ISSIs/GSSIs, the whitelist, SDS contents or the log ring. The read lock is the dashboard's own
+/// RwLock (the same one the WS snapshot takes), held only long enough to copy a handful of counts.
+fn serve_public_snapshot(stream: TcpStream, state: &DashboardState) {
+    let body = match state.read() {
+        Ok(s) => {
+            let active_calls = s.calls.len();
+            let group_calls = s.calls.values().filter(|c| c.is_group).count();
+            let individual_calls = active_calls - group_calls;
+            let center_freq_hz = s.last_tx_visual.as_ref().map(|v| v.center_freq_hz);
+            serde_json::json!({
+                "registered_ms": s.ms_map.len(),
+                "active_calls": active_calls,
+                "group_calls": group_calls,
+                "individual_calls": individual_calls,
+                "center_freq_hz": center_freq_hz,
+                "rf_active": s.last_tx_visual.is_some(),
+                "brew_online": s.brew_online,
+                "stack_version": tetra_core::STACK_VERSION,
+            })
+            .to_string()
+        }
+        Err(_) => "{}".to_string(),
+    };
+    http_json_response(stream, 200, &body);
+}
+
 /// Copy selected profile over the active config_path, preserving a backup.
 fn activate_config_profile(config_path: &str, profile_name: &str) -> Result<(), String> {
     // Security: profile_name must be a plain filename with no path separators
@@ -2392,4 +2606,44 @@ fn serve_login_page(mut stream: TcpStream) {
     );
     let _ = stream.write_all(header.as_bytes());
     let _ = stream.write_all(body.as_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{binary_built_from, DashboardServer};
+    use crate::net_telemetry::TelemetryEvent;
+
+    /// FH-BUG (brew shown as v0): the transport reports version 0 ("unknown") on every (re)connect
+    /// and v1 is learned lazily from a v1 group call. A confirmed v1 must never be downgraded by a
+    /// later 0-reporting (re)connect.
+    #[test]
+    fn brew_version_is_monotonic_across_reconnects() {
+        let server = DashboardServer::new("/tmp/fs_brew_ver_test_config.toml".to_string());
+        let v = || server.state.read().unwrap().brew_version;
+
+        server.handle_telemetry(TelemetryEvent::BrewConnected { connected: true, server_version: 0 });
+        assert_eq!(v(), 0, "initial connect reports unknown");
+
+        server.handle_telemetry(TelemetryEvent::BrewConnected { connected: true, server_version: 1 });
+        assert_eq!(v(), 1, "a v1 group call raises it to v1");
+
+        // Disconnect then reconnect, transport again reports 0 — must NOT downgrade.
+        server.handle_telemetry(TelemetryEvent::BrewConnected { connected: false, server_version: 0 });
+        server.handle_telemetry(TelemetryEvent::BrewConnected { connected: true, server_version: 0 });
+        assert_eq!(v(), 1, "reconnect reporting v0 must not downgrade a confirmed v1");
+    }
+
+    #[test]
+    fn test_binary_built_from() {
+        let head = "fcac34e2778658fd8a2c6767d54f6da6feaaa5fc";
+        // Binary built from this commit (8-char abbrev) -> up to date.
+        assert_eq!(binary_built_from("fcac34e2", head), Some(true));
+        // Binary built from an older commit -> stale, needs rebuild (the FH-BUG-037 case).
+        assert_eq!(binary_built_from("6abf749f", head), Some(false));
+        // A "-modified" (dirty) build at the same commit still counts as that commit.
+        assert_eq!(binary_built_from("fcac34e2-modified", head), Some(true));
+        // No usable hash baked in -> cannot tell.
+        assert_eq!(binary_built_from("unknown", head), None);
+        assert_eq!(binary_built_from("", head), None);
+    }
 }

@@ -546,9 +546,11 @@ impl CcBsSubentity {
         dest_gssi: u32,
         priority: u8,
     ) {
-        if !net_brew::is_brew_gssi_routable(&self.config, dest_gssi) {
+        // Inbound admission (FH-FEAT-032 R3): admit Brew-originated calls for any non-local GSSI,
+        // including bridging/foreign GSSIs absent from the outbound `whitelisted_ssis`.
+        if !net_brew::is_brew_inbound_allowed(&self.config, dest_gssi) {
             tracing::warn!(
-                "CMCE: fsm_on_network_call_start called for non-routable gssi={}, uuid={}, dropping",
+                "CMCE: fsm_on_network_call_start called for inactive/local-only gssi={}, uuid={}, dropping",
                 dest_gssi,
                 brew_uuid
             );

@@ -182,6 +182,14 @@ impl UmacBs {
             },
         };
 
+        // Confirm in the log what packet-data-relevant capabilities the cell advertises in SYSINFO.
+        // A radio that wants advanced-link packet data (class_of_ms.original_advanced_link=1) needs
+        // BOTH sndcp_service AND advanced_link advertised, or it won't start the SNDCP procedure.
+        tracing::info!(
+            "SYSINFO advertising: sndcp_service={} advanced_link={} voice_service={} circuit_mode_data={}",
+            c.cell.sndcp_service, c.cell.advanced_link, c.cell.voice_service, c.cell.circuit_mode_data_service
+        );
+
         let mac_sync_pdu = MacSync {
             system_code: c.cell.system_code,
             colour_code: c.cell.colour_code,

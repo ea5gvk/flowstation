@@ -300,6 +300,13 @@ fn main() {
                 dashboard.set_auth(Some((user, pass)));
             }
 
+            // Optional anonymous read-only public overview (FH-FEAT-033). Inert unless auth is set;
+            // must be configured before start(), which captures the flag into the server thread.
+            if dash_cfg.public_overview {
+                tracing::info!("Dashboard: public read-only overview enabled for anonymous visitors");
+            }
+            dashboard.set_public_overview(dash_cfg.public_overview);
+
             // Propagate SharedConfig so the dashboard can read live SDS queue state.
             dashboard.set_shared_config(cfg.clone());
 

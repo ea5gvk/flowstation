@@ -521,12 +521,32 @@ impl NetworkTransport for WebSocketTransport {
             None
         };
 
-        let (ws, _response) = tungstenite::client_tls_with_config(request, tcp, None, connector)
+        let (ws, response) = tungstenite::client_tls_with_config(request, tcp, None, connector)
             .map_err(|e| NetworkError::ConnectionFailed(format!("WebSocket connect failed: {}", e)))?;
 
-        // Start at v0 — actual version is detected from message length (mnemonic presence).
-        self.server_brew_version = 0;
-        tracing::info!("WebSocketTransport: connected, Brew version TBD (detected from message length)");
+        // Brew version source. Preferred: an authoritative version the server advertises in the
+        // 101 upgrade response (we offer "X-Brew-Version: 1", which a conformant server may echo).
+        // If the server sends no such header — the TetraPack server is not known to — this stays
+        // None and the version is learned lazily from message content (a v1 group call carries a
+        // mnemonic; see worker.rs). We log the header (or its absence) so a single deploy's logs
+        // answer whether the server is a usable, deterministic version source.
+        // Monotonic: never downgrade a version already confirmed this run (e.g. across a reconnect).
+        let handshake_version: Option<u8> = response
+            .headers()
+            .get("x-brew-version")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u8>().ok());
+        self.server_brew_version = self.server_brew_version.max(handshake_version.unwrap_or(0));
+        match handshake_version {
+            Some(v) => tracing::info!(
+                "WebSocketTransport: connected, server advertised Brew v{v} in handshake (now v{})",
+                self.server_brew_version
+            ),
+            None => tracing::info!(
+                "WebSocketTransport: connected, no X-Brew-Version in handshake → version detected lazily from message content (currently v{})",
+                self.server_brew_version
+            ),
+        }
 
         tracing::debug!("WebSocketTransport: WebSocket connected");
 

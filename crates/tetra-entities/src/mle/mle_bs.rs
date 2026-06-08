@@ -167,10 +167,12 @@ impl MleBs {
                     chan_change_resp_req: false, // TODO FIXME
                     chan_change_handle: None,    // TODO FIXME
                 };
+                // SNDCP (packet data, MLE protocol discriminator 4) belongs to the SNDCP entity,
+                // not CMCE. Route it over the TLPD SAP so the packet-data layer receives it.
                 let msg = SapMsg {
-                    sap: Sap::LcmcSap,
+                    sap: Sap::TlpdSap,
                     src: TetraEntity::Mle,
-                    dest: TetraEntity::Cmce,
+                    dest: TetraEntity::Sndcp,
                     msg: SapMsgInner::LtpdMleUnitdataInd(m),
                 };
                 queue.push_back(msg);

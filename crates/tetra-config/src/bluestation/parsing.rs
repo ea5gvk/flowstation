@@ -223,6 +223,97 @@ struct TomlConfigRoot {
 mod tests {
     use super::*;
 
+    /// The shipped example config must always parse cleanly through the real loader. This guards
+    /// against config-documentation drift: every option documented (or set) in example_config must
+    /// stay valid against the DTOs, and the strict `extra`/`deny`-style flatten maps must not reject
+    /// any uncommented key.
+    #[test]
+    fn example_config_parses() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../example_config/config.toml");
+        from_file(path).unwrap_or_else(|e| panic!("example_config/config.toml must parse: {e}"));
+    }
+
+    /// Gold-standard guard: every optional block documented (commented) in example_config must
+    /// parse against the DTOs when a user UNCOMMENTS it — field names and types must match.
+    #[test]
+    fn documented_optional_blocks_parse_when_uncommented() {
+        let toml = r#"
+config_version = "0.6"
+stack_mode = "Bs"
+
+[phy_io]
+backend = "None"
+ul_input_file = "./ul.bin"
+dl_input_file = "./dl.bin"
+
+[net_info]
+mcc = 901
+mnc = 9999
+
+[cell_info]
+main_carrier = 1584
+freq_band = 4
+freq_offset = 0
+duplex_spacing = 4
+reverse_operation = false
+location_area = 1
+registration = true
+deregistration = true
+priority_cell = false
+no_minimum_mode = false
+migration = false
+circuit_mode_data_service = false
+aie_service = false
+neighbor_cell_broadcast = 0
+late_entry_supported = false
+system_code = 3
+sharing_mode = 0
+ts_reserved_frames = 0
+u_plane_dtx = false
+frame_18_ext = false
+ms_txpwr_max_cell = 4
+subscriber_class = 0xFFFF
+
+[[cell_info.neighbor_cells_ca]]
+cell_identifier_ca = 1
+cell_reselection_types_supported = 1
+neighbor_cell_synchronized = false
+cell_load_ca = 0
+main_carrier_number = 1525
+
+[cell_info.neighbor_cells_ca.bs_service_details]
+registration = true
+deregistration = true
+priority_cell = false
+no_minimum_mode = false
+migration = false
+system_wide_services = false
+voice_service = true
+circuit_mode_data_service = false
+sndcp_service = false
+aie_service = false
+advanced_link = false
+
+[telemetry]
+host = "t.example.com"
+port = 443
+use_tls = true
+ca_cert = "/tmp/ca.der"
+username = "bts"
+password = "x"
+
+[command]
+host = "c.example.com"
+port = 443
+use_tls = true
+ca_cert = "/tmp/ca.der"
+username = "station"
+password = "x"
+"#;
+        from_toml_str(toml)
+            .unwrap_or_else(|e| panic!("documented optional blocks must parse when uncommented: {e}"));
+    }
+
     fn minimal_toml(extra_cell: &str) -> String {
         format!(
             r#"

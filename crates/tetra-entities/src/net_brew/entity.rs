@@ -804,38 +804,42 @@ impl BrewEntity {
         };
 
         call.frame_count += 1;
-
-        // Check if resources have been allocated yet
-        let Some(ts) = call.ts else {
-            // Audio arrived before NetworkCallReady - drop it
-            if call.frame_count == 1 {
-                tracing::debug!(
-                    "BrewEntity: voice frame arrived before resources allocated, uuid={}, dropping",
-                    uuid
-                );
-            }
-            return;
-        };
-
-        // Log first voice frame per call
-        if call.frame_count == 1 {
-            tracing::info!(
-                "BrewEntity: voice frame #{} uuid={} len={} bytes ts={}",
-                call.frame_count,
-                uuid,
-                data.len(),
-                ts
-            );
-        }
+        let frame_count = call.frame_count;
+        // `ts` is None until NetworkCallReady opens the traffic channel (a brief window after
+        // NetworkCallStart). We still buffer early frames below — see the playout note.
+        let ts = call.ts;
+        // mutable borrow of `call` ends here; the jitter push below borrows other fields of `self`.
 
         // STE format: byte 0 = header (control bits), bytes 1-35 = 274 ACELP bits for TCH/S.
-        // Strip the STE header and pass only the ACELP payload.
+        // Validate before slicing so a short frame can never panic.
         if data.len() < 36 {
             tracing::warn!("BrewEntity: voice frame too short ({} bytes, expected 36 STE bytes)", data.len());
             return;
         }
-        let acelp_data = data[1..].to_vec(); // 35 bytes = 280 bits, of which 274 are ACELP
 
+        // Log the first frame per call (whether or not the channel is open yet).
+        if frame_count == 1 {
+            match ts {
+                Some(ts) => tracing::info!(
+                    "BrewEntity: voice frame #1 uuid={} len={} bytes ts={}",
+                    uuid,
+                    data.len(),
+                    ts
+                ),
+                None => tracing::debug!(
+                    "BrewEntity: early voice frame uuid={} buffered before resources allocated",
+                    uuid
+                ),
+            }
+        }
+
+        // Buffer the ACELP payload even before the traffic channel is allocated (ts == None):
+        // drain_jitter_playout only emits once call.ts is Some, so these early frames are HELD, not
+        // dropped, eliminating the brief clip at the very start of a Brew-originated transmission
+        // (FH-FEAT-032 R1 — the feature's MCCH channel allocation was already correct; this fixes
+        // only the first-frame clip). The jitter buffer is pre-allocated and hard-capped, and this
+        // runs on the Brew entity tick — off the RF/voice scheduler.
+        let acelp_data = data[1..].to_vec(); // 35 bytes = 280 bits, of which 274 are ACELP
         self.dl_jitter
             .entry(uuid)
             .or_insert_with(|| VoiceJitterBuffer::with_initial_latency(self.brew_config.jitter_initial_latency_frames as usize))

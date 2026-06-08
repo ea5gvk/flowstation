@@ -47,6 +47,23 @@ pub fn is_brew_gssi_routable(config: &SharedConfig, ssi: u32) -> bool {
     true
 }
 
+/// Determine whether a Brew-originated INBOUND call/SDS for a given GSSI may be admitted locally.
+///
+/// This is deliberately weaker than [`is_brew_gssi_routable`]. That predicate governs OUTBOUND
+/// forwarding of *local* traffic to Brew and therefore honours `whitelisted_ssis` — which is
+/// documented as "allow only calls for selected SSIs to be **forwarded through Brew**", i.e. an
+/// outbound concept. Applying the whitelist to inbound admission wrongly blocks a bridging/foreign
+/// GSSI that is absent from the whitelist (FH-FEAT-032 R3): a network call legitimately arriving
+/// from an authenticated Brew connection must still reach the local MS camped on that group.
+///
+/// The `local_ssi_ranges` override is still honoured — those ranges are documented as local-only
+/// ("Incoming brew traffic on these ranges will also be rejected"), so inbound traffic to them stays
+/// rejected.
+#[inline]
+pub fn is_brew_inbound_allowed(config: &SharedConfig, ssi: u32) -> bool {
+    is_active(config) && !config.config().cell.local_ssi_ranges.contains(ssi)
+}
+
 /// Determine if a given ISSI should be sent to the Brew server.
 /// On TetraPack, subscriber ISSIs must be 7 digits (1_000_000..=9_999_999).
 /// Special service ISSIs (e.g. 600 echo, short numbers) are always forwarded to Brew —

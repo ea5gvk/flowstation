@@ -605,20 +605,26 @@ impl MmBs {
             tracing::debug!("MS {} requested {:?}, capping to {:?}", issi, requested, granted_esm);
         }
 
-        let (frame_number, multiframe_number) = if granted_esm == EnergySavingMode::StayAlive {
-            (None, None)
-        } else {
-            // Spread MSs evenly: frame 0-17, multiframe offset within Eg cycle
-            let cycle_len = granted_esm as u8 + 1; // Eg1=2, Eg2=3, Eg3=4
-            // TETRA frames are 1-indexed (1..18); use 1..=18 to avoid frame 0
-            let frame_num = ((issi % 18) + 1) as u8;
-            let mframe_num = ((issi / 18) % cycle_len as u32) as u8;
-            tracing::info!(
-                "MS {} granted {:?}: monitoring frame={} multiframe={}",
-                issi, granted_esm, frame_num, mframe_num
-            );
-            (Some(frame_num), Some(mframe_num))
-        };
+        let (frame_number, multiframe_number) =
+            match crate::mm::components::client_state::ee_cycle_frames(granted_esm) {
+                None => (None, None), // StayAlive — no monitoring window
+                Some(cycle) => {
+                    // Frame-based start point (ETSI EN 300 392-2 Table 23.9 / clause 23.7.6): the MS
+                    // wakes for one TDMA frame every `cycle` frames. Spread MSs across the cycle by
+                    // ISSI so they don't all wake in the same frame. The start point's absolute frame
+                    // index (m-1)*18+(f-1) must be ≡ phase (mod cycle); anchoring it in multiframe 1
+                    // yields a valid Frame Number (1..=18) and Multiframe Number (1..=60 — never the
+                    // StayAlive-reserved 0 the old `(issi/18)%cycle` formula produced).
+                    let phase = (issi % cycle as u32) as u8; // 0..cycle-1, ≤ 5 for capped Eg1..Eg3
+                    let frame_num = (phase % 18) + 1; // 1..=18
+                    let mframe_num = (phase / 18) + 1; // 1..=60 (== 1 for the supported cycles ≤ 6)
+                    tracing::info!(
+                        "MS {} granted {:?}: frame-based cycle={} frames, start frame={} multiframe={}",
+                        issi, granted_esm, cycle, frame_num, mframe_num
+                    );
+                    (Some(frame_num), Some(mframe_num))
+                }
+            };
 
         EnergySavingInformation {
             energy_saving_mode: granted_esm,
@@ -1542,6 +1548,57 @@ impl MmBs {
         for (issi, handle) in clients {
             tracing::debug!("mm_bs: re-registering ISSI {} (handle={})", issi, handle);
             Self::send_d_location_update_command(queue, issi, handle);
+        }
+    }
+}
+
+#[cfg(test)]
+mod ee_tests {
+    use super::*;
+    use tetra_core::TdmaTime;
+
+    #[test]
+    fn grant_energy_saving_produces_spec_valid_start_point() {
+        // ETSI Table 16.40: Frame Number ∈ 1..=18, Multiframe Number ∈ 1..=60 (MN=0 is reserved
+        // ONLY for StayAlive). The old (issi/18)%cycle formula produced MN=0 for half the radios —
+        // an invalid anchor a conformant radio rejects (FH-BUG-034). Every active grant must now be
+        // valid AND its start point must itself be a wake frame in the matching gating window.
+        for mode in [
+            EnergySavingMode::Eg1,
+            EnergySavingMode::Eg2,
+            EnergySavingMode::Eg3,
+            EnergySavingMode::Eg5,
+            EnergySavingMode::Eg7,
+        ] {
+            for issi in [1u32, 2, 17, 18, 19, 2260596, 2269000, 9_999_999] {
+                let esi = MmBs::grant_energy_saving(issi, mode);
+                let frame = esi.frame_number.expect("active EE carries a frame number");
+                let mframe = esi.multiframe_number.expect("active EE carries a multiframe number");
+                assert!((1..=18).contains(&frame), "FN {frame} out of 1..=18 (issi {issi}, {mode:?})");
+                assert!((1..=60).contains(&mframe), "MN {mframe} out of 1..=60 (issi {issi}, {mode:?})");
+                let cycle = crate::mm::components::client_state::ee_cycle_frames(esi.energy_saving_mode)
+                    .expect("active EE has a cycle");
+                assert!(
+                    TdmaTime { h: 0, m: mframe, f: frame, t: 1 }.in_ee_monitoring_window(frame, mframe, cycle),
+                    "start point ({frame},{mframe}) must be open for cycle {cycle} (issi {issi}, {mode:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn grant_energy_saving_stay_alive_and_eg4_7_capping() {
+        // StayAlive → no monitoring window.
+        let esi = MmBs::grant_energy_saving(42, EnergySavingMode::StayAlive);
+        assert_eq!(esi.energy_saving_mode, EnergySavingMode::StayAlive);
+        assert!(esi.frame_number.is_none() && esi.multiframe_number.is_none());
+        // Eg4..Eg7 capped to Eg3 to bound call-setup latency.
+        for mode in [EnergySavingMode::Eg4, EnergySavingMode::Eg5, EnergySavingMode::Eg6, EnergySavingMode::Eg7] {
+            assert_eq!(MmBs::grant_energy_saving(42, mode).energy_saving_mode, EnergySavingMode::Eg3);
+        }
+        // Eg1..Eg3 granted as requested.
+        for mode in [EnergySavingMode::Eg1, EnergySavingMode::Eg2, EnergySavingMode::Eg3] {
+            assert_eq!(MmBs::grant_energy_saving(42, mode).energy_saving_mode, mode);
         }
     }
 }

@@ -258,7 +258,10 @@ impl CcBsSubentity {
         for (call_id, origin) in to_drop {
             tracing::info!("CMCE: dropping call_id={} gssi={} (no listeners)", call_id, gssi);
             if let CallOrigin::Network { brew_uuid } = origin {
-                if net_brew::is_brew_gssi_routable(&self.config, gssi) {
+                // Network-origin teardown: mirror the inbound admission predicate (FH-FEAT-032 R3)
+                // so an admitted foreign/non-whitelisted GSSI can still tell Brew the call ended —
+                // otherwise Brew keeps sending NetworkCallStart and trips the ExpiryOfTimer loop.
+                if net_brew::is_brew_inbound_allowed(&self.config, gssi) {
                     queue.push_back(SapMsg {
                         sap: Sap::Control,
                         src: TetraEntity::Cmce,
@@ -867,9 +870,10 @@ impl CcBsSubentity {
 
             self.release_timeslot(ts);
 
-            if net_brew::is_brew_gssi_routable(&self.config, dest_ssi) {
-                if is_local {
-                    // Local call: notify Brew with generic CallEnded.
+            if is_local {
+                // Local call: notify Brew with generic CallEnded, gated by the outbound predicate
+                // (we only forwarded this call out to Brew if it was routable).
+                if net_brew::is_brew_gssi_routable(&self.config, dest_ssi) {
                     let notify = SapMsg {
                         sap: Sap::Control,
                         src: TetraEntity::Cmce,
@@ -877,10 +881,14 @@ impl CcBsSubentity {
                         msg: SapMsgInner::CmceCallControl(CallControl::CallEnded { call_id, ts }),
                     };
                     queue.push_back(notify);
-                } else if let Some(brew_uuid) = network_brew_uuid {
-                    // Network call: notify Brew with NetworkCallEnd so it stops sending
-                    // NetworkCallStart for new speakers (which would cause an ExpiryOfTimer loop).
-                    // Use origin uuid — call.brew_uuid may be None if cleared on hangtime entry.
+                }
+            } else if let Some(brew_uuid) = network_brew_uuid {
+                // Network call: notify Brew with NetworkCallEnd so it stops sending
+                // NetworkCallStart for new speakers (which would cause an ExpiryOfTimer loop).
+                // Use origin uuid — call.brew_uuid may be None if cleared on hangtime entry.
+                // Gated by the inbound predicate (FH-FEAT-032 R3) so an admitted foreign/
+                // non-whitelisted GSSI can always signal end — matching its admission.
+                if net_brew::is_brew_inbound_allowed(&self.config, dest_ssi) {
                     tracing::info!(
                         "release_group_call: notifying Brew of expired network call_id={} brew_uuid={} cause={:?}",
                         call_id, brew_uuid, disconnect_cause

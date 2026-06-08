@@ -252,6 +252,92 @@ fn test_sds_group_delivery() {
 }
 
 #[test]
+fn test_sds_from_brew_to_group() {
+    // FH-FEAT-032 R2: a group-addressed (GSSI) SDS arriving from Brew must be delivered to the MS
+    // camped on that group. Previously dropped, because rx_sds_from_brew only checked is_registered()
+    // (individual ISSIs) and a GSSI never matches.
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    let components = vec![TetraEntity::Cmce];
+    let sinks = vec![TetraEntity::Mle, TetraEntity::Brew];
+    test.populate_entities(components, sinks);
+
+    let gssi = 100;
+    for issi in [1000001, 1000002, 1000003] {
+        register_subscriber(&mut test, issi);
+        affiliate_subscriber(&mut test, issi, gssi);
+    }
+
+    // CmceSdsData from Brew addressed to the GSSI.
+    let msg = SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Brew,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::CmceSdsData(CmceSdsData {
+            source_issi: 3000001,
+            dest_issi: gssi,
+            user_defined_data: SdsUserData::Type1(0xBEEF),
+        }),
+    };
+    test.submit_message(msg);
+    test.run_stack(Some(1));
+
+    let sink_msgs = test.dump_sinks();
+    assert_eq!(
+        count_d_sds_data(&sink_msgs),
+        1,
+        "Expected exactly 1 GSSI-addressed D-SDS-DATA from Brew (not dropped, not per-member)"
+    );
+    for m in &sink_msgs {
+        if m.dest == TetraEntity::Mle
+            && let SapMsgInner::LcmcMleUnitdataReq(ref prim) = m.msg {
+                assert_eq!(prim.main_address.ssi, gssi);
+                assert_eq!(prim.main_address.ssi_type, SsiType::Gssi);
+            }
+    }
+}
+
+#[test]
+fn test_brew_inbound_allowed_bypasses_whitelist_but_honors_local_ranges() {
+    // FH-FEAT-032 R3: inbound admission must ignore the outbound-only `whitelisted_ssis`, but still
+    // honour `local_ssi_ranges` (documented as local-only / "incoming brew traffic ... rejected").
+    use tetra_core::ranges::SortedDisjointSsiRanges;
+    use tetra_entities::net_brew::{is_brew_gssi_routable, is_brew_inbound_allowed};
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(0, 90)]);
+    config.brew = Some(CfgBrew {
+        host: "test.local".into(),
+        port: 3000,
+        tls: false,
+        username: None,
+        password: None,
+        reconnect_delay: Duration::from_secs(1),
+        jitter_initial_latency_frames: 0,
+        feature_sds_enabled: true,
+        feature_rssi_export: false,
+        whitelisted_ssis: Some(vec![91]), // only GSSI 91 is whitelisted for OUTBOUND forwarding
+    });
+    let test = ComponentTest::from_config(config, None);
+
+    // Foreign GSSI 500: not local, not whitelisted.
+    // Outbound stays blocked by the whitelist; inbound is now ADMITTED (the R3 fix).
+    assert!(!is_brew_gssi_routable(&test.config, 500), "outbound: non-whitelisted GSSI not routable");
+    assert!(is_brew_inbound_allowed(&test.config, 500), "inbound: foreign GSSI must be admitted");
+
+    // GSSI 50 inside local_ssi_ranges: rejected on BOTH directions.
+    assert!(!is_brew_gssi_routable(&test.config, 50));
+    assert!(!is_brew_inbound_allowed(&test.config, 50), "inbound: local-only range must stay rejected");
+
+    // Whitelisted GSSI 91: allowed both ways.
+    assert!(is_brew_gssi_routable(&test.config, 91));
+    assert!(is_brew_inbound_allowed(&test.config, 91));
+}
+
+#[test]
 fn test_u_status_forwarded_as_d_status() {
     debug::setup_logging_verbose();
 
@@ -626,10 +712,12 @@ fn test_sds_to_in_call_ee_ms_waits_for_window_after_call() {
     }
     register_subscriber(&mut test, talker);
 
-    // Talker is an EE MS: monitoring window at frame 14, cycle 2 (Eg1-like). Frame 14 is clear of
-    // the frames the call setup/release pass through, so the window is shut across the release.
+    // Talker is an EE MS: frame-based window, start point (frame 5, multiframe 1), cycle 6 (Eg3 —
+    // ETSI Table 23.9, the BS's cap). The MS wakes every 6 frames; with this phase the open frames
+    // (abs ≡ 4 mod 6 → frames 5, 11, 17…) are clear of frames 1–4 that the call setup/release pass
+    // through, so the window stays shut across the release and the SDS must wait for it.
     // (MM is absent from this test, so the published map is not overwritten.)
-    test.config.state_write().ee_monitoring_windows.insert(talker, (14, 0, 2));
+    test.config.state_write().ee_monitoring_windows.insert(talker, (5, 1, 6));
 
     // Talker keys up the group call (call_id starts at 4).
     test.submit_message(build_u_setup_group_msg(talker, gssi));
@@ -693,10 +781,11 @@ fn test_sds_to_ee_ms_defers_until_monitoring_window() {
     let dest = 2000001;
     register_subscriber(&mut test, dest); // registered, idle (not in a call)
 
-    // Publish an EE monitoring window for dest: frame 2, multiframe offset 0, cycle_len 2. At the
-    // start (frame 1) the window is CLOSED; it opens when the downlink reaches frame 2.
+    // Publish a frame-based EE monitoring window for dest: start point (frame 2, multiframe 1),
+    // cycle 2 (Eg1 — ETSI Table 23.9). The absolute frame index (m-1)*18+(f-1) is odd at the start
+    // point, so the window is CLOSED at frame 1 (abs 0, even) and opens at frame 2 (abs 1, odd).
     // (MM is not in this test, so the published map is not overwritten.)
-    test.config.state_write().ee_monitoring_windows.insert(dest, (2, 0, 2));
+    test.config.state_write().ee_monitoring_windows.insert(dest, (2, 1, 2));
 
     // SDS arrives while dest is asleep (frame 1, window closed) -> must be deferred, not emitted.
     test.submit_message(build_u_sds_data_msg(3000001, dest, 0xABCD));

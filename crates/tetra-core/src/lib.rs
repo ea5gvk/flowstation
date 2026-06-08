@@ -2,12 +2,13 @@
 //!
 //! This crate provides fundamental types and utilities used across the TETRA stack
 
-/// Short git commit hash, set at compile time (e.g. "g2aad62c")
+/// Short git commit hash, set at compile time (e.g. "2aad62c8"). No `g` prefix: the empty `--match=`
+/// makes `git describe --always` emit the bare abbreviated commit hash, not a tag-relative name.
 pub const GIT_HASH: &str = git_version::git_version!(
     args = ["--always", "--dirty=-modified", "--match=", "--abbrev=8"],
     fallback = "unknown"
 );
-/// Full stack version string, e.g. "v0.0.6-g2aad62c"
+/// Full stack version string, e.g. "v0.0.6-2aad62c8"
 pub const STACK_VERSION: &str = const_format::formatcp!("v{}-{}", env!("CARGO_PKG_VERSION"), GIT_HASH);
 
 pub mod address;

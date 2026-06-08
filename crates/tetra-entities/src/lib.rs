@@ -18,6 +18,7 @@ pub mod net_control;
 pub mod net_dashboard;
 pub mod net_telemetry;
 
+pub mod backlight;
 pub mod service_control;
 pub mod sys_telemetry;
 pub mod wifi;
