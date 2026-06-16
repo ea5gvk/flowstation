@@ -15,6 +15,7 @@ use tetra_entities::MessageRouter;
 use tetra_entities::net_brew::entity::BrewEntity;
 use tetra_entities::net_brew::new_websocket_transport;
 use tetra_entities::net_dashboard::DashboardServer;
+use tetra_entities::net_telegram::{TelegramAlerter, telegram_alert_channel};
 use tetra_entities::net_telemetry::worker::TelemetryWorker;
 use tetra_entities::net_telemetry::{
     TELEMETRY_HEARTBEAT_INTERVAL, TELEMETRY_HEARTBEAT_TIMEOUT, TELEMETRY_PROTOCOL_VERSION, TelemetrySource, telemetry_channel,
@@ -138,11 +139,13 @@ fn start_control_worker(cfg: SharedConfig, command_dispatchers: HashMap<TetraEnt
 }
 
 /// Start base station stack
-fn build_bs_stack(cfg: &mut SharedConfig) -> (MessageRouter, Option<TelemetrySource>, HashMap<TetraEntity, CommandDispatcher>) {
+fn build_bs_stack(cfg: &mut SharedConfig, config_path: &str) -> (MessageRouter, Option<TelemetrySource>, HashMap<TetraEntity, CommandDispatcher>) {
     let mut router = MessageRouter::new(cfg.clone());
 
     // Build telemetry sink/source — always create if either telemetry or dashboard is enabled
-    let needs_telemetry = cfg.config().telemetry.is_some() || cfg.config().dashboard.is_some();
+    let needs_telemetry = cfg.config().telemetry.is_some()
+        || cfg.config().dashboard.is_some()
+        || cfg.config().telegram.is_some();
     let (tsink, tsource) = if needs_telemetry {
         let (a, b) = telemetry_channel();
         (Some(a), Some(b))
@@ -178,7 +181,7 @@ fn build_bs_stack(cfg: &mut SharedConfig) -> (MessageRouter, Option<TelemetrySou
     let umac = UmacBs::new(cfg.clone());
     let llc = Llc::new(cfg.clone());
     let mle = MleBs::new(cfg.clone());
-    let mm = MmBs::new(cfg.clone(), tsink.clone(), c_e.remove(&TetraEntity::Mm));
+    let mut mm = MmBs::new(cfg.clone(), tsink.clone(), c_e.remove(&TetraEntity::Mm));
     let sndcp = Sndcp::new(cfg.clone());
     let mut cmce = CmceBs::new(cfg.clone(), tsink.clone(), c_e.remove(&TetraEntity::Cmce));
     // Wire the built-in WX/METAR service's reply channel: its background fetch threads
@@ -186,6 +189,26 @@ fn build_bs_stack(cfg: &mut SharedConfig) -> (MessageRouter, Option<TelemetrySou
     if let Some(d) = c_d.get(&TetraEntity::Cmce) {
         cmce.set_wx_cmd_sender(d.clone_sender());
     }
+    // Restart recovery: when enabled, seed MM from the on-disk cache and start the cold-start
+    // re-registration sweep. The cache path is the configured override, else
+    // `<config-dir>/recovery_cache.json` (the radioid_cache.json convention).
+    if cfg.config().recovery.enabled {
+        let cache_path = cfg
+            .config()
+            .recovery
+            .cache_path
+            .clone()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(config_path)
+                    .parent()
+                    .map(|d| d.join("recovery_cache.json"))
+                    .unwrap_or_else(|| std::path::PathBuf::from("recovery_cache.json"))
+            });
+        eprintln!(" -> Restart recovery enabled (cache: {})", cache_path.display());
+        mm.init_recovery(cache_path);
+    }
+
     router.register_entity(Box::new(lmac));
     router.register_entity(Box::new(umac));
     router.register_entity(Box::new(llc));
@@ -252,8 +275,9 @@ fn main() {
     // Build immutable, cheaply clonable SharedConfig and build the base station stack
     let mut cfg = SharedConfig::from_parts(stack_cfg, None);
 
-    // If dashboard is enabled, set up log capture channel BEFORE logging initialises
-    let dashboard_log_rx = if cfg.config().dashboard.is_some() {
+    // If the dashboard OR Telegram alerts are enabled, set up the log capture channel BEFORE
+    // logging initialises (Telegram forwards WARN/ERROR lines as its critical-status catch-all).
+    let dashboard_log_rx = if cfg.config().dashboard.is_some() || cfg.config().telegram.is_some() {
         let (tx, rx) = crossbeam_channel::unbounded::<(String, String)>();
         debug::set_dashboard_log_sender(tx);
         Some(rx)
@@ -279,15 +303,31 @@ fn main() {
         );
     }
 
-    let (mut router, tsource, cdispatchers) = build_bs_stack(&mut cfg);
+    let (mut router, tsource, cdispatchers) = build_bs_stack(&mut cfg, &args.config);
 
     // Start Telemetry and Control threads, if enabled
     // If dashboard is also enabled, tee the telemetry events to both.
     if let Some(telemetry_source) = tsource {
         let has_telemetry_server = cfg.config().telemetry.is_some();
         let has_dashboard = cfg.config().dashboard.is_some();
+        let has_telegram = cfg.config().telegram.is_some();
 
-        if has_dashboard {
+        // Telegram alerter — independent of the dashboard. Spawned whenever [telegram_alerts]
+        // exists; it idles when alerts are disabled and reads settings live via
+        // effective_telegram(), so toggling from the dashboard takes effect without a restart.
+        let alert_sink = if has_telegram {
+            let (sink, alert_source) = telegram_alert_channel();
+            let alert_cfg = cfg.clone();
+            thread::Builder::new().name("telegram-alerter".into()).spawn(move || {
+                TelegramAlerter::new(alert_cfg, alert_source).run();
+            }).expect("failed to spawn telegram-alerter thread");
+            Some(sink)
+        } else {
+            None
+        };
+
+        // Optional dashboard HTTP server.
+        let dashboard: Option<std::sync::Arc<DashboardServer>> = if has_dashboard {
             let dash_cfg = cfg.config().dashboard.clone().unwrap();
             let mut dashboard = DashboardServer::new(args.config.clone());
 
@@ -334,50 +374,62 @@ fn main() {
                 dashboard.set_fallback_config(reason);
             }
 
-            let dashboard = std::sync::Arc::new(dashboard);
-            let dash_clone = std::sync::Arc::clone(&dashboard);
+            Some(std::sync::Arc::new(dashboard))
+        } else {
+            None
+        };
 
-            // Forward log entries to dashboard
-            if let Some(log_rx) = dashboard_log_rx {
-                let dash_log = std::sync::Arc::clone(&dashboard);
-                thread::Builder::new().name("dashboard-log".into()).spawn(move || {
-                    while let Ok((level, msg)) = log_rx.recv() {
-                        // Filter out debug/trace noise from dashboard log tab
-                        if level == "DEBUG" || level == "TRACE" { continue; }
-                        // Filter out TDMA tick noise — thousands per second
-                        if msg.contains("tick dl") || msg.contains("tick ul") || msg.starts_with("--- tick") { continue; }
-                        dash_log.push_log(&level, msg);
-                    }
-                }).expect("failed to spawn dashboard-log thread");
-            }
-
-            if has_telemetry_server {
-                let cfg2 = cfg.clone();
-                let (tee_sink, tee_source) = telemetry_channel();
-                thread::Builder::new().name("telemetry-tee".into()).spawn(move || {
-                    loop {
-                        match telemetry_source.recv() {
-                            Some(event) => {
-                                dash_clone.handle_telemetry(event.clone());
-                                tee_sink.send(event);
-                            }
-                            None => break,
+        // Capture log lines: push to the dashboard log tab (if present) and forward WARN/ERROR to
+        // the Telegram alerter (if present) as its critical-status catch-all. The alerter logs its
+        // own send failures at debug! level, so this forward never loops. This thread also drains
+        // the log channel even when the dashboard is absent (Telegram-only), so it cannot grow.
+        if let Some(log_rx) = dashboard_log_rx {
+            let dash_log = dashboard.clone();
+            let log_alert = alert_sink.clone();
+            thread::Builder::new().name("log-fanout".into()).spawn(move || {
+                while let Ok((level, msg)) = log_rx.recv() {
+                    // Filter out debug/trace noise.
+                    if level == "DEBUG" || level == "TRACE" { continue; }
+                    // Filter out TDMA tick noise — thousands per second.
+                    if msg.contains("tick dl") || msg.contains("tick ul") || msg.starts_with("--- tick") { continue; }
+                    if level == "WARN" || level == "ERROR" {
+                        if let Some(s) = &log_alert {
+                            s.send_log(level.clone(), msg.clone());
                         }
                     }
-                }).expect("failed to spawn telemetry-tee thread");
-                start_telemetry_worker(cfg2, tee_source);
-            } else {
-                thread::Builder::new().name("telemetry-dash".into()).spawn(move || {
-                    loop {
-                        match telemetry_source.recv() {
-                            Some(event) => dash_clone.handle_telemetry(event),
-                            None => break,
-                        }
+                    if let Some(d) = &dash_log {
+                        d.push_log(&level, msg);
                     }
-                }).expect("failed to spawn telemetry-dash thread");
-            }
-        } else if has_telemetry_server {
-            start_telemetry_worker(cfg.clone(), telemetry_source);
+                }
+            }).expect("failed to spawn log-fanout thread");
+        }
+
+        // Single telemetry consumer: fan each event out to the dashboard, the Telegram alerter, and
+        // the network telemetry worker — each independently optional.
+        let (tee_sink, tee_source) = if has_telemetry_server {
+            let (a, b) = telemetry_channel();
+            (Some(a), Some(b))
+        } else {
+            (None, None)
+        };
+        {
+            let dash = dashboard.clone();
+            let alert = alert_sink.clone();
+            thread::Builder::new().name("telemetry-fanout".into()).spawn(move || {
+                loop {
+                    match telemetry_source.recv() {
+                        Some(event) => {
+                            if let Some(d) = &dash { d.handle_telemetry(event.clone()); }
+                            if let Some(s) = &alert { s.send_event(event.clone()); }
+                            if let Some(t) = &tee_sink { t.send(event); }
+                        }
+                        None => break,
+                    }
+                }
+            }).expect("failed to spawn telemetry-fanout thread");
+        }
+        if let Some(tee_source) = tee_source {
+            start_telemetry_worker(cfg.clone(), tee_source);
         }
     };
 

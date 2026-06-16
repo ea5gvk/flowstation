@@ -155,6 +155,14 @@ voice_service = true
 # Default: 5 seconds. Valid range: 0–300.
 # hangtime_secs = 5
 
+# Legacy-radio workaround: tear a group call down on a SAME-SPEAKER floor retake during hangtime
+# instead of reusing the open circuit, so the next PTT runs a full U-SETUP/D-CONNECT/D-SETUP
+# cycle. Old Motorola sets (MR5/MR19 era) ACK a fast retake grant but never key up the TCH/S,
+# producing a "silent over" the rest of the group hears as dead air; forcing a fresh setup fixes
+# it. Default OFF — modern radios reuse the circuit fine and benefit from the lower retake
+# latency, so enable this only on cells that still run those legacy sets.
+# release_group_on_same_speaker_retake = false
+
 # Maximum active call duration in seconds — ETSI EN 300 392-2 §14.9.1 T310 equivalent (FlowStation).
 # After this time the BS sends D-RELEASE regardless of call activity.
 # 0 = no limit (infinite — call runs until U-DISCONNECT or hangtime).
@@ -168,9 +176,14 @@ voice_service = true
 # ul_inactivity_secs = 3
 
 # Periodic registration interval in seconds — ETSI T351 equivalent (FlowStation).
-# MS must re-register within this interval or be automatically deregistered by the BS.
-# The BS signals this via D-LOCATION-UPDATE-ACCEPT (PeriodicLocationUpdating).
-# On expiry: D-LOCATION-UPDATE-REJECT (ExpiryOfTimer) is sent; terminal re-attaches immediately.
+# MS must re-register within this interval, signalled via D-LOCATION-UPDATE-ACCEPT
+# (PeriodicLocationUpdating).
+# On expiry the BS RE-ATTRACTS the terminal with D-LOCATION-UPDATE-COMMAND (addressed by ISSI),
+# and keeps its registration + group affiliations — it does NOT send REJECT(ExpiryOfTimer) and
+# does NOT remove the client. This is deliberate: removing wipes a Motorola's stored groups so a
+# later group-report-less re-registration leaves nothing to re-affiliate (PTT denied), and
+# REJECT(ExpiryOfTimer) drops Motorola radios to "no service". A gone radio is simply re-attracted
+# once per interval and re-affiliated automatically when it returns.
 # 0 = disabled — registrations never expire.
 # Default: 3600 (1 hour). Valid range when non-zero: 60–86400.
 # periodic_registration_secs = 3600
@@ -356,6 +369,29 @@ voice_service = true
 
 ###############################################################################
 
+# OPTIONAL: Restart recovery (FlowStation)
+#
+# After the BS process restarts (update / crash / service restart) the in-RAM registry is
+# empty, yet radios are still RF-camped on the cell — so the first group PTT fails until each
+# radio re-registers on its own (often only on power-cycle). When enabled, FlowStation persists
+# a small JSON cache of known terminals (ISSI + persistent groups + energy mode) and, on the
+# next startup, proactively sends D-LOCATION-UPDATE-COMMAND (ETSI EN 300 392-2 §16.4.4) to each,
+# forcing re-registration + group re-report so PTT works again within seconds, no human action.
+#
+# Default OFF: proactively keying COMMANDs at a batch of ISSIs right after boot adds MCCH load,
+# so it is opt-in. Pairs with cell_info.periodic_registration_secs (the T351 re-registration).
+#
+# [recovery]
+# enabled = true                  # master on/off (default false)
+# issi_allowlist = []             # empty = recover every cached ISSI; non-empty = only these
+# cache_path = ""                 # explicit path; omit/empty = <config-dir>/recovery_cache.json
+# max_replay_attempts = 150       # per-ISSI COMMAND re-sends before giving up (1..=500)
+# replay_per_frame = 1            # COMMANDs emitted per TDMA frame during the sweep (1..=18)
+# debounce_secs = 5               # coalesce registry changes into one cache write (1..=300)
+# max_cached_issis = 1024         # hard cap on cached terminals (1..=65535)
+
+###############################################################################
+
 # OPTIONAL: Built-in WX/METAR SDS service (FlowStation)
 #
 # A weather responder that runs inside FlowStation — no external bot needed.
@@ -376,6 +412,38 @@ voice_service = true
 # periodic_is_group = false      # true = periodic_issi is a talkgroup (GSSI)
 # periodic_icao = "LROP"         # station whose METAR is auto-sent
 # periodic_interval_secs = 1800  # send period in seconds (>= 300)
+
+###############################################################################
+
+# OPTIONAL: Telegram alerts — push notifications to the BTS owner (FlowStation)
+#
+# Sends professionally-formatted messages to one or more Telegram chats when notable
+# things happen: a radio attaches/detaches, a radio is dropped for not answering the
+# periodic registration (T351), the Brew backhaul goes up/down, a radio beacons its
+# position over LIP/APRS, or the stack logs a WARN/ERROR.
+#
+# Easiest setup is the dashboard "Telegram Alerts" menu, which guides you through
+# creating a bot with @BotFather, detecting your Chat ID with one click, and saving.
+# It writes the values back to this section. You can also set it up manually here:
+#
+#   1. Message @BotFather, send /newbot, and copy the bot token.
+#   2. Send your bot any message (e.g. /start) so it can see your chat.
+#   3. Find your numeric chat ID (the dashboard's "Detect Chat ID" button does this,
+#      or use https://api.telegram.org/bot<TOKEN>/getUpdates and read message.chat.id).
+#
+# chat_ids: positive = a private chat; negative = a group/channel. Each receives every
+# enabled alert. The per-category flags below default to true.
+#
+# [telegram_alerts]
+# enabled = true
+# bot_token = "123456789:AAExampleBotTokenStringFromBotFather"
+# chat_ids = [123456789]          # one or more; negative IDs are groups/channels
+# alert_connect = true            # radio attached
+# alert_disconnect = true         # radio detached
+# alert_t351 = true               # radio dropped (no response to T351)
+# alert_lip = true                # LIP/APRS position beacon
+# alert_backhaul = true           # Brew backhaul up/down
+# alert_critical_logs = true      # forward the stack's WARN/ERROR log lines
 
 ###############################################################################
 

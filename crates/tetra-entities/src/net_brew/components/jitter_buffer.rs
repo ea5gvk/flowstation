@@ -39,6 +39,11 @@ pub struct VoiceJitterBuffer {
     stable_pops: u32,
     dropped_overflow: u64,
     underruns: u64,
+    /// Value of `underruns` at the time of the last unhealthy warning. Used so we only
+    /// re-warn when *new* underruns have occurred since — `underruns` is cumulative, so
+    /// gating on `underruns != 0` would spam the log forever after a single transient
+    /// underrun, even once the stream has stabilised.
+    last_warn_underruns: u64,
     last_warn_at: Option<Instant>,
     initial_latency_frames: usize,
 }
@@ -151,11 +156,18 @@ impl VoiceJitterBuffer {
             }
         }
 
-        if self.target_frames() < BREW_JITTER_WARN_TARGET_FRAMES && self.underruns == 0 {
+        // Warn only when the buffer is genuinely unhealthy: either the target depth is
+        // elevated, or *new* underruns have occurred since our last warning. Comparing
+        // against `last_warn_underruns` (rather than `== 0`) stops a single transient
+        // underrun at call setup from spamming the log every interval for the call's life.
+        if self.target_frames() < BREW_JITTER_WARN_TARGET_FRAMES
+            && self.underruns == self.last_warn_underruns
+        {
             return;
         }
 
         self.last_warn_at = Some(now);
+        self.last_warn_underruns = self.underruns;
         tracing::warn!(
             "BrewEntity: high jitter on uuid={} target_frames={} queue={} underruns={} overflow_drops={} jitter_ms={:.1}",
             uuid,

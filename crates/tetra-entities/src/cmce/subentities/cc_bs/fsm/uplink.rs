@@ -425,12 +425,12 @@ impl CcBsSubentity {
         let disconnect_cause = pdu.disconnect_cause;
 
         tracing::info!("U-RELEASE: call_id={} cause={}", call_id, disconnect_cause);
-        if let Some(call_snapshot) = self.individual_calls.get(&call_id).cloned() {
-            tracing::info!("U-RELEASE (individual) call_id={} cause={}", call_id, disconnect_cause);
-            let sender_is_called = sender.ssi == call_snapshot.called_addr.ssi;
-            if !call_snapshot.called_over_brew && !call_snapshot.calling_over_brew && (call_snapshot.is_active() || sender_is_called) {
-                self.send_d_disconnect_individual(queue, call_id, &call_snapshot, sender, disconnect_cause);
-            }
+        if self.individual_calls.contains_key(&call_id) {
+            tracing::info!("U-RELEASE (individual) call_id={} cause={} from ISSI {}", call_id, disconnect_cause, sender.ssi);
+            // Clear BOTH parties with D-RELEASE (release_individual_call delivers it to each
+            // leg). Deliberately NO D-DISCONNECT to the peer: the Motorola MXP600 reboots when
+            // it receives a D-DISCONNECT, and D-RELEASE already forces the clear without
+            // expecting a U-RELEASE response. (Motorola quirk: peer-clear with D-RELEASE.)
             self.release_individual_call(queue, call_id, disconnect_cause);
         } else {
             self.release_group_call(queue, call_id, disconnect_cause);
@@ -450,12 +450,11 @@ impl CcBsSubentity {
         let call_id = pdu.call_identifier;
         let disconnect_cause = pdu.disconnect_cause;
 
-        if let Some(call_snapshot) = self.individual_calls.get(&call_id).cloned() {
-            tracing::info!("U-DISCONNECT (individual) call_id={} cause={}", call_id, disconnect_cause);
-            let sender_is_called = sender.ssi == call_snapshot.called_addr.ssi;
-            if !call_snapshot.called_over_brew && !call_snapshot.calling_over_brew && (call_snapshot.is_active() || sender_is_called) {
-                self.send_d_disconnect_individual(queue, call_id, &call_snapshot, sender, disconnect_cause);
-            }
+        if self.individual_calls.contains_key(&call_id) {
+            tracing::info!("U-DISCONNECT (individual) call_id={} cause={} from ISSI {}", call_id, disconnect_cause, sender.ssi);
+            // Peer is cleared by D-RELEASE inside release_individual_call (both legs). No
+            // D-DISCONNECT — the MXP600 reboots on receiving one (Motorola quirk: peer-clear
+            // with D-RELEASE, which forces the clear with no U-RELEASE response expected).
             self.release_individual_call(queue, call_id, disconnect_cause);
             return;
         }

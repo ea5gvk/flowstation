@@ -123,6 +123,22 @@ impl SdsBsSubentity {
         }
     }
 
+    /// Record one SDS in the dashboard's SDS Log (best-effort, fire-and-forget). `direction`
+    /// is "rx" (uplink from a local MS), "net" (from the network for local delivery), or "tx"
+    /// (injected by the dashboard operator). The body is decoded best-effort; non-text
+    /// payloads (status/reports/binary) log with empty text and the raw protocol-id byte.
+    fn log_sds(&self, direction: &str, source_issi: u32, dest_issi: u32, is_group: bool, data: &SdsUserData) {
+        let protocol_id = data.to_arr().first().copied().unwrap_or(0);
+        self.emit(TelemetryEvent::SdsLog {
+            direction: direction.to_string(),
+            source_issi,
+            dest_issi,
+            is_group,
+            protocol_id,
+            text: Self::extract_sds_text(data),
+        });
+    }
+
     /// True if `dest_ssi` (an individual ISSI) is currently on one of our traffic timeslots —
     /// either directly (active talker / individual-call party) or as an affiliated member of an
     /// active group call. Such an MS follows the FACCH on its traffic slot, not the MCCH.
@@ -168,7 +184,7 @@ impl SdsBsSubentity {
             if reachable {
                 // Out of any call and awake on its window (if in EE) — deliver on the MCCH.
                 tracing::info!("SDS: destination {} reachable — delivering deferred SDS on the MCCH", p.dest_ssi);
-                self.deliver_d_sds_data_now(queue, p.source_issi, p.dest_ssi, SsiType::Issi, p.user_defined_data);
+                self.deliver_d_sds_data_now(queue, p.source_issi, p.dest_ssi, SsiType::Issi, p.user_defined_data, false);
             } else if p.queued_at.elapsed() > SDS_DEFER_DEADLINE {
                 // Could not reach the destination within the deadline — fail cleanly and tell the
                 // sender, instead of delivering late after its radio has already given up.
@@ -200,7 +216,7 @@ impl SdsBsSubentity {
             "SDS: reporting delivery failure to {} (MR={}) for undeliverable SDS to {}",
             p.source_issi, mr, p.dest_ssi
         );
-        self.deliver_d_sds_data_now(queue, p.dest_ssi, p.source_issi, SsiType::Issi, report);
+        self.deliver_d_sds_data_now(queue, p.dest_ssi, p.source_issi, SsiType::Issi, report, false);
     }
 
     /// Called every tick from CmceBs::tick_start. Fires Home Mode Display broadcast when due.
@@ -258,6 +274,12 @@ impl SdsBsSubentity {
             dest_ssi,
             pdu.user_defined_data.type_identifier()
         );
+
+        // Record every inbound SDS-DATA in the dashboard SDS Log, regardless of how it is
+        // routed afterwards (local ISSI, local group, Brew forward, WX request). is_group is
+        // the BS's view of the destination; the read borrow is O(1) and dropped immediately.
+        let rx_is_group = self.config.state_read().subscribers.has_group_members(dest_ssi);
+        self.log_sds("rx", source_ssi, dest_ssi, rx_is_group, &pdu.user_defined_data);
 
         // Built-in WX/METAR service: if this SDS is addressed to the configured service
         // ISSI and the responder is enabled, treat the text as a weather command, fetch
@@ -351,6 +373,9 @@ impl SdsBsSubentity {
         let is_local_group =
             !is_local_issi && self.config.state_read().subscribers.has_group_members(sds.dest_issi);
 
+        // Log the network-originated SDS in the dashboard SDS Log before it is delivered.
+        self.log_sds("net", sds.source_issi, sds.dest_issi, is_local_group, &sds.user_defined_data);
+
         if is_local_issi {
             // Send D-SDS-DATA downlink to the local MS on the MCCH.
             tracing::info!("SDS: local delivery from Brew: {} -> {}", sds.source_issi, sds.dest_issi);
@@ -419,13 +444,17 @@ impl SdsBsSubentity {
             v
         };
         let wrapped_len_bits = (wrapped_payload.len() * 8) as u16;
+        let sds_data = SdsUserData::Type4(wrapped_len_bits, wrapped_payload);
+
+        // Log the dashboard-originated SDS before sending it downlink.
+        self.log_sds("tx", source_ssi, dest_ssi, dest_is_group, &sds_data);
 
         self.send_d_sds_data(
             queue,
             source_ssi,
             dest_ssi,
             if dest_is_group { SsiType::Gssi } else { SsiType::Issi },
-            SdsUserData::Type4(wrapped_len_bits, wrapped_payload),
+            sds_data,
         );
 
         true
@@ -832,7 +861,7 @@ impl SdsBsSubentity {
             return;
         }
 
-        self.deliver_d_sds_data_now(queue, source_issi, dest_ssi, dest_ssi_type, user_defined_data);
+        self.deliver_d_sds_data_now(queue, source_issi, dest_ssi, dest_ssi_type, user_defined_data, false);
     }
 
     /// Build and send a D-SDS-DATA immediately (no reachability gating). Used for the direct path
@@ -844,6 +873,7 @@ impl SdsBsSubentity {
         dest_ssi: u32,
         dest_ssi_type: SsiType,
         user_defined_data: SdsUserData,
+        force_mcch: bool,
     ) {
         let pdu = DSdsData {
             calling_party_type_identifier: PartyTypeIdentifier::Ssi,
@@ -871,7 +901,17 @@ impl SdsBsSubentity {
         // a half-slot on that timeslot; otherwise send on the MCCH as before. Without this, SDS
         // sent while a call is up are never received. The map is rebuilt from live call state
         // every tick, so it cannot point at a stale/closed circuit.
-        let traffic = {
+        let traffic = if force_mcch {
+            // Caller knows the destination is camped on the MCCH right now (e.g. it just sent
+            // us an uplink U-STATUS via random access on the MCCH), so skip the traffic
+            // inference entirely. Without this, an MS that is merely *affiliated* to a group
+            // which happens to have an active call is mistaken for "following that call on the
+            // traffic channel" and the SDS is FACCH-stolen onto a timeslot the idle MS is not
+            // listening to (or deferred). That is FH-BUG-038: a U-STATUS remote-control reply
+            // never reaches the requesting (idle, scanning-off) radio while any voice traffic
+            // is up, even though its own talkgroup is idle.
+            None
+        } else {
             let state = self.config.state_read();
             state.active_call_ts.get(&dest_ssi).copied().or_else(|| {
                 // Individual SDS to an MS that is a member of an active group call: reach it on
@@ -1009,7 +1049,14 @@ impl SdsBsSubentity {
         // Keep printable ASCII only (the encoding byte declares ISO-8859-1/ASCII).
         payload.extend(text.bytes().filter(|&b| b == b'\t' || (0x20..=0x7E).contains(&b)));
         let len_bits = (payload.len() * 8) as u16;
-        self.send_d_sds_data(queue, source_issi, dest_issi, SsiType::Issi, SdsUserData::Type4(len_bits, payload));
+        // Deliver the reply on the MCCH unconditionally: this is a response to a U-STATUS the
+        // destination radio just sent us via random access on the MCCH, so it is provably
+        // camped there right now (FH-BUG-038). Routing through send_d_sds_data instead would
+        // defer/steal the reply whenever the requester is affiliated to some group that has an
+        // active call — even though the requester's own talkgroup is idle and it is listening
+        // on the MCCH — so the radio never sees its reply and retransmits the U-STATUS until
+        // timeout.
+        self.deliver_d_sds_data_now(queue, source_issi, dest_issi, SsiType::Issi, SdsUserData::Type4(len_bits, payload), true);
     }
 
     fn handle_sds_command_status(&mut self, queue: &mut MessageQueue, source_ssi: u32, status: &PreCodedStatus) {

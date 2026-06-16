@@ -199,6 +199,14 @@ pub struct CfgCellInfo {
 
     /// Remote control via SDS U-STATUS to ISSI 9999. None = disabled.
     pub sds_command_control: Option<CfgSdsCommandControl>,
+
+    /// When true, a same-speaker floor retake during group-call hangtime tears the call down
+    /// (D-RELEASE) instead of reusing the hanging circuit, so the next PTT runs a full
+    /// U-SETUP/D-CONNECT/D-SETUP cycle. Workaround for legacy Motorola radios (MR5/MR19 era)
+    /// that ACK a fast-retake floor grant but never key up the TCH/S, producing a "silent over"
+    /// the rest of the group hears as dead air. Default: false (modern radios reuse the circuit
+    /// fine and benefit from the lower retake latency). Opt in only for fleets with legacy sets.
+    pub release_group_on_same_speaker_retake: bool,
 }
 
 #[derive(Default, Deserialize)]
@@ -265,6 +273,10 @@ pub struct CellInfoDto {
 
     /// Remote control via SDS U-STATUS. Optional section.
     pub sds_command_control: Option<SdsCommandControlDto>,
+
+    /// Tear down a group call on a same-speaker hangtime retake (legacy-Motorola silent-over
+    /// workaround). Default: false.
+    pub release_group_on_same_speaker_retake: Option<bool>,
 
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
@@ -334,6 +346,7 @@ pub fn cell_dto_to_cfg(ci: CellInfoDto) -> CfgCellInfo {
                 action: e.action,
             }).collect(),
         }),
+        release_group_on_same_speaker_retake: ci.release_group_on_same_speaker_retake.unwrap_or(false),
     }
 }
 

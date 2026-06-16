@@ -1,3 +1,7 @@
+use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
+
+use crate::mm::components::recovery_cache::{RecoveryCache, TerminalRecord};
 use crate::net_control::ControlEndpoint;
 use crate::net_telemetry::channel::TelemetrySink;
 use crate::{MessageQueue, TetraEntityTrait, net_brew};
@@ -37,6 +41,19 @@ pub struct MmBs {
     telemetry: Option<TelemetrySink>,
     control: Option<ControlEndpoint>,
     client_mgr: MmClientMgr,
+
+    // ── Restart recovery ──────────────────────────────────────────────────────
+    /// On-disk cache of known terminals. `Some` only after `init_recovery` runs (i.e. when the
+    /// `[recovery]` section is enabled); `None` means recovery is off and all the hooks below are
+    /// no-ops.
+    recovery: Option<RecoveryCache>,
+    /// ISSIs loaded from the cache still awaiting re-registration, replayed round-robin.
+    recovery_pending: VecDeque<u32>,
+    /// Per-ISSI count of D-LOCATION-UPDATE-COMMANDs sent during the startup sweep.
+    recovery_attempts: HashMap<u32, u32>,
+    /// Monotonic frame index of the last replay batch, so we emit at most `replay_per_frame`
+    /// COMMANDs per TDMA frame rather than on every tick.
+    recovery_last_frame: Option<i32>,
 }
 
 impl MmBs {
@@ -47,7 +64,133 @@ impl MmBs {
             telemetry,
             control,
             client_mgr,
+            recovery: None,
+            recovery_pending: VecDeque::new(),
+            recovery_attempts: HashMap::new(),
+            recovery_last_frame: None,
         }
+    }
+
+    /// Initialise restart recovery from the resolved cache path. Called once at startup from the
+    /// binary, only when `[recovery] enabled = true`. Loads the persisted terminals, restores them
+    /// into the client registry as "known but Detached" (so the coverage-return re-affiliation can
+    /// fire when they answer), and seeds the replay queue. Emits no SAP messages — terminals are
+    /// re-affiliated to CMCE/Brew only when they actually re-register. Honours the current ISSI
+    /// whitelist and the optional `[recovery] issi_allowlist`.
+    pub fn init_recovery(&mut self, cache_path: PathBuf) {
+        let rec_cfg = self.config.config().recovery.clone();
+        let debounce = std::time::Duration::from_secs(rec_cfg.debounce_secs);
+        let cache = RecoveryCache::new(cache_path, debounce);
+        let records = cache.load();
+
+        let mut restored = 0usize;
+        let mut skipped = 0usize;
+        for rec in records.into_iter().take(rec_cfg.max_cached_issis as usize) {
+            // Honour both the access-control whitelist and the optional recovery allowlist.
+            let whitelisted = self.config.config().security.is_issi_allowed(rec.issi);
+            let in_allowlist = rec_cfg.issi_allowlist.is_empty() || rec_cfg.issi_allowlist.contains(&rec.issi);
+            if !whitelisted || !in_allowlist {
+                skipped += 1;
+                continue;
+            }
+            let esm = EnergySavingMode::try_from(rec.energy_saving_mode as u64).unwrap_or(EnergySavingMode::StayAlive);
+            self.client_mgr.restore_client(rec.issi, &rec.groups, esm);
+            self.recovery_pending.push_back(rec.issi);
+            self.recovery_attempts.insert(rec.issi, 0);
+            restored += 1;
+        }
+
+        tracing::info!(
+            "MM: restart recovery initialised — {} terminal(s) restored from cache ({} skipped by whitelist/allowlist); replaying D-LOCATION-UPDATE-COMMAND",
+            restored, skipped
+        );
+        self.recovery = Some(cache);
+    }
+
+    /// Mark the recovery cache dirty (a flush is debounced from tick_start). No-op when recovery
+    /// is disabled.
+    fn recovery_mark_dirty(&mut self) {
+        if let Some(cache) = &mut self.recovery {
+            cache.mark_dirty();
+        }
+    }
+
+    /// Stop replaying to an ISSI that has (re-)registered. Called from the location-update path.
+    fn recovery_confirm(&mut self, issi: u32) {
+        if self.recovery.is_none() {
+            return;
+        }
+        let was_pending = self.recovery_attempts.remove(&issi).is_some();
+        self.recovery_pending.retain(|&i| i != issi);
+        if was_pending {
+            tracing::info!("MM: restart recovery — ISSI {} re-registered, stopping replay", issi);
+        }
+    }
+
+    /// Per-tick startup replay: emit up to `replay_per_frame` D-LOCATION-UPDATE-COMMANDs per TDMA
+    /// frame to terminals still awaiting re-registration, round-robin, giving up on a terminal
+    /// after `max_replay_attempts` (e.g. one powered off mid-outage). Goes inert when the queue
+    /// drains.
+    fn drive_recovery_replay(&mut self, queue: &mut MessageQueue, ts: TdmaTime) {
+        if self.recovery.is_none() || self.recovery_pending.is_empty() {
+            return;
+        }
+        // Monotonic frame index — emit at most one batch per frame.
+        let frame = ts.to_int() / 4;
+        if self.recovery_last_frame == Some(frame) {
+            return;
+        }
+        self.recovery_last_frame = Some(frame);
+
+        let rec_cfg = self.config.config().recovery.clone();
+        // Emit at most `replay_per_frame` COMMANDs per frame, but never re-key the same radio
+        // twice in one frame: bound the pops to the number of distinct pending entries, so a
+        // queue shorter than replay_per_frame doesn't double-send (which would also burn that
+        // ISSI's attempt budget faster than configured).
+        let budget = (rec_cfg.replay_per_frame as usize).min(self.recovery_pending.len());
+        let mut processed = 0usize;
+        while processed < budget {
+            let Some(issi) = self.recovery_pending.pop_front() else {
+                break;
+            };
+            processed += 1;
+            // Already confirmed (no longer tracked) — drop it from the queue.
+            let Some(&attempts) = self.recovery_attempts.get(&issi) else {
+                continue;
+            };
+            if attempts >= rec_cfg.max_replay_attempts {
+                tracing::info!(
+                    "MM: restart recovery — giving up on ISSI {} after {} unanswered COMMANDs",
+                    issi, attempts
+                );
+                self.recovery_attempts.remove(&issi);
+                continue;
+            }
+            // handle = 0: addressed by ISSI on the MCCH (see send_d_location_update_command).
+            Self::send_d_location_update_command(queue, issi, 0);
+            self.recovery_attempts.insert(issi, attempts + 1);
+            self.recovery_pending.push_back(issi); // round-robin until it answers or we give up
+        }
+    }
+
+    /// Debounced flush of the recovery cache. Takes the cache out of `self` so the snapshot
+    /// closure can borrow `self.client_mgr` without a borrow conflict, then restores it.
+    fn recovery_maybe_flush(&mut self) {
+        let Some(mut cache) = self.recovery.take() else {
+            return;
+        };
+        cache.maybe_flush(|| {
+            self.client_mgr
+                .snapshot_for_recovery()
+                .into_iter()
+                .map(|(issi, groups, esm)| TerminalRecord {
+                    issi,
+                    groups,
+                    energy_saving_mode: esm.into_raw() as u8,
+                })
+                .collect()
+        });
+        self.recovery = Some(cache);
     }
 
     /// Force CMCE to release any individual P2P calls involving the given ISSI,
@@ -169,6 +312,7 @@ impl MmBs {
             tracing::warn!("Received UItsiDetach for unknown client with SSI: {}", ssi);
             // return;
         };
+        self.recovery_mark_dirty();
     }
 
     fn rx_u_location_update_demand(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
@@ -187,6 +331,12 @@ impl MmBs {
                 return;
             }
         };
+
+        // The terminal answered with a location update — stop the restart-recovery replay to it
+        // regardless of how this update is handled below (migration reject, whitelist reject, or
+        // normal registration). Hoisted above all early-returns so a migrating/rejected terminal
+        // isn't replayed to forever. No-op when recovery is disabled / ISSI not pending.
+        self.recovery_confirm(prim.received_address.ssi);
 
         // Migration not supported: ETSI 16.4.1.1 case b) requires identity exchange via
         // D-LOCATION-UPDATE-PROCEEDING which we don't implement. Reject with cause
@@ -210,6 +360,7 @@ impl MmBs {
                 }
                 self.emit_subscriber_update(queue, issi, Vec::new(), BrewSubscriberAction::Deregister);
             }
+            self.recovery_mark_dirty();
             Self::send_d_location_update_reject(
                 queue,
                 issi,
@@ -274,6 +425,11 @@ impl MmBs {
             );
             return;
         }
+
+        // Restart recovery: this terminal answered (re-registered), so stop replaying
+        // D-LOCATION-UPDATE-COMMANDs to it. The coverage-return re-affiliation block below then
+        // restores its CMCE/Brew group state. No-op when recovery is disabled / ISSI not pending.
+        self.recovery_confirm(issi);
 
         let was_pending = self.client_mgr.is_pending_command(issi);
         let is_new = !self.client_mgr.client_is_known(issi);
@@ -489,6 +645,9 @@ impl MmBs {
         // Reset periodic registration timer on every successful registration.
         self.client_mgr.reset_registration_timer(issi);
 
+        // Registration / affiliation / EE state changed — persist for restart recovery (debounced).
+        self.recovery_mark_dirty();
+
         // Use PeriodicLocationUpdating accept type when periodic registration is enabled.
         // This signals to the MS that it must re-register within the configured interval.
         let periodic_secs = self.config.config().cell.periodic_registration_secs;
@@ -688,6 +847,7 @@ impl MmBs {
                 if let Err(e) = self.client_mgr.set_client_monitoring_window(issi, esi.frame_number, esi.multiframe_number) {
                     tracing::debug!("MM: mid-session monitoring window update on ISSI {} skipped: {:?}", issi, e);
                 }
+                self.recovery_mark_dirty();
 
                 Self::send_d_mm_status_energy_saving(queue, issi, handle, esi);
                 handled = true;
@@ -708,6 +868,7 @@ impl MmBs {
 
                 tracing::info!("MS {} energy saving mode change response: {:?}", issi, esm);
                 let _ = self.client_mgr.set_client_energy_saving_mode(issi, esm);
+                self.recovery_mark_dirty();
                 handled = true;
             }
             StatusUplink::DualWatchModeRequest
@@ -864,6 +1025,9 @@ impl MmBs {
 
         // Try to attach to requested groups, and retrieve list of accepted GroupIdentityDownlink elements
         let accepted_gid = self.try_attach_detach_groups(queue, issi, &giu_clamped);
+
+        // Group affiliations changed — persist for restart recovery (debounced).
+        self.recovery_mark_dirty();
 
         // Build reply PDU
         let pdu_response = DAttachDetachGroupIdentityAcknowledgement {
@@ -1371,7 +1535,7 @@ impl TetraEntityTrait for MmBs {
         self.config = config;
     }
 
-    fn tick_start(&mut self, queue: &mut MessageQueue, _ts: TdmaTime) {
+    fn tick_start(&mut self, queue: &mut MessageQueue, ts: TdmaTime) {
         if let Some(cep) = &self.control {
             while let Some(cmd) = cep.try_recv() {
                 match cmd {
@@ -1387,6 +1551,17 @@ impl TetraEntityTrait for MmBs {
         let interval_secs = self.config.config().cell.periodic_registration_secs;
         let expired = self.client_mgr.collect_expired_registrations(interval_secs);
         for issi in expired {
+            // Restart-recovery interlock: never expire/remove a client the recovery sweep is
+            // still replaying to. The sweep owns its lifecycle until it confirms (re-register →
+            // recovery_confirm) or gives up (attempt cap). Without this, a restored client at
+            // the tail of the replay queue could reach T351 second-expiry and be removed —
+            // wiping its stored groups, the exact failure recovery exists to prevent — when
+            // periodic_registration_secs is clamped low. recovery_attempts is empty unless
+            // recovery is active, so this is a cheap no-op otherwise. It also prevents a
+            // double-COMMAND (T351 + recovery) to the same ISSI in one window.
+            if self.recovery_attempts.contains_key(&issi) {
+                continue;
+            }
             tracing::info!(
                 "MM: ISSI {} periodic registration expired ({}s) — sending D-LOCATION-UPDATE-COMMAND",
                 issi, interval_secs
@@ -1408,39 +1583,40 @@ impl TetraEntityTrait for MmBs {
             //    COMMAND after RoamingLocationUpdating.
             let already_sent = self.client_mgr.is_pending_command(issi);
             if already_sent {
-                // Second expiry — terminal didn't respond to COMMAND within grace period.
-                // Send D-LOCATION-UPDATE-REJECT(ExpiryOfTimer) so the terminal knows it must
-                // re-attach. Without this, terminals like Sepura stay "connected" locally
-                // while the BS has already removed them, causing a silent desync.
-                let last_handle = self.client_mgr
-                    .get_client_by_issi(issi)
-                    .map(|c| c.last_handle)
-                    .unwrap_or(0);
+                // Second expiry — the terminal didn't answer the first COMMAND within the grace
+                // period. We deliberately do NOT remove the client and do NOT send
+                // D-LOCATION-UPDATE-REJECT(ExpiryOfTimer):
+                //   - removing wipes the terminal's stored groups, so a Motorola that later
+                //     re-registers WITHOUT a group report (it still believes it is affiliated —
+                //     persistent attachment_lifetime=0) leaves the coverage-return re-affiliation
+                //     nothing to restore, and the next group PTT is denied (FH-BUG-031);
+                //   - REJECT(ExpiryOfTimer) drops Motorola radios to "no service".
+                // Instead, re-attract once more (handle 0 — the L2 handle is inert) and reset the
+                // registration clock. The client and its groups stay in the registry; a genuinely
+                // gone radio just lingers harmlessly (re-attracted at most once per interval), and
+                // when it returns the coverage-return re-affiliation restores its group state so
+                // PTT works immediately. (Trade-off: the registry isn't pruned by T351 anymore —
+                // acceptable: it's bounded by the fleet and cleared on restart.)
                 tracing::info!(
-                    "MM: ISSI {} did not respond to D-LOCATION-UPDATE-COMMAND — sending REJECT and removing",
+                    "MM: ISSI {} still unresponsive — re-attracting and keeping groups (no REJECT, no removal)",
                     issi
                 );
-                Self::send_d_location_update_reject_cause(
-                    queue, issi, last_handle,
-                    LocationUpdateType::PeriodicLocationUpdating,
-                    None,
-                    RejectCause::ExpiryOfTimer,
-                );
-                let detached = self.client_mgr.remove_client(issi);
-                if let Some(client) = detached {
-                    self.config.state_write().subscribers.deregister(issi);
-                    if !client.groups.is_empty() {
-                        let groups: Vec<u32> = client.groups.iter().copied().collect();
-                        self.emit_subscriber_update(queue, issi, groups, BrewSubscriberAction::Deaffiliate);
-                    }
-                    self.emit_subscriber_update(queue, issi, Vec::new(), BrewSubscriberAction::Deregister);
-                }
+                Self::send_d_location_update_command(queue, issi, 0);
+                self.client_mgr.reset_registration_timer(issi);
+                self.recovery_mark_dirty();
                 continue;
             }
             // First expiry — send COMMAND and wait grace period (60s) for response.
             // Do NOT remove_client here: keeping the client in registry preserves ESM
             // and group state so the terminal re-registers cleanly without losing EE mode.
             // Only notify Brew so it stops routing calls to this terminal until it re-registers.
+            //
+            // handle = 0: the L2 handle is inert (MLE addresses downlink MM PDUs by ISSI; see
+            // mle_bs.rs rx_lmm_mle_unitdata_req + uplink ind hardcoded handle 0). The COMMAND
+            // reaches the camped radio by ISSI regardless. The second-expiry branch above no
+            // longer removes the client or sends REJECT, so the terminal's groups survive an
+            // unanswered COMMAND and are restored by coverage-return re-affiliation on its return
+            // (FH-BUG-031 fix).
             Self::send_d_location_update_command(queue, issi, 0);
             self.client_mgr.set_pending_command(issi, 60);
             let groups: Vec<u32> = self.client_mgr
@@ -1453,7 +1629,22 @@ impl TetraEntityTrait for MmBs {
             self.emit_subscriber_update(queue, issi, Vec::new(), BrewSubscriberAction::Deregister);
             // Mark as detached in state but keep in client_mgr (preserves ESM + groups)
             self.config.state_write().subscribers.deregister(issi);
+            // Tell telemetry consumers the radio dropped for not answering T351. This is the
+            // edge: first-expiry fires once (subsequent ticks hit the re-attract branch above),
+            // so it is the right place to signal a drop. The client stays in client_mgr by
+            // design (groups preserved), so remove_client — and thus MsDeregistration — is NOT
+            // emitted here; this dedicated event is the only drop signal for this path. It also
+            // lets the dashboard drop the stale station from its list.
+            if let Some(sink) = &self.telemetry {
+                sink.send(crate::net_telemetry::TelemetryEvent::MsTimeoutDrop { issi });
+            }
         }
+
+        // Restart recovery: replay D-LOCATION-UPDATE-COMMANDs to cached terminals awaiting
+        // re-registration (no-op once the sweep drains / when recovery is disabled), then flush
+        // the cache if dirty + debounce elapsed.
+        self.drive_recovery_replay(queue, ts);
+        self.recovery_maybe_flush();
 
         // Republish the per-MS energy-economy monitoring windows into shared state every tick, from
         // the authoritative client registry, so the downlink scheduler (CMCE/SDS) can gate
@@ -1506,6 +1697,14 @@ impl TetraEntityTrait for MmBs {
                             // send a new U-LOCATION-UPDATING-DEMAND, effectively re-registering.
                             // This is cleaner than a reject: the terminal stays on the network
                             // but goes through a full re-registration cycle.
+                            //
+                            // handle = 0: the L2 handle is inert in this stack. MLE addresses
+                            // downlink MM PDUs purely by ISSI on the connectionless MCCH
+                            // (mle_bs.rs: rx_lmm_mle_unitdata_req discards prim.handle), and the
+                            // uplink ind hardcodes handle 0 (mle_bs.rs:132), so last_handle is
+                            // always 0 anyway. The COMMAND reaches the camped radio by its ISSI.
+                            // (NB: this means whatever makes FH-BUG-028 vendor-specific is NOT the
+                            // handle — that root cause is still open.)
                             Self::send_d_location_update_command(queue, issi, 0);
                             let groups: Vec<u32> = self.client_mgr
                                 .get_client_by_issi(issi)
@@ -1517,6 +1716,7 @@ impl TetraEntityTrait for MmBs {
                             self.emit_subscriber_update(queue, issi, Vec::new(), BrewSubscriberAction::Deregister);
                             self.client_mgr.remove_client(issi);
                             self.config.state_write().subscribers.deregister(issi);
+                            self.recovery_mark_dirty();
                         }
                     }
                     _ => {
@@ -1536,18 +1736,22 @@ impl MmBs {
     /// locally registered MS to force them to re-affiliate. This fixes the PTT-denied
     /// symptom where MS units registered before a Brew disconnect never re-register.
     fn rx_brew_reconnected(&mut self, queue: &mut MessageQueue) {
-        let clients: Vec<(u32, u32)> = self.client_mgr.all_clients_with_handle().collect();
-        if clients.is_empty() {
+        let issis = self.client_mgr.all_known_issis();
+        if issis.is_empty() {
             tracing::info!("mm_bs: BrewReconnected — no registered MS to re-register");
             return;
         }
         tracing::info!(
             "mm_bs: BrewReconnected — sending D-LOCATION-UPDATE-COMMAND to {} MS unit(s)",
-            clients.len()
+            issis.len()
         );
-        for (issi, handle) in clients {
-            tracing::debug!("mm_bs: re-registering ISSI {} (handle={})", issi, handle);
-            Self::send_d_location_update_command(queue, issi, handle);
+        for issi in issis {
+            // handle = 0: addressed by ISSI on the MCCH (the handle is inert — see
+            // all_known_issis). This path was previously dead because it filtered on
+            // last_handle != 0, which is never true, so no MS was ever re-registered after a
+            // Brew reconnect — the cause of "PTT denied after the backhaul blips".
+            tracing::debug!("mm_bs: re-registering ISSI {}", issi);
+            Self::send_d_location_update_command(queue, issi, 0);
         }
     }
 }

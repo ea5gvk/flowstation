@@ -348,3 +348,77 @@ fn test_dsetup_ee_fallback_resends_after_timeout() {
         "after the EE fallback expires, D-SETUP resends must resume (never worse than before), got {resends}"
     );
 }
+
+/// Energy-economy group-call announce batching: a group with a member that is asleep (EE) at
+/// announce time must receive EXTRA group D-SETUP re-sends (covering the member's later wake
+/// frame) compared to an identical all-StayAlive group. Both runs see the same late-entry
+/// cadence, so the difference isolates the batching contribution.
+#[test]
+fn test_group_ee_announce_adds_resends_for_sleeping_member() {
+    debug::setup_logging_verbose();
+
+    fn run_group_call(with_ee_member: bool) -> usize {
+        let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+        let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+        test.populate_entities(
+            vec![TetraEntity::Cmce],
+            vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+        );
+        let caller = 1000001;
+        let member = 1000003;
+        register_subscriber(&mut test, caller, TEST_GSSI);
+        register_subscriber(&mut test, member, TEST_GSSI);
+        if with_ee_member {
+            // Awake only on frames where (f-1) % 6 == 3 (f = 4/10/16): asleep at the setup frame
+            // (f=1), wakes within the first EE cycle. (frame, multiframe, cycle_len).
+            test.config.state_write().ee_monitoring_windows.insert(member, (4, 1, 6));
+        }
+        test.submit_message(build_u_setup_msg(caller, TEST_GSSI));
+        test.run_stack(Some(1));
+        test.dump_sinks(); // discard the initial group D-SETUP
+        // Span several EE cycles, but stay well under the ~5 s (360 ts) late-entry interval so the
+        // only source of additional group D-SETUPs is the EE announce batching.
+        test.run_stack(Some(40));
+        count_d_setups(&test.dump_sinks())
+    }
+
+    let with_ee = run_group_call(true);
+    let stayalive_only = run_group_call(false);
+    assert!(
+        with_ee > stayalive_only,
+        "a group with a sleeping EE member must get extra batched group D-SETUPs ({with_ee}) vs an all-StayAlive group ({stayalive_only})"
+    );
+}
+
+/// The transmitting speaker is awake by definition, so its own EE window must NOT drive announce
+/// batching. A group whose only non-speaker member is StayAlive must produce zero batched group
+/// D-SETUPs even when the EE-subscriber caller's window opens mid-run (regression for the
+/// speaker-counted-as-uncovered bug).
+#[test]
+fn test_group_ee_announce_excludes_speaker() {
+    debug::setup_logging_verbose();
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+    let caller = 1000001;
+    let stayalive_listener = 1000002;
+    register_subscriber(&mut test, caller, TEST_GSSI);
+    register_subscriber(&mut test, stayalive_listener, TEST_GSSI);
+    // Caller is itself an EE subscriber, asleep at setup but waking within the run (f = 4/10/16).
+    // With the fix it is excluded from coverage (it is the speaker); the only non-speaker member is
+    // StayAlive, so no batched re-send should ever fire.
+    test.config.state_write().ee_monitoring_windows.insert(caller, (4, 1, 6));
+
+    test.submit_message(build_u_setup_msg(caller, TEST_GSSI));
+    test.run_stack(Some(1));
+    test.dump_sinks(); // discard initial group D-SETUP
+    test.run_stack(Some(40));
+    let batched = count_d_setups(&test.dump_sinks());
+    assert_eq!(
+        batched, 0,
+        "the speaker's own EE window must not trigger batched re-sends (got {batched})"
+    );
+}

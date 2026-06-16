@@ -21,7 +21,6 @@ use tetra_pdus::cmce::{
         d_call_proceeding::DCallProceeding,
         d_connect::DConnect,
         d_connect_acknowledge::DConnectAcknowledge,
-        d_disconnect::DDisconnect,
         d_release::DRelease,
         d_setup::DSetup,
         d_tx_ceased::DTxCeased,

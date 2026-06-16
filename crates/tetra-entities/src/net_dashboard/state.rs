@@ -49,6 +49,19 @@ pub struct LastHeardEntry {
     pub dest: u32,            // destination GSSI or ISSI (0 if unknown)
 }
 
+/// SDS Log entry — one SDS message the BS sent or received locally. Persisted to disk
+/// (`sds_log.json` next to the active config) so the log survives a restart.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SdsLogEntry {
+    pub ts: String,           // "YYYY-MM-DD HH:MM:SS" local time
+    pub direction: String,    // "rx" (from MS) | "net" (from network) | "tx" (from dashboard)
+    pub source_issi: u32,
+    pub dest_issi: u32,
+    pub is_group: bool,
+    pub protocol_id: u8,
+    pub text: String,
+}
+
 /// Shared mutable state for the dashboard, protected by RwLock
 #[derive(Debug, Default)]
 pub struct DashboardStateInner {
@@ -56,6 +69,10 @@ pub struct DashboardStateInner {
     pub calls: HashMap<u16, CallEntry>,
     pub log_ring: std::collections::VecDeque<LogEntry>,
     pub last_heard: std::collections::VecDeque<LastHeardEntry>,
+    /// SDS Log ring (chronological, oldest at the front). Backed by an on-disk JSON file.
+    pub sds_log: std::collections::VecDeque<SdsLogEntry>,
+    /// Where `sds_log` is persisted. Empty disables persistence (e.g. config without a parent dir).
+    sds_log_path: std::path::PathBuf,
     pub config_path: String,
     pub brew_online: bool,
     pub brew_version: u8,
@@ -117,6 +134,9 @@ pub struct SdrHealthSnapshot {
 }
 
 pub const LAST_HEARD_MAX: usize = 50;
+/// Max SDS Log entries kept in memory and on disk. The log is human-messaging volume, so a
+/// few hundred entries cover a long history while keeping the JSON file small.
+pub const SDS_LOG_MAX: usize = 500;
 
 #[derive(Debug)]
 pub struct MsEntry {
@@ -148,11 +168,22 @@ pub type DashboardState = Arc<RwLock<DashboardStateInner>>;
 
 impl DashboardStateInner {
     pub fn new(config_path: String) -> Self {
+        // The SDS Log is persisted next to the active config, mirroring radioid_cache.json.
+        let sds_log_path = std::path::Path::new(&config_path)
+            .parent()
+            .map(|d| d.join("sds_log.json"))
+            .unwrap_or_else(|| std::path::PathBuf::from("sds_log.json"));
+        let sds_log = load_sds_log(&sds_log_path);
+        if !sds_log.is_empty() {
+            tracing::info!("SDS Log: loaded {} entries from {}", sds_log.len(), sds_log_path.display());
+        }
         Self {
             ms_map: HashMap::new(),
             calls: HashMap::new(),
             log_ring: std::collections::VecDeque::with_capacity(500),
             last_heard: std::collections::VecDeque::with_capacity(LAST_HEARD_MAX + 1),
+            sds_log,
+            sds_log_path,
             config_path,
             brew_online: false,
             brew_version: 0,
@@ -190,6 +221,35 @@ impl DashboardStateInner {
         self.log_ring.push_back(entry);
     }
 
+    /// Append one SDS to the log (newest at the back), evicting the oldest past SDS_LOG_MAX,
+    /// then persist the whole ring to disk so it survives a restart. The file is small and
+    /// SDS traffic is low-volume, so a full rewrite per entry is cheap.
+    pub fn push_sds_log(&mut self, direction: &str, source_issi: u32, dest_issi: u32, is_group: bool, protocol_id: u8, text: String) {
+        let entry = SdsLogEntry {
+            ts: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            direction: direction.to_string(),
+            source_issi,
+            dest_issi,
+            is_group,
+            protocol_id,
+            text,
+        };
+        if self.sds_log.len() >= SDS_LOG_MAX {
+            self.sds_log.pop_front();
+        }
+        self.sds_log.push_back(entry);
+        self.persist_sds_log();
+    }
+
+    fn persist_sds_log(&self) {
+        if self.sds_log_path.as_os_str().is_empty() {
+            return;
+        }
+        if let Ok(text) = serde_json::to_string(&self.sds_log) {
+            let _ = std::fs::write(&self.sds_log_path, text);
+        }
+    }
+
     pub fn snapshot_ms(&self) -> Vec<MsState> {
         self.ms_map.values().map(|e| MsState {
             issi: e.issi,
@@ -219,4 +279,13 @@ impl DashboardStateInner {
             ts: c.ts,
         }).collect()
     }
+}
+
+/// Load the persisted SDS Log from disk. Returns an empty ring when the file is missing or
+/// unparseable (e.g. first run, or a schema change) — the log is best-effort, never fatal.
+fn load_sds_log(path: &std::path::Path) -> std::collections::VecDeque<SdsLogEntry> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return std::collections::VecDeque::new();
+    };
+    serde_json::from_str(&text).unwrap_or_default()
 }

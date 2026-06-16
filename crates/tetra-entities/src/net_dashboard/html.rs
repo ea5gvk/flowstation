@@ -1,5 +1,5 @@
 pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-uisize="m">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
@@ -11,33 +11,34 @@ html,body{height:100%;overflow:hidden;}
 
 /* ── Themes ── */
 :root{
-  --bg:      #0f1117;
-  --bg2:     #161b24;
-  --bg3:     #1c2332;
-  --bg4:     #232d3f;
-  --border:  #2a3547;
-  --border2: #334060;
+  --bg:      #090d14;
+  --bg2:     #111824;
+  --bg3:     #19212f;
+  --bg4:     #232e40;
+  --border:  #232e40;
+  --border2: #33415a;
   --accent:  #00d4a8;
   --accent2: #4da6ff;
   --warn:    #ffb224;
   --danger:  #ff4d6d;
-  --text:    #eaf0fb;
-  --text2:   #8ba3c4;
-  --text3:   #3d5270;
-  --sidebar: #0b0f16;
-  --sidebar-border: #1a2236;
+  --text:    #eef3fb;
+  --text2:   #94abc9;
+  --text3:   #4c628a;
+  --muted:   var(--text2);   /* help/secondary text — was referenced everywhere but never defined */
+  --sidebar: #070a10;
+  --sidebar-border: #161d2c;
   --card-shadow: 0 1px 3px rgba(0,0,0,0.4);
-  --r: 8px;
+  --r: 10px;
   --mono: 'ui-monospace','Cascadia Code','Consolas','Liberation Mono','Menlo',monospace;
   --sans: 'ui-sans-serif', system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', 'Noto Sans SC', 'PingFang SC', 'Hiragino Sans GB', 'WenQuanYi Micro Hei', sans-serif;
 }
 [data-theme="light"]{
-  --bg:#f0f4f9;--bg2:#ffffff;--bg3:#e8eef6;--bg4:#dce4ef;
-  --border:#c8d5e8;--border2:#b0c4da;
-  --accent:#007a62;--accent2:#0066cc;--warn:#b06000;--danger:#c0203a;
-  --text:#0d1829;--text2:#3a5a7a;--text3:#9ab0c8;
-  --sidebar:#1a2540;--sidebar-border:#253050;
-  --card-shadow:0 1px 4px rgba(0,0,0,0.1);
+  --bg:#eceff4;--bg2:#ffffff;--bg3:#e6eaf1;--bg4:#d6dde7;
+  --border:#dde3ec;--border2:#c4cdd9;
+  --accent:#00876a;--accent2:#1565c0;--warn:#9a5400;--danger:#c0203a;
+  --text:#16202e;--text2:#3d4f66;--text3:#5f7188;
+  --sidebar:#ffffff;--sidebar-border:#e3e8ef;
+  --card-shadow:0 1px 3px rgba(20,30,50,0.06),0 4px 16px -8px rgba(20,30,50,0.10);
 }
 [data-theme="blue"]{
   --bg:#03071e;--bg2:#060d2a;--bg3:#091235;--bg4:#0d1840;
@@ -47,6 +48,17 @@ html,body{height:100%;overflow:hidden;}
   --sidebar:#020514;--sidebar-border:#0c1840;
   --card-shadow:0 1px 3px rgba(0,0,200,0.15);
 }
+
+/* ── Readability scale (eye control) ──────────────────────────────────────────
+   --ts is one text-scale multiplier consumed by the curated readability block
+   (the @media min-width:701px block) via calc(). data-uisize lives on <html>,
+   persisted as fs_uisize. High/Ultra also strengthen the muted text tiers —
+   theme-agnostic, because we reassign the *tokens* themselves. */
+:root{ --ts:1.10; --wt-quiet:600; }   /* boot default = Medium (≈16.5px base) */
+html[data-uisize="s"]{ --ts:0.92; }
+html[data-uisize="m"]{ --ts:1.10; }
+html[data-uisize="h"]{ --ts:1.26; --text3:var(--text2); --wt-quiet:600; }
+html[data-uisize="u"]{ --ts:1.46; --text3:var(--text); --text2:var(--text); --wt-quiet:700; }
 
 /* ── Touchscreen mode (FH-FEAT-008) ──────────────────────────────────────────
    Opt-in via body.touch-mode (persisted in localStorage), OR auto-enabled on a
@@ -108,9 +120,10 @@ body{
 .sidebar-logo{
   padding:18px 16px 14px;
   border-bottom:1px solid var(--sidebar-border);
-  display:flex;align-items:center;gap:10px;
+  display:flex;flex-direction:column;gap:12px;
   flex-shrink:0;
 }
+.logo-row{display:flex;align-items:center;gap:10px;}
 .logo-icon{
   width:28px;height:28px;border-radius:6px;
   background:linear-gradient(135deg,var(--accent),var(--accent2));
@@ -125,6 +138,67 @@ body{
 .logo-text .logo-name{font-size:13px;font-weight:700;color:var(--text);letter-spacing:0.02em;}
 .logo-text .logo-sub{font-size:10px;color:var(--text3);letter-spacing:0.08em;font-family:var(--mono);}
 #sidebar.collapsed .logo-text{opacity:0;width:0;pointer-events:none;}
+
+/* ── Hardware status rows — iOS-Settings status block fused to the brand header ── */
+.hw-status{
+  display:flex;flex-direction:column;gap:2px;
+  padding:5px;border-radius:9px;
+  background:color-mix(in srgb,var(--text) 3%,transparent);
+  border:1px solid var(--sidebar-border);
+  box-shadow:var(--hair);
+  transition:opacity 0.15s,padding 0.2s,border-color 0.2s,background 0.2s;
+}
+/* JS sets display:flex on these wrappers when populated (else display:none). */
+.hw-row{
+  display:flex;align-items:center;gap:9px;
+  padding:6px 7px;border-radius:7px;
+  overflow:hidden;cursor:default;transition:background 0.15s;
+}
+.hw-row + .hw-row{box-shadow:inset 0 1px 0 var(--sidebar-border);}
+.hw-row:hover{background:color-mix(in srgb,var(--text) 4%,transparent);}
+.hw-row:hover + .hw-row{box-shadow:none;}
+.hw-glyph{
+  flex-shrink:0;width:22px;height:22px;border-radius:6px;
+  display:flex;align-items:center;justify-content:center;
+}
+.hw-glyph svg{width:14px;height:14px;display:block;}
+.hw-row--sdr .hw-glyph{color:var(--accent);background:color-mix(in srgb,var(--accent) 12%,transparent);}
+.hw-row--pwr .hw-glyph{color:var(--warn);background:color-mix(in srgb,var(--warn) 14%,transparent);}
+.hw-meta{
+  flex:1;min-width:0;display:flex;flex-direction:column;line-height:1.2;
+  overflow:hidden;transition:opacity 0.15s,width 0.15s;
+}
+.hw-key{
+  font-family:var(--mono);font-size:8.5px;font-weight:700;letter-spacing:0.12em;
+  text-transform:uppercase;color:var(--text3);
+}
+.hw-val{
+  font-family:var(--mono);font-size:11px;font-weight:600;color:var(--text2);
+  letter-spacing:0.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+/* Live link indicator — soft radiating teal pulse ("SDR is talking to RF"). */
+.hw-live{flex-shrink:0;display:flex;align-items:center;}
+.hw-live-dot{
+  width:6px;height:6px;border-radius:50%;background:var(--accent);
+  box-shadow:0 0 0 0 color-mix(in srgb,var(--accent) 55%,transparent);
+  animation:hw-pulse 2.4s ease-in-out infinite;
+}
+@keyframes hw-pulse{
+  0%  {box-shadow:0 0 0 0 color-mix(in srgb,var(--accent) 55%,transparent);}
+  70% {box-shadow:0 0 0 5px color-mix(in srgb,var(--accent) 0%,transparent);}
+  100%{box-shadow:0 0 0 0 color-mix(in srgb,var(--accent) 0%,transparent);}
+}
+
+/* Collapsed rail (56px): keep the tinted glyphs, drop labels/value/dot gracefully. */
+#sidebar.collapsed .sidebar-logo{padding-left:0;padding-right:0;align-items:center;}
+#sidebar.collapsed .hw-status{background:transparent;border-color:transparent;box-shadow:none;padding:2px 0;gap:6px;}
+#sidebar.collapsed .hw-row{justify-content:center;padding:4px 0;gap:0;}
+#sidebar.collapsed .hw-meta,
+#sidebar.collapsed .hw-live{opacity:0;width:0;pointer-events:none;}
+#sidebar.collapsed .hw-row + .hw-row{box-shadow:none;}
+
+/* Hide the whole block + its border when neither row is active (Chromium :has()). */
+.hw-status:not(:has(.hw-row[style*="flex"])){display:none;}
 
 /* ── Update-available badge (own block under the logo, not clipped by the logo box) ── */
 .update-badge{
@@ -273,6 +347,7 @@ body{
   display:flex;align-items:center;
   padding:0 20px;gap:12px;
   flex-shrink:0;
+  position:relative;z-index:50;   /* keep dropdown popovers above #content */
 }
 .topbar-title{
   font-size:15px;font-weight:700;color:var(--text);
@@ -282,62 +357,8 @@ body{
 .topbar-sub{font-size:12px;color:var(--text3);font-family:var(--mono);}
 .topbar-right{margin-left:auto;display:flex;align-items:center;gap:8px;}
 
-/* SDR hardware badge — shows the auto-detected SDR (LimeSDR, SXceiver, µCell, etc).
-   Positioned between the page title and the right-side controls. Carries a subtle
-   animated dot to convey "live link to RF". */
-.sdr-badge{
-  display:flex;align-items:center;gap:7px;
-  padding:5px 10px;
-  background:rgba(0,212,168,0.08);
-  border:1px solid rgba(0,212,168,0.3);
-  border-radius:6px;
-  font-family:var(--mono);font-size:10px;font-weight:600;
-  letter-spacing:0.05em;
-  color:var(--accent);
-  margin-left:14px;
-  cursor:default;
-  transition:background 0.15s;
-}
-.sdr-badge:hover{background:rgba(0,212,168,0.14);}
-.sdr-badge-dot{
-  width:6px;height:6px;border-radius:50%;
-  background:var(--accent);
-  box-shadow:0 0 6px var(--accent);
-  animation:sdr-pulse 2s ease-in-out infinite;
-}
-@keyframes sdr-pulse{
-  0%,100%{opacity:1;}
-  50%{opacity:0.4;}
-}
-.sdr-badge-label{white-space:nowrap;}
-
-/* Host power-draw badge: lives next to the SDR badge, uses a violet accent so
-   it's visually distinct from the SDR (teal) badge. Hidden when sys_telemetry
-   can't find any power-capable sensor on the host. */
-.pwr-badge{
-  display:flex;align-items:center;gap:6px;
-  padding:5px 10px;
-  background:rgba(167,114,232,0.10);
-  border:1px solid rgba(167,114,232,0.35);
-  border-radius:6px;
-  font-family:var(--mono);font-size:10px;font-weight:600;
-  letter-spacing:0.05em;
-  color:#c8a4f5;
-  margin-left:6px;
-  cursor:default;
-  transition:background 0.15s;
-}
-.pwr-badge:hover{background:rgba(167,114,232,0.18);}
-.pwr-badge-icon{
-  font-size:11px;line-height:1;
-  filter:drop-shadow(0 0 4px rgba(167,114,232,0.5));
-}
-.pwr-badge-label{white-space:nowrap;}
-[data-theme="light"] .pwr-badge{
-  background:rgba(123,68,200,0.08);
-  border-color:rgba(123,68,200,0.3);
-  color:#6432aa;
-}
+/* (The old topbar SDR/power pill badges were relocated into the sidebar brand
+   header as the .hw-status block — see the sidebar CSS above.) */
 
 /* Host hardware sensor tiles on the System tab. Compact, single-line per
    sensor, monospace numbers so columns of values line up visually. */
@@ -546,6 +567,136 @@ body{
 }
 .lang-btn:hover{color:var(--text);background:var(--bg3);}
 .lang-btn.active{color:var(--accent);background:rgba(0,212,168,0.08);border-color:rgba(0,212,168,0.2);}
+
+/* ── Readability eye button + Apple-style level popover ───────────────────── */
+.eye-wrap{position:relative;display:flex;}
+.eye-btn{
+  width:30px;height:30px;display:flex;align-items:center;justify-content:center;
+  background:transparent;border:1px solid var(--border);border-radius:6px;
+  color:var(--text3);cursor:pointer;transition:all 0.15s;
+}
+.eye-btn svg{width:16px;height:16px;display:block;}
+.eye-btn:hover{color:var(--text);border-color:var(--border2);background:var(--bg3);}
+.eye-btn[aria-expanded="true"]{
+  color:var(--accent);
+  border-color:color-mix(in srgb,var(--accent) 45%,var(--border));
+  background:color-mix(in srgb,var(--accent) 8%,transparent);
+}
+
+/* Popover: iOS-Settings list on a vibrancy surface — rounded, hairline rows, soft shadow */
+.read-pop{
+  position:absolute;top:calc(100% + 9px);right:0;
+  width:248px;padding:6px;z-index:300;
+  background:color-mix(in srgb,var(--bg2) 88%,transparent);
+  -webkit-backdrop-filter:saturate(180%) blur(20px);
+  backdrop-filter:saturate(180%) blur(20px);
+  border:1px solid var(--border);border-radius:14px;
+  box-shadow:
+    0 18px 48px -16px rgba(20,30,50,0.34),
+    0 4px 12px rgba(20,30,50,0.10),
+    var(--hair);
+  opacity:0;transform:translateY(-6px) scale(0.98);transform-origin:top right;
+  pointer-events:none;
+  transition:opacity 0.16s ease,transform 0.16s cubic-bezier(.2,.8,.2,1);
+}
+.read-pop.open{opacity:1;transform:translateY(0) scale(1);pointer-events:auto;}
+.read-pop-title{
+  font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:0.12em;
+  text-transform:uppercase;color:var(--text3);padding:8px 10px 6px;
+}
+.read-opt{
+  display:flex;align-items:center;gap:12px;width:100%;
+  padding:9px 10px;border-radius:9px;
+  background:transparent;border:none;cursor:pointer;text-align:left;color:var(--text);
+  transition:background 0.12s;
+}
+.read-opt + .read-opt{box-shadow:inset 0 1px 0 var(--border);}     /* hairline separator */
+.read-opt:hover{background:var(--bg3);}
+.read-opt:hover + .read-opt{box-shadow:none;}                       /* hide line above hovered row */
+/* Live "Aa" swatch — its font-size is the real base px for that level */
+.read-aa{
+  flex-shrink:0;width:34px;height:30px;border-radius:7px;
+  background:var(--bg3);border:1px solid var(--border);
+  display:flex;align-items:center;justify-content:center;
+  font-family:var(--sans);font-weight:600;color:var(--text2);line-height:1;
+}
+.read-opt[data-size="s"] .read-aa{font-size:13px;}
+.read-opt[data-size="m"] .read-aa{font-size:16px;}
+.read-opt[data-size="h"] .read-aa{font-size:18px;font-weight:700;color:var(--text);}
+.read-opt[data-size="u"] .read-aa{font-size:21px;font-weight:800;color:var(--text);}
+.read-opt-text{flex:1;min-width:0;display:flex;flex-direction:column;}
+.read-opt-name{font-family:var(--sans);font-size:13px;font-weight:600;letter-spacing:-0.01em;}
+.read-opt-desc{font-size:11px;color:var(--text3);margin-top:1px;}
+.read-check{
+  flex-shrink:0;width:18px;height:18px;color:var(--accent);
+  opacity:0;transform:scale(0.6);transition:opacity 0.12s,transform 0.12s;
+}
+.read-opt.active .read-check{opacity:1;transform:scale(1);}
+.read-opt.active .read-opt-name{color:var(--accent);}
+
+@media (max-width:700px){ .read-pop{width:220px;} }
+
+/* ── Settings controls (Config / Telegram / WX tabs) — premium, consistent ──── */
+/* Sub-label in a card header (e.g. WiFi saved-count). */
+.card-sub{font-family:var(--mono);font-size:11px;color:var(--muted);letter-spacing:0.02em;}
+
+/* iOS-style toggle switch. The real <input type=checkbox id=…> stays in the DOM
+   (just visually replaced) so all .checked reads/writes keep working unchanged. */
+.sw{position:relative;display:inline-block;width:44px;height:26px;flex-shrink:0;vertical-align:middle;}
+.sw input{position:absolute;inset:0;width:100%;height:100%;opacity:0;margin:0;cursor:pointer;z-index:1;}
+.sw i{
+  position:absolute;inset:0;border-radius:999px;pointer-events:none;
+  background:var(--bg4);border:1px solid var(--border2);
+  transition:background .2s ease,border-color .2s ease;
+}
+.sw i::after{
+  content:'';position:absolute;top:2px;left:2px;width:20px;height:20px;border-radius:50%;
+  background:#fff;box-shadow:0 1px 3px rgba(20,30,50,.35);transition:transform .2s cubic-bezier(.2,.8,.2,1);
+}
+.sw input:checked ~ i{background:var(--accent);border-color:var(--accent);}
+.sw input:checked ~ i::after{transform:translateX(18px);}
+.sw input:focus-visible ~ i{box-shadow:0 0 0 3px color-mix(in srgb,var(--accent) 28%,transparent);}
+
+/* Full settings row: label (with optional sub) on the left, switch on the right,
+   hairline separators between rows. */
+.sw-row{
+  display:flex;align-items:center;justify-content:space-between;gap:16px;
+  padding:11px 2px;cursor:pointer;user-select:none;
+}
+.sw-row + .sw-row{border-top:1px solid var(--border);}
+.sw-text{font-size:14px;color:var(--text);font-weight:500;line-height:1.35;}
+.sw-text .sw-sub{display:block;font-size:11.5px;color:var(--muted);margin-top:2px;font-weight:400;}
+
+/* Native checkboxes that remain (e.g. inside modals) get the brand tint. */
+input[type="checkbox"]:not(.sw input),
+input[type="radio"]{accent-color:var(--accent);}
+
+/* Help/intro text under a card title — used across the settings tabs. */
+.help-text{color:var(--muted);font-size:13px;line-height:1.6;}
+
+/* Recipient / ISSI chips (whitelist + telegram) — pill shape, brand-tinted. */
+.id-chip{
+  display:inline-flex;align-items:center;gap:7px;
+  background:color-mix(in srgb,var(--accent2) 10%,transparent);
+  border:1px solid color-mix(in srgb,var(--accent2) 30%,transparent);
+  color:var(--text);border-radius:999px;padding:5px 6px 5px 12px;
+  font-family:var(--mono);font-size:12.5px;font-weight:600;
+}
+.id-chip-x{
+  display:inline-flex;align-items:center;justify-content:center;
+  width:18px;height:18px;border-radius:50%;cursor:pointer;
+  color:var(--danger);background:color-mix(in srgb,var(--danger) 12%,transparent);
+  font-weight:700;line-height:1;transition:background .15s;
+}
+.id-chip-x:hover{background:color-mix(in srgb,var(--danger) 22%,transparent);}
+
+/* The global .card-body is padding:0 (for table/grid cards). Settings + list tabs
+   put text/controls straight in the body, so give those real breathing room —
+   except the full-bleed code editor, which stays edge-to-edge. */
+#page-telegram .card-body,
+#page-config .card-body,
+#page-wifi .card-body{padding:16px 18px;}
+#page-config .card-body:has(#config-editor){padding:0;}
 
 /* ── Content area ── */
 #content{
@@ -936,10 +1087,6 @@ td code{
   .topbar-right{gap:4px;}
   .theme-btn{padding:3px 6px;font-size:9px;}
   .lang-btn{padding:2px 4px;font-size:9px;}
-  /* SDR badge: keep the dot but shrink the text; if the badge would push out the
-     right-side controls, hide the label entirely. */
-  .sdr-badge{margin-left:6px;padding:4px 7px;font-size:9px;}
-  .sdr-badge-label{max-width:60px;overflow:hidden;text-overflow:ellipsis;}
   .logout-btn{width:30px;height:30px;font-size:13px;}
 
   #content{padding:8px;}
@@ -1155,6 +1302,373 @@ tbody td{transition:background .12s ease;}
 
 /* Refined, rounded scrollbar thumbs everywhere (no size change → no conflicts). */
 ::-webkit-scrollbar-thumb{border-radius:6px;}
+
+/* ════════════════════════════════════════════════════════════════════════
+   Ecosystem polish v2 — premium materials layer.
+   Purely visual: depth, light, gradients & spacing refinements layered on top
+   of the existing token system. NO structural/class/markup changes, so the
+   shared mobile schema is untouched. Hues keep the teal/azure brand identity;
+   only neutrals, elevation and "material" treatments are enriched.
+   ════════════════════════════════════════════════════════════════════════ */
+:root{
+  --brand: linear-gradient(135deg, var(--accent) 0%, var(--accent2) 100%);
+  --hair:  inset 0 1px 0 rgba(255,255,255,0.05);
+  --shadow-sm: 0 1px 2px rgba(0,0,0,0.45);
+  --shadow-md: 0 10px 28px -14px rgba(0,0,0,0.65), 0 2px 6px rgba(0,0,0,0.32);
+  --shadow-lg: 0 28px 64px -22px rgba(0,0,0,0.72), 0 6px 18px rgba(0,0,0,0.42);
+  --glass: color-mix(in srgb, var(--bg2) 76%, transparent);
+}
+[data-theme="light"]{--hair: inset 0 1px 0 rgba(255,255,255,0.7);}
+
+/* Ambient backdrop — faint brand glows bleed in from the corners behind the
+   content, giving the shell a sense of depth without distracting from data. */
+body{
+  background:
+    radial-gradient(1100px 560px at 82% -10%, color-mix(in srgb,var(--accent) 8%, transparent), transparent 60%),
+    radial-gradient(1000px 680px at -6% 108%, color-mix(in srgb,var(--accent2) 8%, transparent), transparent 55%),
+    var(--bg);
+  background-attachment:fixed;
+}
+[data-theme="light"] body{
+  background:
+    radial-gradient(1100px 560px at 82% -10%, rgba(0,122,98,0.05), transparent 60%),
+    radial-gradient(1000px 680px at -6% 108%, rgba(0,102,204,0.05), transparent 55%),
+    var(--bg);
+}
+
+/* ── Sidebar: deeper, with a hairline inner highlight ── */
+#sidebar{
+  background:linear-gradient(180deg, color-mix(in srgb,var(--sidebar) 92%, var(--accent2)) 0%, var(--sidebar) 22%, var(--sidebar) 100%);
+  box-shadow:1px 0 0 rgba(255,255,255,0.02), 8px 0 24px -16px rgba(0,0,0,0.6);
+}
+.sidebar-logo{padding-top:20px;padding-bottom:16px;}
+.logo-icon{
+  box-shadow:0 4px 14px -4px color-mix(in srgb,var(--accent) 60%, transparent), var(--hair);
+  border:1px solid color-mix(in srgb,var(--accent) 35%, transparent);
+}
+.logo-text .logo-name{font-weight:800;letter-spacing:0.01em;}
+
+/* ── Nav items: signature active treatment (left accent bar + soft wash) ── */
+.nav-item{border-radius:8px;}
+.nav-item.active{
+  background:linear-gradient(90deg, color-mix(in srgb,var(--accent) 16%, transparent), color-mix(in srgb,var(--accent) 4%, transparent));
+  border-color:color-mix(in srgb,var(--accent) 22%, transparent);
+  box-shadow:inset 2px 0 0 var(--accent);
+}
+.nav-item.active .nav-icon{filter:drop-shadow(0 0 6px color-mix(in srgb,var(--accent) 60%, transparent));}
+[data-theme="light"] .nav-item.active{box-shadow:inset 2px 0 0 var(--accent);}
+
+/* ── Topbar: frosted glass with a hairline base highlight ── */
+#topbar{
+  background:var(--glass);
+  -webkit-backdrop-filter:saturate(160%) blur(12px);
+  backdrop-filter:saturate(160%) blur(12px);
+  box-shadow:0 1px 0 rgba(255,255,255,0.03), 0 6px 18px -14px rgba(0,0,0,0.7);
+}
+.topbar-title{font-size:16px;font-weight:800;letter-spacing:-0.015em;}
+
+/* ── Content rhythm ── */
+#content{padding:24px;}
+@media(max-width:700px){#content{padding:14px;}}
+
+/* ── Stat cards: subtle vertical sheen, brand top-line fade, deeper lift ── */
+.stat-grid{gap:16px;margin-bottom:22px;}
+.stat-card{
+  background:linear-gradient(180deg, var(--bg2) 0%, color-mix(in srgb,var(--bg2) 86%, #000) 100%);
+  border:1px solid var(--border);
+  border-radius:var(--r);
+  box-shadow:var(--shadow-md), var(--hair);
+  padding:17px 19px;
+}
+.stat-card::before{
+  height:3px;
+  background:linear-gradient(90deg, var(--accent-line,var(--accent)), color-mix(in srgb,var(--accent-line,var(--accent)) 0%, transparent) 92%);
+  opacity:0.95;
+}
+.stat-value{font-size:30px;letter-spacing:-0.025em;}
+.stat-icon{font-size:30px;opacity:0.06;}
+
+/* ── Cards: refined elevation + header wash ── */
+.card{
+  border:1px solid var(--border);
+  border-radius:var(--r);
+  box-shadow:var(--shadow-md), var(--hair);
+}
+.card-head{
+  background:linear-gradient(180deg, color-mix(in srgb,var(--bg3) 45%, transparent), transparent);
+  padding-top:13px;padding-bottom:13px;
+}
+.card-title{color:var(--text2);}
+
+/* ── Tables: zebra-free but with a soft sticky header and crisper hover ── */
+thead th{
+  background:color-mix(in srgb,var(--bg2) 92%, var(--accent2));
+  border-bottom:1px solid var(--border2);
+}
+tbody tr{transition:background .12s ease;}
+tbody tr:hover td{background:color-mix(in srgb,var(--bg3) 70%, transparent);}
+
+/* ── Buttons: hairline highlight + brand primary ── */
+.btn{border-radius:8px;box-shadow:var(--hair);}
+.btn-primary{
+  background:linear-gradient(180deg, color-mix(in srgb,var(--accent) 22%, transparent), color-mix(in srgb,var(--accent) 12%, transparent));
+  border-color:color-mix(in srgb,var(--accent) 45%, transparent);
+  color:var(--accent);
+}
+.btn-primary:hover{
+  background:linear-gradient(180deg, color-mix(in srgb,var(--accent) 30%, transparent), color-mix(in srgb,var(--accent) 18%, transparent));
+  border-color:var(--accent);
+}
+
+/* ── Badges: pill shape for a cleaner, app-like read ── */
+.badge{border-radius:999px;padding:2px 9px;}
+
+/* ── Pickers (theme/lang): unified segmented-control feel ── */
+.theme-picker{box-shadow:var(--hair);}
+.touch-btn,.theme-picker,.logout-btn,.sidebar-toggle{border-radius:8px;}
+
+/* ── Footer status rows: a touch more contrast for the LEDs ── */
+.conn-status-row,.brew-status-row{border-radius:8px;}
+
+/* ── Deeper hover lift on cards (compose with existing motion layer) ── */
+@media (prefers-reduced-motion: no-preference){
+  .card:hover,.stat-card:hover{
+    box-shadow:var(--shadow-lg), var(--hair);
+  }
+}
+
+/* ── Scrollbar thumb: brand-tinted on hover ── */
+::-webkit-scrollbar-thumb{background:var(--border2);}
+::-webkit-scrollbar-thumb:hover{background:color-mix(in srgb,var(--accent) 40%, var(--border2));}
+
+/* ════ TETRA BTS Details card ════ */
+.bts-grid{
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));
+  gap:10px;padding:16px 18px;
+}
+.bts-tile{
+  background:linear-gradient(180deg, var(--bg), color-mix(in srgb,var(--bg) 82%, #000));
+  border:1px solid var(--border);border-radius:9px;
+  padding:11px 13px;display:flex;flex-direction:column;gap:6px;min-width:0;
+  box-shadow:var(--hair);
+}
+.bts-tile-label{
+  font-family:var(--mono);font-size:9px;font-weight:600;letter-spacing:0.09em;
+  text-transform:uppercase;color:var(--text3);white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis;
+}
+.bts-tile-value{
+  font-family:var(--mono);font-size:15px;font-weight:700;color:var(--text);
+  letter-spacing:-0.01em;min-width:0;overflow-wrap:anywhere;
+}
+.bts-tile-value.tx{color:var(--accent);}
+.bts-tile-value.rx{color:var(--accent2);}
+/* Header status chips (Neighbor Cell / HangTime) */
+.bts-chip{
+  display:inline-flex;align-items:center;gap:6px;
+  font-family:var(--mono);font-size:10px;font-weight:700;letter-spacing:0.04em;
+  padding:5px 11px;border-radius:999px;border:1px solid var(--border2);
+  background:var(--bg3);color:var(--text2);white-space:nowrap;box-shadow:var(--hair);
+}
+.bts-chip svg{flex-shrink:0;}
+.bts-chip.on{color:var(--accent);background:color-mix(in srgb,var(--accent) 13%,transparent);border-color:color-mix(in srgb,var(--accent) 40%,transparent);}
+.bts-chip.off{color:var(--text3);background:var(--bg3);border-color:var(--border);}
+.bts-chip.time{color:var(--accent2);background:color-mix(in srgb,var(--accent2) 13%,transparent);border-color:color-mix(in srgb,var(--accent2) 38%,transparent);}
+.bts-access-bar{
+  display:flex;align-items:center;justify-content:space-between;gap:12px;
+  margin:0 18px 16px;padding:13px 16px;
+  background:linear-gradient(180deg, var(--bg), color-mix(in srgb,var(--bg) 80%, #000));
+  border:1px solid var(--border);border-radius:10px;box-shadow:var(--hair);
+}
+.bts-access-info{display:flex;align-items:center;gap:13px;min-width:0;}
+.bts-access-icon{
+  width:38px;height:38px;flex-shrink:0;border-radius:10px;
+  display:flex;align-items:center;justify-content:center;
+  background:color-mix(in srgb,var(--accent2) 12%, transparent);
+  border:1px solid color-mix(in srgb,var(--accent2) 30%, transparent);
+  color:var(--accent2);
+}
+.bts-access-title{font-size:12.5px;font-weight:700;color:var(--text);letter-spacing:0.01em;}
+.bts-access-sub{font-family:var(--mono);font-size:10px;color:var(--text3);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.bts-access{
+  font-family:var(--mono);font-size:11px;font-weight:800;letter-spacing:0.1em;
+  padding:7px 16px;border-radius:999px;border:1px solid;white-space:nowrap;flex-shrink:0;
+  background:var(--bg3);color:var(--text3);border-color:var(--border);
+}
+.bts-access.open{
+  color:var(--accent);
+  background:color-mix(in srgb,var(--accent) 13%, transparent);
+  border-color:color-mix(in srgb,var(--accent) 42%, transparent);
+}
+.bts-access.restricted{
+  color:var(--warn);
+  background:color-mix(in srgb,var(--warn) 13%, transparent);
+  border-color:color-mix(in srgb,var(--warn) 42%, transparent);
+}
+@media(max-width:500px){
+  .bts-grid{grid-template-columns:1fr 1fr;gap:8px;padding:12px;}
+  .bts-tile-value{font-size:13px;}
+  .bts-access-bar{margin:0 12px 12px;}
+}
+
+/* ════ Monitor tables — consistent column alignment ════
+   Headers were left-aligned while badges / status / signal sat centred in the cell,
+   so nothing lined up vertically. Rule: the primary identifier column stays left;
+   every other column is centred so each value sits directly under its header. */
+#page-stations table th, #page-stations table td,
+#page-calls table th,    #page-calls table td,
+#page-lastheard table th, #page-lastheard table td{
+  text-align:center; vertical-align:middle;
+}
+#page-stations table th:first-child, #page-stations table td:first-child,
+#page-calls table th:first-child,    #page-calls table td:first-child,
+#page-lastheard table th:first-child, #page-lastheard table td:first-child{
+  text-align:left;
+}
+/* SDS Log: left-aligned, top-aligned rows; message wraps, timestamp stays on one line. */
+#page-sdslog table th, #page-sdslog table td{ text-align:left; vertical-align:top; }
+#page-sdslog .sds-time{ white-space:nowrap; color:var(--text2); font-variant-numeric:tabular-nums; }
+#page-sdslog .sds-msg{ word-break:break-word; max-width:560px; }
+.sds-empty{ color:var(--text3); font-style:italic; }
+/* Signal cell: centre the bar+value as a unit, and keep the dBFS reading on one line
+   (it was wrapping to two, which read as "toy-like"). */
+#page-stations .rssi-bar{ justify-content:center; }
+.rssi-val{ width:auto; min-width:62px; white-space:nowrap; }
+
+/* ════ Timeslot visualizer — live identity + motion ════ */
+/* Per-timeslot call timer, top-right corner. Colour-matched to the call state. */
+.ts-timer{
+  position:absolute;top:7px;right:9px;
+  font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:0.04em;
+  color:var(--text3);font-variant-numeric:tabular-nums;pointer-events:none;
+}
+.ts-block.call .ts-timer{color:var(--warn);}
+.ts-block.voice .ts-timer{color:var(--danger);}
+/* GSSI line reads a touch larger; ISSI/callsign line stays monospace + tabular. */
+.ts-label{font-size:11px;}
+.ts-sub{font-family:var(--mono);font-variant-numeric:tabular-nums;}
+
+@media (prefers-reduced-motion: no-preference){
+  /* Idle dots gently "breathe" so the panel feels alive when quiet. Active dots
+     (control / call / voice) stay perfectly still so the ripple reads as concentric. */
+  .ts-block:not(.mcch):not(.call):not(.voice) .ts-led{
+    animation:tsBreathe 3.2s ease-in-out infinite;will-change:transform,opacity;
+  }
+  @keyframes tsBreathe{0%,100%{transform:scale(1);opacity:.5;}50%{transform:scale(1.25);opacity:.9;}}
+
+  /* Active timeslots emit an expanding "radar" ripple from the LED — a calmer,
+     more signal-like cue than a flat colour change. The ring is centred via
+     translate(-50%,-50%) preserved across the whole keyframe, so it stays exactly
+     concentric with the dot regardless of scale. currentColor matches the state. */
+  .ts-led{position:relative;}
+  .ts-led::after{
+    content:'';position:absolute;top:50%;left:50%;width:100%;height:100%;
+    box-sizing:border-box;  /* the global *{} reset doesn't reach ::after — set it here so
+                               width:100% + border + translate(-50%) all use the same 10px box */
+    border-radius:50%;border:1.5px solid currentColor;
+    transform:translate(-50%,-50%) scale(1);transform-origin:center;
+    opacity:0;pointer-events:none;
+  }
+  .ts-block.mcch  .ts-led{color:var(--accent2);}
+  .ts-block.call  .ts-led{color:var(--warn);}
+  .ts-block.voice .ts-led{color:var(--danger);}
+  .ts-block.mcch  .ts-led::after{animation:tsRipple 2.6s ease-out infinite;}
+  .ts-block.call  .ts-led::after{animation:tsRipple 1.6s ease-out infinite;}
+  .ts-block.voice .ts-led::after{animation:tsRipple 0.9s ease-out infinite;}
+  @keyframes tsRipple{
+    0%{opacity:.6;transform:translate(-50%,-50%) scale(1);}
+    100%{opacity:0;transform:translate(-50%,-50%) scale(3.2);}
+  }
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+   Premium light/grey default (FH user feedback) — bigger high-contrast type,
+   a theme-integrated (light) sidebar, tighter sections, and a subtle texture.
+   Light overrides are scoped to [data-theme="light"]; the density/font bumps
+   apply on desktop/tablet only so the phone layout keeps its tuned sizes.
+   ════════════════════════════════════════════════════════════════════════ */
+
+/* Softer elevation for light surfaces (the base shadows are tuned for dark). */
+[data-theme="light"]{
+  --shadow-sm:0 1px 2px rgba(30,45,70,0.07);
+  --shadow-md:0 6px 18px -10px rgba(30,45,70,0.16), 0 2px 5px rgba(30,45,70,0.06);
+  --shadow-lg:0 20px 46px -18px rgba(30,45,70,0.22), 0 6px 14px rgba(30,45,70,0.10);
+}
+
+/* Theme-integrated sidebar: the rail now follows the theme instead of staying
+   dark navy (dark text on a dark rail was the "bad contrast" complaint). */
+[data-theme="light"] #sidebar{
+  background:var(--sidebar);
+  box-shadow:1px 0 0 var(--sidebar-border), 6px 0 22px -18px rgba(30,45,70,0.22);
+}
+[data-theme="light"] .logo-text .logo-sub,
+[data-theme="light"] .sidebar-copyright .cr-line{color:var(--text3);}
+
+/* Flatten the dark-oriented (#000-mixed) gradients to clean light surfaces. */
+[data-theme="light"] .stat-card{background:var(--bg2);}
+[data-theme="light"] .bts-tile,
+[data-theme="light"] .bts-access-bar,
+[data-theme="light"] .bts-chip{background:var(--bg);}
+[data-theme="light"] .card-head{background:linear-gradient(180deg,var(--bg3),transparent);}
+
+/* Premium texture: a faint dot-grid + soft brand glows show through the gutters. */
+[data-theme="light"] body{
+  background:
+    radial-gradient(circle at 1px 1px, rgba(30,45,70,0.05) 1px, transparent 0) 0 0/22px 22px,
+    radial-gradient(1100px 560px at 84% -12%, rgba(0,135,106,0.06), transparent 60%),
+    radial-gradient(1000px 680px at -8% 110%, rgba(21,101,192,0.06), transparent 55%),
+    var(--bg);
+}
+
+/* Readability + density — desktop/tablet only. Type scales with --ts (eye control). */
+@media (min-width:701px){
+  body{font-size:calc(15px * var(--ts));}
+
+  #content{padding:18px;}
+  .stat-grid{gap:12px;margin-bottom:14px;}
+  .stat-card{padding:13px 16px;}
+  .stat-value{font-size:calc(26px * var(--ts));}
+  .stat-label{font-size:calc(12px * var(--ts));font-weight:var(--wt-quiet);}
+  .stat-sub{font-size:calc(11.5px * var(--ts));}
+  .card{margin-bottom:12px;}
+  .card-head{padding-top:11px;padding-bottom:11px;}
+  .card-title{font-size:calc(13px * var(--ts));letter-spacing:0.07em;font-weight:var(--wt-quiet);}
+
+  .nav-item{font-size:calc(14px * var(--ts));}
+  .nav-section-label{font-size:calc(10px * var(--ts));font-weight:var(--wt-quiet);}
+
+  thead th{font-size:calc(11px * var(--ts));font-weight:var(--wt-quiet);}
+  tbody td{font-size:calc(14px * var(--ts));padding:9px 14px;}
+  .badge{font-size:calc(10.5px * var(--ts));}
+  .btn,.btn-sm{font-size:calc(11.5px * var(--ts));}
+
+  .bts-grid{gap:9px;padding:13px 16px;}
+  .bts-tile-label{font-size:calc(10px * var(--ts));font-weight:var(--wt-quiet);}
+  .bts-tile-value{font-size:calc(17px * var(--ts));}
+  .bts-access-bar{margin:0 16px 13px;padding:11px 14px;}
+  .bts-access-title{font-size:calc(13px * var(--ts));}
+
+  .ts-grid{padding:13px 16px;gap:9px;}
+
+  .info-key{font-size:calc(12px * var(--ts));font-weight:var(--wt-quiet);}
+  .info-val{font-size:calc(13px * var(--ts));}
+
+  .rf-metric-label{font-size:calc(10px * var(--ts));font-weight:var(--wt-quiet);}
+  .rf-metric-value{font-size:calc(16px * var(--ts));}
+  .rf-qmetric-label{font-size:calc(10px * var(--ts));}
+  .rf-qmetric-value{font-size:calc(15px * var(--ts));}
+
+  .log-wrap{font-size:calc(12px * var(--ts));line-height:1.75;}
+  .topbar-title{font-size:calc(17px * var(--ts));}
+
+  /* sidebar hardware-status readout (Piece B) scales with the same knob */
+  .hw-val{font-size:calc(11px * var(--ts));}
+}
+/* Clamp the scale on phones so Ultra never blows out the <=700px layout. */
+@media (max-width:700px){
+  html[data-uisize="h"]{ --ts:1.16; }
+  html[data-uisize="u"]{ --ts:1.28; }
+}
 </style>
 </head>
 <body>
@@ -1165,10 +1679,43 @@ tbody td{transition:background .12s ease;}
 <!-- ── Sidebar ── -->
 <nav id="sidebar">
   <div class="sidebar-logo">
-    <div class="logo-icon">FS</div>
-    <div class="logo-text">
-      <div class="logo-name">FlowStation</div>
-      <div class="logo-sub">{{STACK_VERSION}}</div>
+    <div class="logo-row">
+      <div class="logo-icon">FS</div>
+      <div class="logo-text">
+        <div class="logo-name">FlowStation</div>
+        <div class="logo-sub">{{STACK_VERSION}}</div>
+      </div>
+    </div>
+    <!-- Hardware status — driven by the SAME JS as the old topbar badges (IDs preserved).
+         loadSystemInfo() toggles #sdr-badge + writes #sdr-badge-label;
+         handleSysHealth() toggles #pwr-badge + writes #pwr-badge-label. No JS changes. -->
+    <div class="hw-status">
+      <div id="sdr-badge" class="hw-row hw-row--sdr" style="display:none" title="Detected SDR hardware">
+        <span class="hw-glyph" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" stroke-linejoin="round">
+            <path d="M5 18a9 9 0 0 1 14 0"/><path d="M8 15a5 5 0 0 1 8 0"/>
+            <circle cx="12" cy="18" r="1.4" fill="currentColor" stroke="none"/>
+          </svg>
+        </span>
+        <span class="hw-meta">
+          <span class="hw-key" data-i18n="sdr">SDR</span>
+          <span class="hw-val" id="sdr-badge-label">—</span>
+        </span>
+        <span class="hw-live" aria-hidden="true"><span class="hw-live-dot"></span></span>
+      </div>
+      <div id="pwr-badge" class="hw-row hw-row--pwr" style="display:none" title="Host system power draw">
+        <span class="hw-glyph" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" stroke-linejoin="round">
+            <path d="M13 2 4 14h7l-1 8 9-12h-7l1-8Z"/>
+          </svg>
+        </span>
+        <span class="hw-meta">
+          <span class="hw-key" data-i18n="power">POWER</span>
+          <span class="hw-val" id="pwr-badge-label">—</span>
+        </span>
+      </div>
     </div>
   </div>
   <div id="update-badge" class="update-badge"
@@ -1195,6 +1742,10 @@ tbody td{transition:background .12s ease;}
       <span class="nav-icon">📋</span>
       <span class="nav-label" data-i18n="log">LOG</span>
     </div>
+    <div class="nav-item" onclick="showPage('sdslog',this)" id="nav-sdslog">
+      <span class="nav-icon">✉</span>
+      <span class="nav-label" data-i18n="sdslog">SDS LOG</span>
+    </div>
     <div class="nav-item" onclick="showPage('rf',this)" id="nav-rf">
       <span class="nav-icon">⚡</span>
       <span class="nav-label" data-i18n="rf">RF</span>
@@ -1204,6 +1755,10 @@ tbody td{transition:background .12s ease;}
     <div class="nav-item" onclick="showPage('config',this)" id="nav-config">
       <span class="nav-icon">⚙</span>
       <span class="nav-label" data-i18n="config">CONFIG</span>
+    </div>
+    <div class="nav-item" onclick="showPage('telegram',this)" id="nav-telegram">
+      <span class="nav-icon">✈</span>
+      <span class="nav-label" data-i18n="telegram">Telegram</span>
     </div>
     <!-- WiFi tab is hidden until we confirm NetworkManager is available on
          the host. The probe runs once at dashboard boot via /api/wifi/available
@@ -1253,27 +1808,62 @@ tbody td{transition:background .12s ease;}
     <button id="sidebar-toggle-btn" onclick="openMobileSidebar()">☰</button>
     <div class="topbar-title" id="topbar-title">Radios</div>
 
-    <!-- SDR hardware badge — auto-detected at stack startup. Hidden until populated. -->
-    <div id="sdr-badge" class="sdr-badge" style="display:none" title="Detected SDR hardware">
-      <span class="sdr-badge-dot"></span>
-      <span class="sdr-badge-label" id="sdr-badge-label">—</span>
-    </div>
-
-    <!-- Host power-draw badge — populated from /sys via sys_telemetry. Stays hidden
-         when no power-capable sensor is found (e.g. non-Pi, non-x86 hosts). -->
-    <div id="pwr-badge" class="pwr-badge" style="display:none" title="Host system power draw">
-      <span class="pwr-badge-icon">⚡</span>
-      <span class="pwr-badge-label" id="pwr-badge-label">—</span>
-    </div>
-
     <div class="topbar-right">
+      <!-- Readability: opens an Apple-style level popover (Small/Medium/High/Ultra). -->
+      <div class="eye-wrap">
+        <button class="eye-btn" id="read-btn" onclick="toggleReadPop(event)"
+                title="Text size &amp; contrast" aria-haspopup="true" aria-expanded="false" aria-label="Readability">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/>
+            <circle cx="12" cy="12" r="3"/>
+          </svg>
+        </button>
+        <div class="read-pop" id="read-pop" role="menu" aria-label="Text size">
+          <div class="read-pop-title" data-i18n="readability">READABILITY</div>
+          <button class="read-opt" data-size="s" role="menuitemradio" onclick="setUiSize('s')">
+            <span class="read-aa">Aa</span>
+            <span class="read-opt-text">
+              <span class="read-opt-name" data-i18n="size_small">Small</span>
+              <span class="read-opt-desc" data-i18n="size_small_d">Compact · normal contrast</span>
+            </span>
+            <svg class="read-check" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
+          </button>
+          <button class="read-opt" data-size="m" role="menuitemradio" onclick="setUiSize('m')">
+            <span class="read-aa">Aa</span>
+            <span class="read-opt-text">
+              <span class="read-opt-name" data-i18n="size_medium">Medium</span>
+              <span class="read-opt-desc" data-i18n="size_medium_d">Default · comfortable</span>
+            </span>
+            <svg class="read-check" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
+          </button>
+          <button class="read-opt" data-size="h" role="menuitemradio" onclick="setUiSize('h')">
+            <span class="read-aa">Aa</span>
+            <span class="read-opt-text">
+              <span class="read-opt-name" data-i18n="size_high">High</span>
+              <span class="read-opt-desc" data-i18n="size_high_d">Larger · stronger contrast</span>
+            </span>
+            <svg class="read-check" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
+          </button>
+          <button class="read-opt" data-size="u" role="menuitemradio" onclick="setUiSize('u')">
+            <span class="read-aa">Aa</span>
+            <span class="read-opt-text">
+              <span class="read-opt-name" data-i18n="size_ultra">Ultra</span>
+              <span class="read-opt-desc" data-i18n="size_ultra_d">Largest · maximum contrast</span>
+            </span>
+            <svg class="read-check" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
+          </button>
+        </div>
+      </div>
       <div class="theme-picker">
-        <button class="theme-btn active" data-t="dark" onclick="setTheme('dark',this)">Dark</button>
-        <button class="theme-btn" data-t="light" onclick="setTheme('light',this)">Light</button>
+        <button class="theme-btn" data-t="dark" onclick="setTheme('dark',this)">Dark</button>
+        <button class="theme-btn active" data-t="light" onclick="setTheme('light',this)">Light</button>
         <button class="theme-btn" data-t="blue" onclick="setTheme('blue',this)">Blue</button>
       </div>
-      <!-- Touchscreen-mode toggle (FH-FEAT-008). Distinct class from .theme-btn. -->
-      <button class="touch-btn" id="touch-toggle" onclick="toggleTouchMode()" title="Touchscreen mode">Touch</button>
       <div class="lang-picker">
         <button class="lang-btn active" onclick="setLang('en',this)">EN</button>
         <button class="lang-btn" onclick="setLang('ro',this)">RO</button>
@@ -1360,6 +1950,37 @@ tbody td{transition:background .12s ease;}
           <div class="stat-icon">🔗</div>
         </div>
       </div>
+      <!-- TETRA BTS Details — static cell + RF identity from config.toml -->
+      <div class="card">
+        <div class="card-head">
+          <div class="card-title" data-i18n="bts_details">TETRA BTS Details</div>
+          <div class="card-actions">
+            <span id="bts-neighbor" class="bts-chip">—</span>
+            <span id="bts-hang" class="bts-chip">—</span>
+          </div>
+        </div>
+        <div class="bts-grid">
+          <div class="bts-tile"><div class="bts-tile-label" data-i18n="bts_tx">TX Freq</div><div class="bts-tile-value tx" id="bts-tx">—</div></div>
+          <div class="bts-tile"><div class="bts-tile-label" data-i18n="bts_rx">RX Freq</div><div class="bts-tile-value rx" id="bts-rx">—</div></div>
+          <div class="bts-tile"><div class="bts-tile-label" data-i18n="bts_shift">Duplex Shift</div><div class="bts-tile-value" id="bts-shift">—</div></div>
+          <div class="bts-tile"><div class="bts-tile-label">MCC</div><div class="bts-tile-value" id="bts-mcc">—</div></div>
+          <div class="bts-tile"><div class="bts-tile-label">MNC</div><div class="bts-tile-value" id="bts-mnc">—</div></div>
+          <div class="bts-tile"><div class="bts-tile-label" data-i18n="bts_carrier">Main Carrier</div><div class="bts-tile-value" id="bts-carrier">—</div></div>
+        </div>
+        <div class="bts-access-bar">
+          <div class="bts-access-info">
+            <span class="bts-access-icon">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 4 5v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V5z"/><path d="M9 12l2 2 4-4"/></svg>
+            </span>
+            <div>
+              <div class="bts-access-title" data-i18n="bts_access">Registration Access</div>
+              <div class="bts-access-sub" id="bts-access-sub">—</div>
+            </div>
+          </div>
+          <span id="bts-access" class="bts-access">—</span>
+        </div>
+      </div>
+
       <!-- TS Visualizer -->
       <div class="card">
         <div class="card-head">
@@ -1379,12 +2000,13 @@ tbody td{transition:background .12s ease;}
               <div class="ts-wave-bar" style="height:6px"></div>
             </div>
             <div class="ts-label">MCCH</div>
-            <div class="ts-sub">Control</div>
+            <div class="ts-sub">ACTIVE</div>
             <div class="ts-flash"></div>
             <div class="ts-duration-bar"></div>
           </div>
           <div class="ts-block" id="ts-block-2">
             <div class="ts-num">TS 2</div>
+            <div class="ts-timer"></div>
             <div class="ts-led"></div>
             <div class="ts-wave">
               <div class="ts-wave-bar" style="height:3px"></div>
@@ -1402,6 +2024,7 @@ tbody td{transition:background .12s ease;}
           </div>
           <div class="ts-block" id="ts-block-3">
             <div class="ts-num">TS 3</div>
+            <div class="ts-timer"></div>
             <div class="ts-led"></div>
             <div class="ts-wave">
               <div class="ts-wave-bar" style="height:3px"></div>
@@ -1419,6 +2042,7 @@ tbody td{transition:background .12s ease;}
           </div>
           <div class="ts-block" id="ts-block-4">
             <div class="ts-num">TS 4</div>
+            <div class="ts-timer"></div>
             <div class="ts-led"></div>
             <div class="ts-wave">
               <div class="ts-wave-bar" style="height:3px"></div>
@@ -1446,9 +2070,9 @@ tbody td{transition:background .12s ease;}
           <div class="table-wrap">
             <table>
               <thead><tr>
-                <th data-i18n="th_issi">ISSI</th>
+                <th data-i18n="th_issi_cs">ISSI / Callsign</th>
                 <th data-i18n="th_groups">Groups</th>
-                <th class="col-mobile-hide" data-i18n="th_ee">EE</th>
+                <th class="col-mobile-hide" data-i18n="th_ee">Energy Economy</th>
                 <th data-i18n="th_signal">Signal</th>
                 <th data-i18n="th_status">Status</th>
                 <th class="col-mobile-hide" data-i18n="th_last_seen">Last seen</th>
@@ -1528,8 +2152,38 @@ tbody td{transition:background .12s ease;}
             <input type="checkbox" id="log-autoscroll" checked>
             <span data-i18n="autoscroll">Auto-scroll</span>
           </label>
-          <div style="margin-left:auto">
+          <div style="margin-left:auto;display:flex;gap:6px">
+            <button class="btn btn-sm" onclick="exportLog()" data-i18n="export">⤓ Export</button>
             <button class="btn btn-sm" onclick="clearLog()" data-i18n="clear">Clear</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── SDS LOG ── -->
+    <!-- SDS messages sent/received locally on this BS. Backed by a persisted ring
+         (sds_log.json) so the history survives restarts. Populated live over the WS
+         and refetched from /api/sds-log when the tab opens. -->
+    <div class="page" id="page-sdslog">
+      <div class="card">
+        <div class="card-head">
+          <div class="card-title" data-i18n="sdslog">SDS Log</div>
+          <div class="card-actions">
+            <button class="btn btn-sm" onclick="loadSdsLog()" data-i18n="sds_refresh">⟳ Refresh</button>
+          </div>
+        </div>
+        <div class="card-body">
+          <div class="table-wrap">
+            <table>
+              <thead><tr>
+                <th data-i18n="th_time">Time</th>
+                <th data-i18n="th_dir">Dir</th>
+                <th data-i18n="th_from">From</th>
+                <th data-i18n="th_to">To</th>
+                <th data-i18n="th_message">Message</th>
+              </tr></thead>
+              <tbody id="sdslog-tbody"></tbody>
+            </table>
           </div>
         </div>
       </div>
@@ -1618,21 +2272,6 @@ tbody td{transition:background .12s ease;}
             <div class="rf-qmetric-label" data-i18n="rf_obw">Occupied BW (99%)</div>
             <div class="rf-qmetric-value" id="rf-obw">—</div>
             <div class="rf-qmetric-bar"><div class="rf-qmetric-fill" id="rf-obw-bar"></div></div>
-          </div>
-          <div class="rf-qmetric" id="rf-q-dc-wrap">
-            <div class="rf-qmetric-label" data-i18n="rf_dc">DC offset (I/Q)</div>
-            <div class="rf-qmetric-value" id="rf-dc">—</div>
-            <div class="rf-qmetric-bar"><div class="rf-qmetric-fill" id="rf-dc-bar"></div></div>
-          </div>
-          <div class="rf-qmetric" id="rf-q-iqa-wrap">
-            <div class="rf-qmetric-label" data-i18n="rf_iqa">IQ amplitude imbalance</div>
-            <div class="rf-qmetric-value" id="rf-iqa">—</div>
-            <div class="rf-qmetric-bar"><div class="rf-qmetric-fill" id="rf-iqa-bar"></div></div>
-          </div>
-          <div class="rf-qmetric" id="rf-q-iqp-wrap">
-            <div class="rf-qmetric-label" data-i18n="rf_iqp">IQ phase imbalance</div>
-            <div class="rf-qmetric-value" id="rf-iqp">—</div>
-            <div class="rf-qmetric-bar"><div class="rf-qmetric-fill" id="rf-iqp-bar"></div></div>
           </div>
         </div>
       </div>
@@ -1728,12 +2367,12 @@ tbody td{transition:background .12s ease;}
             ISSI or talkgroup at a set interval. Data from aviationweather.gov.
           </div>
 
-          <label style="display:flex;align-items:center;gap:10px;margin-bottom:14px;cursor:pointer">
-            <input type="checkbox" id="wx-enabled" style="width:18px;height:18px">
-            <span data-i18n="wx_enabled">Enable on-demand METAR responder</span>
+          <label class="sw-row">
+            <span class="sw-text" data-i18n="wx_enabled">Enable on-demand METAR responder</span>
+            <span class="sw"><input type="checkbox" id="wx-enabled"><i></i></span>
           </label>
 
-          <div style="display:flex;gap:8px;align-items:center;margin-bottom:18px;flex-wrap:wrap">
+          <div style="display:flex;gap:8px;align-items:center;margin:12px 0 18px;flex-wrap:wrap">
             <label style="color:var(--muted);font-size:13px;min-width:140px" data-i18n="wx_service_issi">Service ISSI</label>
             <input type="number" id="wx-service-issi" class="form-input" min="1" max="16777215"
                    placeholder="9998" style="flex:1;min-width:140px">
@@ -1741,9 +2380,9 @@ tbody td{transition:background .12s ease;}
 
           <hr style="border:none;border-top:1px solid var(--border);margin:14px 0">
 
-          <label style="display:flex;align-items:center;gap:10px;margin-bottom:14px;cursor:pointer">
-            <input type="checkbox" id="wx-periodic-enabled" style="width:18px;height:18px">
-            <span data-i18n="wx_periodic_enabled">Enable periodic auto-broadcast</span>
+          <label class="sw-row" style="margin-bottom:8px">
+            <span class="sw-text" data-i18n="wx_periodic_enabled">Enable periodic auto-broadcast</span>
+            <span class="sw"><input type="checkbox" id="wx-periodic-enabled"><i></i></span>
           </label>
 
           <div style="display:grid;grid-template-columns:140px 1fr;gap:10px;align-items:center">
@@ -1754,8 +2393,8 @@ tbody td{transition:background .12s ease;}
             <input type="number" id="wx-periodic-issi" class="form-input" min="1" max="16777215" placeholder="ISSI or GSSI">
 
             <label style="color:var(--muted);font-size:13px" data-i18n="wx_periodic_isgroup">Destination is group</label>
-            <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
-              <input type="checkbox" id="wx-periodic-isgroup" style="width:18px;height:18px">
+            <label style="display:flex;align-items:center;gap:10px;cursor:pointer">
+              <span class="sw"><input type="checkbox" id="wx-periodic-isgroup"><i></i></span>
               <span style="color:var(--muted);font-size:12px" data-i18n="wx_periodic_isgroup_hint">(GSSI instead of individual ISSI)</span>
             </label>
 
@@ -1764,6 +2403,89 @@ tbody td{transition:background .12s ease;}
           </div>
           <div style="color:var(--muted);font-size:11px;margin-top:6px" data-i18n="wx_interval_hint">Minimum 300 s (5 min) to avoid hammering the weather API.</div>
           <div class="config-msg" id="wx-msg"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── TELEGRAM ALERTS ──
+         Owner-facing push notifications via a Telegram bot. The owner pastes their
+         @BotFather token, detects their chat ID with one click (getUpdates), picks
+         which categories to receive, and saves. Applies instantly and persists to
+         config.toml. -->
+    <div class="page" id="page-telegram">
+      <div class="card">
+        <div class="card-head">
+          <div class="card-title" data-i18n="tg_title">Telegram Alerts</div>
+          <div class="card-actions">
+            <button class="btn" onclick="testTelegram()" data-i18n="tg_test">Send test</button>
+            <button class="btn btn-primary" onclick="saveTelegram()" data-i18n="save">Save</button>
+          </div>
+        </div>
+        <div class="card-body">
+          <div class="help-text" style="margin-bottom:6px" data-i18n="tg_help">
+            Get instant Telegram messages when something happens on the station.
+          </div>
+          <label class="sw-row">
+            <span class="sw-text" data-i18n="tg_enabled">Enable Telegram alerts</span>
+            <span class="sw"><input type="checkbox" id="tg-enabled"><i></i></span>
+          </label>
+          <div class="config-msg" id="tg-msg"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><div class="card-title" data-i18n="tg_howto_title">Setup — 4 steps</div></div>
+        <div class="card-body" style="color:var(--muted);font-size:13px;line-height:1.7">
+          <div data-i18n="tg_step1">1. In Telegram, open @BotFather, send /newbot and copy the bot token.</div>
+          <div data-i18n="tg_step2">2. Paste the token below and click Verify.</div>
+          <div data-i18n="tg_step3">3. Send your bot any message, e.g. /start.</div>
+          <div data-i18n="tg_step4">4. Click Detect Chat ID, add your chat, then Save.</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><div class="card-title" data-i18n="tg_bot_title">Bot token</div></div>
+        <div class="card-body">
+          <div style="color:var(--muted);font-size:13px;margin-bottom:12px" data-i18n="tg_bot_help">
+            The token from @BotFather looks like 123456789:AAExampleTokenString.
+          </div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <input type="text" id="tg-token" class="form-input" placeholder="123456789:AA…"
+                   autocomplete="off" spellcheck="false" oninput="tgTokenDirty=true"
+                   style="flex:1;min-width:220px">
+            <button class="btn" onclick="verifyTelegram()" data-i18n="tg_verify">Verify</button>
+          </div>
+          <div id="tg-verify-status" style="margin-top:8px;font-size:13px;min-height:18px"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><div class="card-title" data-i18n="tg_recipients_title">Recipients (Chat IDs)</div></div>
+        <div class="card-body">
+          <div style="color:var(--muted);font-size:13px;margin-bottom:12px" data-i18n="tg_recipients_help">
+            Every alert is sent to each recipient.
+          </div>
+          <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">
+            <button class="btn" onclick="detectTelegramChats()" data-i18n="tg_detect">📥 Detect Chat ID</button>
+            <input type="number" id="tg-chat-input" class="form-input" placeholder="-1001234567890"
+                   style="flex:1;min-width:180px" onkeydown="if(event.key==='Enter'){addRecipient();}">
+            <button class="btn" onclick="addRecipient()" data-i18n="tg_add">+ Add</button>
+          </div>
+          <div id="tg-detected" style="margin-bottom:10px"></div>
+          <div id="tg-chips" style="display:flex;gap:8px;flex-wrap:wrap;min-height:32px"></div>
+          <div class="config-msg" id="tg-recipients-msg"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><div class="card-title" data-i18n="tg_categories_title">Alert categories</div></div>
+        <div class="card-body" style="padding-top:4px;padding-bottom:4px">
+          <label class="sw-row"><span class="sw-text" data-i18n="tg_cat_connect">Radio connected</span><span class="sw"><input type="checkbox" id="tg-connect"><i></i></span></label>
+          <label class="sw-row"><span class="sw-text" data-i18n="tg_cat_disconnect">Radio disconnected</span><span class="sw"><input type="checkbox" id="tg-disconnect"><i></i></span></label>
+          <label class="sw-row"><span class="sw-text" data-i18n="tg_cat_t351">Radio dropped (no T351 response)</span><span class="sw"><input type="checkbox" id="tg-t351"><i></i></span></label>
+          <label class="sw-row"><span class="sw-text" data-i18n="tg_cat_lip">LIP/APRS position beacon</span><span class="sw"><input type="checkbox" id="tg-lip"><i></i></span></label>
+          <label class="sw-row"><span class="sw-text" data-i18n="tg_cat_backhaul">Brew backhaul up/down</span><span class="sw"><input type="checkbox" id="tg-backhaul"><i></i></span></label>
+          <label class="sw-row"><span class="sw-text" data-i18n="tg_cat_logs">Critical log (warnings/errors)</span><span class="sw"><input type="checkbox" id="tg-logs"><i></i></span></label>
         </div>
       </div>
     </div>
@@ -2069,6 +2791,7 @@ const LANGS={
     bts_ip:'BTS IP',offline:'OFFLINE',online:'ONLINE',
     brew_online:'ONLINE',brew_offline:'OFFLINE',
     stations:'Radios',calls:'Calls',lastheard:'Last Heard',log:'Log',rf:'RF',config:'Config',
+    sdslog:'SDS Log',th_dir:'Dir',th_from:'From',th_to:'To',th_message:'Message',no_sds:'No SDS messages yet',sds_refresh:'⟳ Refresh',
     rf_freq:'Center freq',rf_rate:'Sample rate',rf_rms:'RMS',rf_peak:'Peak',rf_age:'Snapshot',
     rf_waiting:'waiting…',rf_live:'live',rf_stale:'stale',
     rf_spectrum:'TX DSP Spectrum (pre-PA)',rf_constellation:'TX DSP Constellation',
@@ -2085,9 +2808,13 @@ const LANGS={
     terminals:'Radios',registered:'registered',
     active_calls:'Active Calls',circuits:'circuits in use',
     registered_terminals:'Registered Radios',
+    bts_details:'TETRA BTS Details',bts_tx:'TX Freq',bts_rx:'RX Freq',bts_shift:'Duplex Shift',bts_rate:'Sample Rate',
+    bts_la:'Location Area',bts_cc:'Colour Code',bts_carrier:'Main Carrier',bts_band:'Band',
+    bts_access:'Registration Access',bts_wl_entries:'whitelisted ISSI',bts_wl_open:'Open — all ISSI may register',
+    readability:'Readability',size_small:'Small',size_small_d:'Compact · normal contrast',size_medium:'Medium',size_medium_d:'Default · comfortable',size_high:'High',size_high_d:'Larger · stronger contrast',size_ultra:'Ultra',size_ultra_d:'Largest · maximum contrast',sdr:'SDR',power:'Power',
     no_terminals:'No radios registered',no_calls:'No active calls',
     live_log:'Live Log',autoscroll:'Auto-scroll',filter_all:'All',
-    clear:'Clear',restart:'⟳ Restart',shutdown:'⏻ Shutdown',save:'Save',
+    clear:'Clear',export:'⤓ Export',restart:'⟳ Restart',shutdown:'⏻ Shutdown',save:'Save',
     whitelist_title:'ISSI Whitelist',whitelist_add:'+ Add ISSI',whitelist_empty:'List empty — open network (any radio may register).',
     whitelist_help:'When the list is empty, any radio may register (open network). When non-empty, only the listed ISSIs are accepted; all others are rejected. Changes apply instantly and persist across restarts.',
     whitelist_enforced:'ENFORCED',whitelist_open:'OPEN',whitelist_invalid:'Enter a valid ISSI (1–16777215).',
@@ -2102,7 +2829,7 @@ const LANGS={
     live_sds_sent:'sent',live_sds_times:'×',live_sds_forever:'∞',live_sds_delete:'✕',
     fallback_title:'⚠ FALLBACK CONFIG ACTIVE — Primary config failed to load',
     sds_msg_label:'Message',cancel:'Cancel',send:'Send',
-    th_issi:'ISSI',th_groups:'Groups',th_ee:'EE',th_signal:'Signal',
+    th_issi:'ISSI',th_issi_cs:'ISSI / Callsign',th_groups:'Groups',th_ee:'Energy Economy',th_signal:'Signal',
     tg_selected:'Selected talkgroup (last keyed up)',
     tg_affiliated_short:'affiliated',tg_affiliated_hint:'Other talkgroups this radio is affiliated to (kept attached on the BS even when scan is off on the device)',
     th_status:'Status',th_last_seen:'Last seen',th_actions:'Actions',
@@ -2135,11 +2862,34 @@ const LANGS={
     sys_active_badge:'ACTIVE',sys_no_profiles:'No .toml profiles found in config directory.',
     sys_activate_confirm:'Switch to profile "{name}" and restart?\nCurrent config will be backed up.',
     sys_bts:'BTS Connection',
+    telegram:'Telegram',tg_title:'Telegram Alerts',
+    tg_help:'Get instant Telegram messages when something happens on the station — a radio attaches or drops, the backhaul goes up or down, a position beacon arrives, or the stack logs a warning/error.',
+    tg_enabled:'Enable Telegram alerts',
+    tg_test:'Send test',tg_testing:'Sending test…',tg_test_ok:'✓ Test sent to {n} chat(s)',
+    tg_howto_title:'Setup — 4 steps',
+    tg_step1:'1. In Telegram, open @BotFather, send /newbot and follow the prompts. Copy the bot token it gives you.',
+    tg_step2:'2. Paste the token below and click Verify — you should see your bot\'s @username.',
+    tg_step3:'3. Open a chat with your new bot (or add it to a group) and send it any message, e.g. /start.',
+    tg_step4:'4. Click "Detect Chat ID", add your chat to the recipients, then Save. Use "Send test" to confirm.',
+    tg_bot_title:'Bot token',
+    tg_bot_help:'The token from @BotFather looks like 123456789:AAExampleTokenString. It is stored masked and never shown in full again.',
+    tg_verify:'Verify',tg_verifying:'Verifying…',
+    tg_recipients_title:'Recipients (Chat IDs)',
+    tg_recipients_help:'Every alert is sent to each recipient. A positive ID is a private chat; a negative ID is a group or channel.',
+    tg_detect:'📥 Detect Chat ID',tg_detecting:'Reading recent messages…',
+    tg_detect_none:'No recent messages found. Send your bot a message first, then try again.',
+    tg_detect_found:'Chats that messaged your bot — click Add:',
+    tg_add:'Add',tg_no_recipients:'No recipients yet.',tg_invalid_chat:'Enter a valid Chat ID.',
+    tg_categories_title:'Alert categories',
+    tg_cat_connect:'🟢 Radio connected',tg_cat_disconnect:'🔴 Radio disconnected',
+    tg_cat_t351:'📴 Radio dropped (no T351 response)',tg_cat_lip:'📍 LIP/APRS position beacon',
+    tg_cat_backhaul:'🛰 Brew backhaul up/down',tg_cat_logs:'🚨 Critical log (warnings/errors)',
   },
   ro:{
     bts_ip:'IP BTS',offline:'DECONECTAT',online:'CONECTAT',
     brew_online:'ONLINE',brew_offline:'OFFLINE',
     stations:'Radiouri',calls:'Apeluri',lastheard:'Ultima Activitate',log:'Log',rf:'RF',config:'Config',
+    sdslog:'Jurnal SDS',th_dir:'Dir',th_from:'De la',th_to:'Către',th_message:'Mesaj',no_sds:'Niciun mesaj SDS încă',sds_refresh:'⟳ Reîmprospătează',
     rf_freq:'Frecvență centru',rf_rate:'Rată eșantion',rf_rms:'RMS',rf_peak:'Vârf',rf_age:'Captură',
     rf_waiting:'în așteptare…',rf_live:'live',rf_stale:'expirat',
     rf_spectrum:'Spectru TX DSP (pre-PA)',rf_constellation:'Constelație TX DSP',
@@ -2156,9 +2906,13 @@ const LANGS={
     terminals:'Radiouri',registered:'înregistrate',
     active_calls:'Apeluri Active',circuits:'circuite active',
     registered_terminals:'Radiouri Înregistrate',
+    bts_details:'Detalii BTS TETRA',bts_tx:'Frecvență TX',bts_rx:'Frecvență RX',bts_shift:'Decalaj Duplex',bts_rate:'Rată Eșantionare',
+    bts_la:'Zonă (LA)',bts_cc:'Cod Culoare',bts_carrier:'Purtătoare Princ.',bts_band:'Bandă',
+    bts_access:'Acces Înregistrare',bts_wl_entries:'ISSI permise',bts_wl_open:'Deschis — orice ISSI se poate înregistra',
+    readability:'Lizibilitate',size_small:'Mic',size_small_d:'Compact · contrast normal',size_medium:'Mediu',size_medium_d:'Implicit · confortabil',size_high:'Mare',size_high_d:'Mai mare · contrast sporit',size_ultra:'Ultra',size_ultra_d:'Cel mai mare · contrast maxim',sdr:'SDR',power:'Consum',
     no_terminals:'Niciun radio înregistrat',no_calls:'Niciun apel activ',
     live_log:'Log Live',autoscroll:'Auto-scroll',filter_all:'Toate',
-    clear:'Șterge',restart:'⟳ Repornire',shutdown:'⏻ Oprire',save:'Salvează',
+    clear:'Șterge',export:'⤓ Export',restart:'⟳ Repornire',shutdown:'⏻ Oprire',save:'Salvează',
     whitelist_title:'Listă albă ISSI',whitelist_add:'+ Adaugă ISSI',whitelist_empty:'Listă goală — rețea deschisă (orice radio se poate înregistra).',
     whitelist_help:'Când lista e goală, orice radio se poate înregistra (rețea deschisă). Când are intrări, doar ISSI-urile listate sunt acceptate; restul sunt respinse. Modificările se aplică instant și persistă după repornire.',
     whitelist_enforced:'ACTIVĂ',whitelist_open:'DESCHISĂ',whitelist_invalid:'Introdu un ISSI valid (1–16777215).',
@@ -2173,7 +2927,7 @@ const LANGS={
     fallback_title:'⚠ CONFIG DE REZERVĂ ACTIV — Config principal nu a putut fi încărcat',
     sds_title:'⬡ Trimite Mesaj SDS',sds_dest:'ISSI Destinatar',
     sds_msg_label:'Mesaj',cancel:'Anulează',send:'Trimite',
-    th_issi:'ISSI',th_groups:'Grupuri',th_ee:'EE',th_signal:'Semnal',
+    th_issi:'ISSI',th_issi_cs:'ISSI / Indicativ',th_groups:'Grupuri',th_ee:'Economie Energie',th_signal:'Semnal',
     tg_selected:'Grup selectat (ultima transmisie)',
     tg_affiliated_short:'afiliate',tg_affiliated_hint:'Alte grupuri la care radio-ul este afiliat (rămân atașate la BS chiar și când scan e oprit din statie)',
     th_status:'Status',th_last_seen:'Văzut',th_actions:'Acțiuni',
@@ -2205,11 +2959,34 @@ const LANGS={
     sys_active_badge:'ACTIV',sys_no_profiles:'Niciun profil .toml găsit în directorul config.',
     sys_activate_confirm:'Comutare la profilul "{name}" și repornire?\nConfig-ul curent va fi salvat.',
     sys_bts:'Conexiune BTS',
+    telegram:'Telegram',tg_title:'Alerte Telegram',
+    tg_help:'Primește mesaje Telegram instant când se întâmplă ceva pe stație — un radio se conectează sau cade, backhaul-ul urcă/coboară, sosește o baliză de poziție, sau stack-ul logează un avertisment/eroare.',
+    tg_enabled:'Activează alertele Telegram',
+    tg_test:'Trimite test',tg_testing:'Se trimite testul…',tg_test_ok:'✓ Test trimis către {n} conversație(i)',
+    tg_howto_title:'Configurare — 4 pași',
+    tg_step1:'1. În Telegram, deschide @BotFather, trimite /newbot și urmează pașii. Copiază token-ul botului.',
+    tg_step2:'2. Lipește token-ul mai jos și apasă Verifică — ar trebui să vezi @username-ul botului tău.',
+    tg_step3:'3. Deschide o conversație cu botul (sau adaugă-l într-un grup) și trimite-i orice mesaj, ex. /start.',
+    tg_step4:'4. Apasă „Detectează Chat ID", adaugă conversația la destinatari, apoi Salvează. Folosește „Trimite test" pentru confirmare.',
+    tg_bot_title:'Token bot',
+    tg_bot_help:'Token-ul de la @BotFather arată ca 123456789:AAExempluToken. Este stocat mascat și nu mai e afișat integral.',
+    tg_verify:'Verifică',tg_verifying:'Se verifică…',
+    tg_recipients_title:'Destinatari (Chat ID-uri)',
+    tg_recipients_help:'Fiecare alertă e trimisă către toți destinatarii. Un ID pozitiv e o conversație privată; unul negativ e un grup sau canal.',
+    tg_detect:'📥 Detectează Chat ID',tg_detecting:'Se citesc mesajele recente…',
+    tg_detect_none:'Niciun mesaj recent. Trimite întâi un mesaj botului, apoi încearcă din nou.',
+    tg_detect_found:'Conversații care au scris botului — apasă Adaugă:',
+    tg_add:'Adaugă',tg_no_recipients:'Niciun destinatar încă.',tg_invalid_chat:'Introdu un Chat ID valid.',
+    tg_categories_title:'Categorii de alerte',
+    tg_cat_connect:'🟢 Radio conectat',tg_cat_disconnect:'🔴 Radio deconectat',
+    tg_cat_t351:'📴 Radio căzut (fără răspuns T351)',tg_cat_lip:'📍 Baliză poziție LIP/APRS',
+    tg_cat_backhaul:'🛰 Backhaul Brew up/down',tg_cat_logs:'🚨 Log critic (avertismente/erori)',
   },
   de:{
     bts_ip:'BTS-IP',offline:'OFFLINE',online:'ONLINE',
     brew_online:'ONLINE',brew_offline:'OFFLINE',
     stations:'Radios',calls:'Anrufe',lastheard:'Zuletzt Gehört',log:'Log',rf:'RF',config:'Config',
+    sdslog:'SDS-Log',th_dir:'Ri.',th_from:'Von',th_to:'An',th_message:'Nachricht',no_sds:'Noch keine SDS-Nachrichten',sds_refresh:'⟳ Aktualisieren',
     rf_freq:'Mittenfrequenz',rf_rate:'Abtastrate',rf_rms:'RMS',rf_peak:'Spitze',rf_age:'Aufnahme',
     rf_waiting:'wartet…',rf_live:'live',rf_stale:'veraltet',
     rf_spectrum:'TX-DSP-Spektrum (vor PA)',rf_constellation:'TX-DSP-Konstellation',
@@ -2228,7 +3005,7 @@ const LANGS={
     registered_terminals:'Registrierte Radios',
     no_terminals:'Keine Radios registriert',no_calls:'Keine aktiven Anrufe',
     live_log:'Live-Log',autoscroll:'Auto-Scroll',filter_all:'Alle',
-    clear:'Löschen',restart:'⟳ Neustart',shutdown:'⏻ Herunterfahren',save:'Speichern',
+    clear:'Löschen',export:'⤓ Exportieren',restart:'⟳ Neustart',shutdown:'⏻ Herunterfahren',save:'Speichern',
     whitelist_title:'ISSI-Whitelist',whitelist_add:'+ ISSI hinzufügen',whitelist_empty:'Liste leer — offenes Netz (jedes Funkgerät darf sich anmelden).',
     whitelist_help:'Ist die Liste leer, darf sich jedes Funkgerät anmelden (offenes Netz). Bei Einträgen werden nur die gelisteten ISSIs akzeptiert; alle anderen werden abgewiesen. Änderungen wirken sofort und bleiben nach Neustart erhalten.',
     whitelist_enforced:'AKTIV',whitelist_open:'OFFEN',whitelist_invalid:'Gültige ISSI eingeben (1–16777215).',
@@ -2243,7 +3020,7 @@ const LANGS={
     fallback_title:'⚠ FALLBACK-KONFIGURATION AKTIV — Primäre Konfiguration konnte nicht geladen werden',
     sds_title:'⬡ SDS-Nachricht senden',sds_dest:'Ziel-ISSI',
     sds_msg_label:'Nachricht',cancel:'Abbrechen',send:'Senden',
-    th_issi:'ISSI',th_groups:'Gruppen',th_ee:'EE',th_signal:'Signal',
+    th_issi:'ISSI',th_groups:'Gruppen',th_ee:'Energiesparen',th_signal:'Signal',
     th_status:'Status',th_last_seen:'Zuletzt',th_actions:'Aktionen',
     th_id:'ID',th_type:'Typ',th_caller:'Anrufer',
     th_dest:'Ziel',th_speaker:'Sprecher',th_duration:'Dauer',
@@ -2278,6 +3055,7 @@ const LANGS={
     bts_ip:'IP BTS',offline:'SIN CONEXIÓN',online:'EN LÍNEA',
     brew_online:'EN LÍNEA',brew_offline:'SIN CONEXIÓN',
     stations:'Radios',calls:'Llamadas',lastheard:'Última Actividad',log:'Log',rf:'RF',config:'Config',
+    sdslog:'Registro SDS',th_dir:'Dir',th_from:'De',th_to:'Para',th_message:'Mensaje',no_sds:'Aún no hay mensajes SDS',sds_refresh:'⟳ Actualizar',
     rf_freq:'Frecuencia central',rf_rate:'Tasa de muestreo',rf_rms:'RMS',rf_peak:'Pico',rf_age:'Captura',
     rf_waiting:'esperando…',rf_live:'en vivo',rf_stale:'obsoleto',
     rf_spectrum:'Espectro TX DSP (pre-PA)',rf_constellation:'Constelación TX DSP',
@@ -2296,7 +3074,7 @@ const LANGS={
     registered_terminals:'Radios Registrados',
     no_terminals:'No hay radios registrados',no_calls:'No hay llamadas activas',
     live_log:'Log en Vivo',autoscroll:'Auto-desplaz.',filter_all:'Todos',
-    clear:'Limpiar',restart:'⟳ Reiniciar',shutdown:'⏻ Apagar',save:'Guardar',
+    clear:'Limpiar',export:'⤓ Exportar',restart:'⟳ Reiniciar',shutdown:'⏻ Apagar',save:'Guardar',
     whitelist_title:'Lista blanca ISSI',whitelist_add:'+ Añadir ISSI',whitelist_empty:'Lista vacía — red abierta (cualquier radio puede registrarse).',
     whitelist_help:'Cuando la lista está vacía, cualquier radio puede registrarse (red abierta). Con entradas, solo se aceptan los ISSI listados; el resto se rechazan. Los cambios se aplican al instante y persisten tras reiniciar.',
     whitelist_enforced:'ACTIVA',whitelist_open:'ABIERTA',whitelist_invalid:'Introduce un ISSI válido (1–16777215).',
@@ -2311,7 +3089,7 @@ const LANGS={
     fallback_title:'⚠ CONFIGURACIÓN DE RESERVA ACTIVA — No se pudo cargar la configuración principal',
     sds_title:'⬡ Enviar Mensaje SDS',sds_dest:'ISSI Destino',
     sds_msg_label:'Mensaje',cancel:'Cancelar',send:'Enviar',
-    th_issi:'ISSI',th_groups:'Grupos',th_ee:'EE',th_signal:'Señal',
+    th_issi:'ISSI',th_groups:'Grupos',th_ee:'Ahorro Energía',th_signal:'Señal',
     th_status:'Estado',th_last_seen:'Visto',th_actions:'Acciones',
     th_id:'ID',th_type:'Tipo',th_caller:'Llamante',
     th_dest:'Destino',th_speaker:'Hablante',th_duration:'Duración',
@@ -2346,6 +3124,7 @@ const LANGS={
     bts_ip:'BTS IP',offline:'OFFLINE',online:'ONLINE',
     brew_online:'ONLINE',brew_offline:'OFFLINE',
     stations:'Rádiók',calls:'Hívások',lastheard:'Utoljára Hallott',log:'Napló',rf:'RF',config:'Konfig',
+    sdslog:'SDS Napló',th_dir:'Irány',th_from:'Feladó',th_to:'Címzett',th_message:'Üzenet',no_sds:'Még nincs SDS üzenet',sds_refresh:'⟳ Frissítés',
     rf_freq:'Központi frekvencia',rf_rate:'Mintavételezési ráta',rf_rms:'RMS',rf_peak:'Csúcs',rf_age:'Pillanatkép',
     rf_waiting:'várakozás…',rf_live:'élő',rf_stale:'elavult',
     rf_spectrum:'TX DSP spektrum (PA előtt)',rf_constellation:'TX DSP konstelláció',
@@ -2364,7 +3143,7 @@ const LANGS={
     registered_terminals:'Regisztrált rádiók',
     no_terminals:'Nincs regisztrált rádió',no_calls:'Nincs aktív hívás',
     live_log:'Élő napló',autoscroll:'Automatikus görgetés',filter_all:'Mind',
-    clear:'Törlés',restart:'⟳ Újraindítás',shutdown:'⏻ Leállítás',save:'Mentés',
+    clear:'Törlés',export:'⤓ Exportálás',restart:'⟳ Újraindítás',shutdown:'⏻ Leállítás',save:'Mentés',
     whitelist_title:'ISSI engedélyezőlista',whitelist_add:'+ ISSI hozzáadása',whitelist_empty:'Üres lista — nyílt hálózat (bármely rádió regisztrálhat).',
     whitelist_help:'Ha a lista üres, bármely rádió regisztrálhat (nyílt hálózat). Ha vannak elemek, csak a listázott ISSI-k engedélyezettek; a többit elutasítja. A módosítások azonnal érvénybe lépnek és újraindítás után is megmaradnak.',
     whitelist_enforced:'AKTÍV',whitelist_open:'NYÍLT',whitelist_invalid:'Adjon meg érvényes ISSI-t (1–16777215).',
@@ -2374,7 +3153,7 @@ const LANGS={
     wx_periodic_interval:'Időköz (másodperc)',wx_interval_hint:'Legalább 300 mp (5 perc), hogy ne terhelje túl az időjárás API-t.',wx_periodic_incomplete:'Add meg az állomás ICAO-t és a célt az időszakos módhoz.',
     sds_title:'⬡ SDS üzenet küldése',sds_dest:'Cél ISSI',
     sds_msg_label:'Üzenet',cancel:'Mégse',send:'Küldés',
-    th_issi:'ISSI',th_groups:'Csoportok',th_ee:'EE',th_signal:'Jelerősség',
+    th_issi:'ISSI',th_groups:'Csoportok',th_ee:'Energiatakarékos',th_signal:'Jelerősség',
     th_status:'Állapot',th_last_seen:'Utoljára látva',th_actions:'Műveletek',
     th_id:'ID',th_type:'Típus',th_caller:'Hívó',
     th_dest:'Cél',th_speaker:'Beszélő',th_duration:'Időtartam',
@@ -2406,6 +3185,7 @@ const LANGS={
     bts_ip:'BTS IP',offline:'离线',online:'在线',
     brew_online:'在线',brew_offline:'离线',
     stations:'终端',calls:'通话',lastheard:'最近通话',log:'日志',rf:'RF',config:'配置',
+    sdslog:'SDS日志',th_dir:'方向',th_from:'发件',th_to:'收件',th_message:'消息',no_sds:'暂无SDS消息',sds_refresh:'⟳ 刷新',
     rf_freq:'中心频率',rf_rate:'采样率',rf_rms:'RMS',rf_peak:'峰值',rf_age:'快照',
     rf_waiting:'等待中…',rf_live:'实时',rf_stale:'已过期',
     rf_spectrum:'TX DSP 频谱（功放前）',rf_constellation:'TX DSP 星座图',
@@ -2424,7 +3204,7 @@ const LANGS={
     registered_terminals:'已注册终端',
     no_terminals:'暂无终端注册',no_calls:'无活跃通话',
     live_log:'实时日志',autoscroll:'自动滚动',filter_all:'全部',
-    clear:'清除',restart:'⟳ 重启',shutdown:'⏻ 关机',save:'保存',
+    clear:'清除',export:'⤓ 导出',restart:'⟳ 重启',shutdown:'⏻ 关机',save:'保存',
     whitelist_title:'ISSI 白名单',whitelist_add:'+ 添加 ISSI',whitelist_empty:'列表为空 — 开放网络（任何电台均可注册）。',
     whitelist_help:'列表为空时，任何电台均可注册（开放网络）。有条目时，仅接受列出的 ISSI，其余一律拒绝。更改即时生效并在重启后保留。',
     whitelist_enforced:'已启用',whitelist_open:'开放',whitelist_invalid:'请输入有效的 ISSI（1–16777215）。',
@@ -2439,7 +3219,7 @@ const LANGS={
     live_sds_sent:'已发送',live_sds_times:'次',live_sds_forever:'∞',live_sds_delete:'删除',
     fallback_title:'⚠ 正在使用后备配置 — 主配置加载失败',
     sds_msg_label:'消息内容',cancel:'取消',send:'发送',
-    th_issi:'ISSI',th_groups:'群组',th_ee:'EE',th_signal:'信号',
+    th_issi:'ISSI',th_groups:'群组',th_ee:'节能',th_signal:'信号',
     th_status:'状态',th_last_seen:'最后在线',th_actions:'操作',
     th_id:'ID',th_type:'类型',th_caller:'主叫',
     th_dest:'被叫',th_speaker:'讲话者',th_duration:'时长',
@@ -2478,7 +3258,7 @@ function applyLang(){
   document.querySelectorAll('[data-i18n]').forEach(el=>el.textContent=t(el.getAttribute('data-i18n')));
   document.querySelectorAll('[data-i18n-tab]').forEach(el=>el.textContent=t(el.getAttribute('data-i18n-tab')));
   // Update nav labels
-  ['stations','calls','lastheard','log','config','system'].forEach(p=>{
+  ['stations','calls','lastheard','log','config','telegram','system'].forEach(p=>{
     const el=document.querySelector(`#nav-${p} .nav-label`);
     if(el)el.textContent=t(p);
   });
@@ -2492,7 +3272,7 @@ function setLang(l,btn){
   applyLang();
 }
 
-let currentTheme=localStorage.getItem('fs_theme')||'dark';
+let currentTheme=localStorage.getItem('fs_theme')||'light';
 function setTheme(theme,btn){
   currentTheme=theme;localStorage.setItem('fs_theme',theme);
   document.documentElement.setAttribute('data-theme',theme==='dark'?'':theme);
@@ -2500,6 +3280,37 @@ function setTheme(theme,btn){
   if(btn)btn.classList.add('active');
   else document.querySelectorAll('.theme-btn').forEach(d=>{if(d.dataset.t===theme)d.classList.add('active');});
 }
+
+// ── Readability (text size + contrast) ───────────────────────────────────────
+// One multiplier --ts on <html data-uisize>, consumed by the curated readability
+// block via calc(). Default = Medium (bigger out of the box). Persisted: fs_uisize.
+let currentUiSize=localStorage.getItem('fs_uisize')||'m';
+function applyUiSize(){
+  document.documentElement.setAttribute('data-uisize',currentUiSize);
+  document.querySelectorAll('.read-opt').forEach(o=>
+    o.classList.toggle('active',o.dataset.size===currentUiSize));
+}
+function setUiSize(s){
+  currentUiSize=s;localStorage.setItem('fs_uisize',s);
+  applyUiSize();closeReadPop();
+}
+function toggleReadPop(e){
+  if(e)e.stopPropagation();
+  const pop=document.getElementById('read-pop'),btn=document.getElementById('read-btn');
+  const open=pop.classList.toggle('open');
+  if(btn)btn.setAttribute('aria-expanded',open?'true':'false');
+}
+function closeReadPop(){
+  const pop=document.getElementById('read-pop'),btn=document.getElementById('read-btn');
+  if(pop)pop.classList.remove('open');
+  if(btn)btn.setAttribute('aria-expanded','false');
+}
+// Outside-click + Esc dismissal (matches native popover behavior)
+document.addEventListener('click',e=>{
+  const pop=document.getElementById('read-pop');
+  if(pop&&pop.classList.contains('open')&&!e.target.closest('.eye-wrap'))closeReadPop();
+});
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeReadPop();});
 
 // ── Touch mode (FH-FEAT-008) ─────────────────────────────────────────────────
 // '1' = forced on, '0' = forced off, null = auto (on for coarse pointers).
@@ -2536,7 +3347,7 @@ function closeMobileSidebar(){
 }
 
 // ── Page navigation ───────────────────────────────────────────────────────
-const PAGE_TITLES={stations:'stations',calls:'calls',lastheard:'lastheard',log:'log',rf:'rf',config:'config',system:'system'};
+const PAGE_TITLES={stations:'stations',calls:'calls',lastheard:'lastheard',log:'log',sdslog:'sdslog',rf:'rf',config:'config',system:'system'};
 function showPage(name,el){
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
@@ -2544,7 +3355,10 @@ function showPage(name,el){
   if(el)el.classList.add('active');
   else{const nav=document.getElementById('nav-'+name);if(nav)nav.classList.add('active');}
   document.getElementById('topbar-title').textContent=t(name)||name;
+  if(name==='stations'){loadBtsInfo();}
+  if(name==='sdslog'){loadSdsLog();}
   if(name==='config'){loadConfig();loadWhitelist();loadWx();}
+  if(name==='telegram'){loadTelegram();}
   if(name==='system'){loadSystemInfo();loadConfigProfiles();loadLiveSds();loadBrightness();}
   else if(sysAutoRefreshTimer){clearInterval(sysAutoRefreshTimer);sysAutoRefreshTimer=null;const cb=document.getElementById('sys-autorefresh');if(cb)cb.checked=false;}
   if(name==='wifi')wifiRefresh();
@@ -2863,7 +3677,7 @@ async function wifiCall(url, body){
 function escAttr(s){ return String(s).replace(/&/g,'&amp;').replace(/'/g,"&#39;").replace(/"/g,'&quot;'); }
 
 // ── State + WS ────────────────────────────────────────────────────────────
-let ws=null,state={ms:{},calls:{},lastHeard:[],brewOnline:false,brewVer:0},sdsDest=0;
+let ws=null,state={ms:{},calls:{},lastHeard:[],sdsLog:[],brewOnline:false,brewVer:0},sdsDest=0;
 
 // ── RadioID callsigns (indicativ) ──────────────────────────────────────────────
 // issi -> "CALLSIGN" (found) | "" (looked up, none). A missing key means unresolved.
@@ -2880,12 +3694,13 @@ function refreshCallsigns(){
   Object.values(state.ms).forEach(m=>ids.add(m.issi));
   Object.values(state.calls).forEach(c=>{if(c.caller_issi)ids.add(c.caller_issi);if(c.called_issi&&c.call_type!=='group')ids.add(c.called_issi);if(c.active_speaker)ids.add(c.active_speaker);});
   state.lastHeard.forEach(e=>{if(e.issi)ids.add(e.issi);});
+  (state.sdsLog||[]).forEach(e=>{if(e.source_issi)ids.add(e.source_issi);if(e.dest_issi&&!e.is_group)ids.add(e.dest_issi);});
   const unknown=[...ids].filter(id=>id&&callsigns[id]===undefined).slice(0,256);
   if(!unknown.length)return;
   _csInflight=true;
   fetch('/api/callsigns?ids='+unknown.join(','))
     .then(r=>r.ok?r.json():{})
-    .then(d=>{let changed=false;for(const k in d){if(callsigns[k]!==d[k]){callsigns[k]=d[k];changed=true;}}if(changed){renderStations();renderCalls();renderLastHeard();}})
+    .then(d=>{let changed=false;for(const k in d){if(callsigns[k]!==d[k]){callsigns[k]=d[k];changed=true;}}if(changed){renderStations();renderCalls();renderLastHeard();renderSdsLog();}})
     .catch(()=>{})
     .finally(()=>{_csInflight=false;});
 }
@@ -2956,9 +3771,8 @@ function handleMsg(msg){
       (msg.calls||[]).forEach(c=>{
         state.calls[c.call_id]={...c,started_at:Date.now()-(c.started_secs_ago||0)*1000};
         if(c.ts&&c.ts>=2){
-          const lbl=c.call_type==='group'?`GSSI ${c.gssi}`:(c.called_issi?`ISSI ${c.called_issi}`:'P2P');
           const sub=c.call_type==='group'?t('call_group'):(c.simplex?t('call_p2p_s'):t('call_p2p_d'));
-          tsSetCall(c.ts,c.call_id,c.call_type,lbl,sub);
+          tsSetCall(c.ts,{...c,sub});
         }
       });
       if(msg.log&&msg.log.length){document.getElementById('log-container').innerHTML='';msg.log.forEach(e=>appendLog(e));}
@@ -3013,9 +3827,8 @@ function handleMsg(msg){
       if(msg.call_type==='group'&&msg.gssi!=null&&state.ms[msg.caller_issi]){state.ms[msg.caller_issi].selected_group=msg.gssi;renderStations();}
       if(msg.last_heard)pushLastHeard(msg.last_heard);
       if(msg.ts&&msg.ts>=2){
-        const lbl=msg.call_type==='group'?`GSSI ${msg.gssi}`:(msg.called_issi?`ISSI ${msg.called_issi}`:'P2P');
         const sub=msg.call_type==='group'?t('call_group'):(msg.simplex?t('call_p2p_s'):t('call_p2p_d'));
-        tsSetCall(msg.ts,msg.call_id,msg.call_type,lbl,sub);
+        tsSetCall(msg.ts,{...msg,sub});
         updateTsBlocks();
       }
       renderCalls();renderLastHeard();break;
@@ -3026,6 +3839,8 @@ function handleMsg(msg){
       tsVoice(msg.ts);break;
     case 'speaker_changed':
       if(state.calls[msg.call_id])state.calls[msg.call_id].active_speaker=msg.speaker_issi;
+      // Reflect the new speaker on the timeslot visualizer immediately.
+      tsSetSpeaker(msg.call_id,msg.speaker_issi);updateTsBlocks();
       // The new speaker has this call's GSSI selected (looked up from the active call).
       {const sg=state.calls[msg.call_id]&&state.calls[msg.call_id].gssi;
        if(sg!=null&&state.ms[msg.speaker_issi]){state.ms[msg.speaker_issi].selected_group=sg;renderStations();}}
@@ -3038,6 +3853,11 @@ function handleMsg(msg){
       pushLastHeard({issi:msg.issi,activity:msg.activity,dest:msg.dest,ts:new Date().toTimeString().slice(0,8)});
       renderLastHeard();break;
     case 'log':appendLog(msg);break;
+    case 'sds_log':
+      if(!state.sdsLog)state.sdsLog=[];
+      state.sdsLog.unshift({ts:nowStamp(),direction:msg.direction,source_issi:msg.source_issi,dest_issi:msg.dest_issi,is_group:msg.is_group,protocol_id:msg.protocol_id,text:msg.text});
+      if(state.sdsLog.length>500)state.sdsLog.pop();
+      renderSdsLog();refreshCallsigns();break;
     case 'tx_visual':handleTxVisual(msg);break;
     case 'tx_quality':handleTxQuality(msg);break;
     case 'sdr_health':handleSdrHealth(msg);break;
@@ -3046,13 +3866,15 @@ function handleMsg(msg){
 }
 
 // ── Render helpers ────────────────────────────────────────────────────────
+// Small battery-with-bolt glyph — conveys "Energy Economy" (power-saving) at a glance.
+const EE_ICON='<svg viewBox="0 0 24 24" width="9" height="9" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" style="vertical-align:-1px;margin-right:3px;flex-shrink:0"><rect x="2" y="7" width="16" height="10" rx="2"/><path d="M22 10v4" stroke-linecap="round"/><path d="M10.5 9.5 8 13h3l-2.5 3.5" fill="none" stroke-linecap="round"/></svg>';
 function eeLabel(mode){
   if(!mode||mode===0)return '<span style="color:var(--text3);font-size:10px">—</span>';
   const labels=['','EG1','EG2','EG3','EG4','EG5','EG6','EG7'];
   const colors=['','var(--accent)','var(--accent)','var(--accent2)','var(--accent2)','var(--warn)','var(--danger)','var(--danger)'];
   const tips=['','~1s','~2s','~3s','~4s','~5s','~6s','~7s'];
   const col=colors[mode]||'var(--text2)';
-  return `<span class="badge" title="Energy Economy Mode ${mode} — wake ${tips[mode]}" style="background:color-mix(in srgb,${col} 12%,transparent);border-color:${col};color:${col};font-size:9px">${labels[mode]}</span>`;
+  return `<span class="badge" title="Energy Economy Mode ${mode} — wake ${tips[mode]}" style="display:inline-flex;align-items:center;background:color-mix(in srgb,${col} 12%,transparent);border-color:${col};color:${col};font-size:9px">${EE_ICON}${labels[mode]}</span>`;
 }
 function lastSeenLabel(secs){
   if(secs==null)return'—';
@@ -3112,7 +3934,7 @@ function updateTsBlocks(){
     if(ts===1){
       block.className='ts-block mcch';
       label.textContent='MCCH';
-      sub.textContent='Control';
+      sub.textContent='ACTIVE';
       // subtle MCCH wave animation
       if(!tsWaveHeights[0].length)tsRandWave(1);
       tsApplyWave(1,true);
@@ -3121,26 +3943,33 @@ function updateTsBlocks(){
     }
 
     const st=tsState[i];
+    const timer=block.querySelector('.ts-timer');
     if(!st){
       block.className='ts-block';
       label.textContent='—';
       sub.textContent='Idle';
       tsApplyWave(ts,false);
+      if(timer)timer.textContent='';
       if(dur)dur.style.width='0%';
       continue;
     }
 
     const voiceRecent=st.voice_ts&&(now-st.voice_ts)<TS_VOICE_DECAY_MS;
+    // Top line = GSSI (talkgroup) for group calls / called ISSI for individual;
+    // bottom line = the ISSI currently keyed up, with its RadioID callsign when known.
+    const lines=tsLines(st);
+    label.textContent=lines.top;
 
     if(voiceRecent){
       block.className='ts-block voice';
-      label.textContent=st.label||'—';
-      sub.textContent='▶ TX';
+      sub.textContent=lines.bottom?('▶ '+lines.bottom):'▶ TX';
     } else {
       block.className='ts-block call';
-      label.textContent=st.label||'—';
+      sub.textContent=lines.bottom||(st.sub||'Alloc');
+    }
+    if(timer){
       const elapsed=Math.floor((now-(st.started_at||now))/1000);
-      sub.textContent=elapsed>0?formatDur(elapsed):(st.sub||'Alloc');
+      timer.textContent=elapsed>0?formatDur(elapsed):'';
     }
     tsApplyWave(ts, voiceRecent);
 
@@ -3157,16 +3986,45 @@ function formatDur(s){
   return Math.floor(s/60)+'m'+String(s%60).padStart(2,'0')+'s';
 }
 
-function tsSetCall(ts, call_id, call_type, label, sub){
+// Render an ISSI + its RadioID callsign (indicativ) compactly for the TS sub-line.
+function tsIssiText(issi){
+  if(!issi)return '';
+  const cs=callsigns[issi];
+  return cs?(issi+' · '+cs):(''+issi);
+}
+// Compute the two text lines for an active timeslot from its call state:
+//   top    → GSSI (talkgroup number) for group calls, else the called ISSI / P2P
+//   bottom → the ISSI currently transmitting, with callsign when resolved
+function tsLines(st){
+  const speaker=st.speaker_issi||st.caller_issi;
+  if(st.call_type==='group'){
+    // Group calls (the normal traffic-channel case): GSSI on top, speaking ISSI below.
+    return {top: st.gssi!=null?('GSSI '+st.gssi):'GROUP', bottom: tsIssiText(speaker)};
+  }
+  // Individual / point-to-point calls have no talkgroup — label the top line clearly
+  // so it never shows a bare "ISSI" that reads like a misplaced GSSI.
+  return {top:'PRIVATE', bottom: tsIssiText(speaker)};
+}
+function tsSetCall(ts, call){
   if(ts<2||ts>4)return;
-  tsState[ts-1]={call_id,call_type,label,sub,voice_ts:null,started_at:Date.now()};
+  tsState[ts-1]={
+    call_id:call.call_id, call_type:call.call_type,
+    gssi:call.gssi, called_issi:call.called_issi, caller_issi:call.caller_issi,
+    speaker_issi:call.active_speaker||call.speaker_issi||call.caller_issi,
+    simplex:call.simplex, sub:call.sub,
+    voice_ts:null, started_at:Date.now()
+  };
+}
+// Point a timeslot at the ISSI now transmitting (group-call speaker hand-offs).
+function tsSetSpeaker(call_id, speaker_issi){
+  for(let i=1;i<4;i++){if(tsState[i]&&tsState[i].call_id===call_id)tsState[i].speaker_issi=speaker_issi;}
 }
 function tsClearCall(call_id){
   for(let i=1;i<4;i++){if(tsState[i]&&tsState[i].call_id===call_id)tsState[i]=null;}
 }
 function tsVoice(ts){
   if(ts<2||ts>4)return;
-  if(!tsState[ts-1])tsState[ts-1]={call_id:0,call_type:'',label:'Traffic',sub:'',voice_ts:null,started_at:Date.now()};
+  if(!tsState[ts-1])tsState[ts-1]={call_id:0,call_type:'',gssi:null,voice_ts:null,started_at:Date.now()};
   tsState[ts-1].voice_ts=Date.now();
   // Randomize waveform bars on each voice frame for live feel
   tsRandWave(ts);
@@ -3222,7 +4080,7 @@ function renderStations(){
     const ls=m._last_seen_ts?Math.floor((Date.now()-m._last_seen_ts)/1000):m.last_seen_secs_ago;
     return`<tr>
       <td>${idCell(m.issi)}</td><td>${grps}</td>
-      <td class="col-mobile-hide" style="text-align:center">${eeLabel(m.energy_saving_mode||0)}</td>
+      <td class="col-mobile-hide">${eeLabel(m.energy_saving_mode||0)}</td>
       <td><div class="rssi-bar"><div class="rssi-track"><div class="rssi-fill" style="width:${pct}%;background:${col}"></div></div><span class="rssi-val" style="color:${col}">${rL}</span></div></td>
       <td><span class="badge badge-green">${t('online_badge')}</span></td>
       <td class="col-mobile-hide">${lastSeenLabel(ls)}</td>
@@ -3262,6 +4120,31 @@ function renderLastHeard(){
 }
 function clearLastHeard(){state.lastHeard=[];renderLastHeard();}
 
+// ── SDS Log ───────────────────────────────────────────────────────────────
+function _p2(n){return String(n).padStart(2,'0');}
+// Local "YYYY-MM-DD HH:MM:SS" stamp matching the server's persisted format. Used only for
+// live rows arriving over the WS; rows fetched from /api/sds-log already carry a server stamp.
+function nowStamp(){const d=new Date();return `${d.getFullYear()}-${_p2(d.getMonth()+1)}-${_p2(d.getDate())} ${_p2(d.getHours())}:${_p2(d.getMinutes())}:${_p2(d.getSeconds())}`;}
+// Human label for known SDS protocol-identifier bytes so binary payloads (no decoded text)
+// still read meaningfully. 0x02/0x09/0x82/0x89 = text; 0x0A = LIP position; 0xDC = Home Mode Display.
+function pidLabel(pid){const m={2:'text',9:'text',10:'LIP position',12:'concat',128:'text',130:'text',137:'text',218:'status',220:'home-display'};return m[pid]||('PID '+pid);}
+const SDS_DIR={rx:['badge-green','RX'],net:['badge-blue','NET'],tx:['badge-yellow','TX']};
+function dirBadge(dir){const x=SDS_DIR[dir]||['badge-dim',(dir||'?').toUpperCase()];return `<span class="badge ${x[0]}">${x[1]}</span>`;}
+function sdsRow(e){
+  const to=e.is_group?`<code>${e.dest_issi}</code> <span class="sds-empty">grp</span>`:idCell(e.dest_issi);
+  const body=(e.text&&e.text.length)?escHtml(e.text):`<span class="sds-empty">[${escHtml(pidLabel(e.protocol_id))}]</span>`;
+  return `<tr><td class="sds-time">${escHtml(e.ts||'')}</td><td>${dirBadge(e.direction)}</td><td>${idCell(e.source_issi)}</td><td>${to}</td><td class="sds-msg">${body}</td></tr>`;
+}
+function renderSdsLog(){
+  const tb=document.getElementById('sdslog-tbody');if(!tb)return;
+  const rows=state.sdsLog||[];
+  if(!rows.length){tb.innerHTML=`<tr><td colspan="5" class="sds-empty" style="text-align:center;padding:24px">${t('no_sds')}</td></tr>`;return;}
+  tb.innerHTML=rows.map(sdsRow).join('');
+}
+async function loadSdsLog(){
+  try{const r=await fetch('/api/sds-log');if(!r.ok)return;state.sdsLog=await r.json();renderSdsLog();refreshCallsigns();}catch{}
+}
+
 function appendLog(msg){
   const f=logFilter(),lv={'':0,DEBUG:0,INFO:1,WARN:2,ERROR:3};
   if((lv[msg.level]??0)<(lv[f]??0))return;
@@ -3273,6 +4156,28 @@ function appendLog(msg){
   if(document.getElementById('log-autoscroll').checked)c.scrollTop=c.scrollHeight;
 }
 function clearLog(){document.getElementById('log-container').innerHTML='';}
+
+// Export the live log buffer to a local .log file — no SSH required. Saves what is
+// currently held in the dashboard (up to the most recent ~600 lines that passed the
+// active level filter), as plain "TS  LEVEL  message" text.
+function exportLog(){
+  const lines=[...document.querySelectorAll('#log-container .log-line')].map(l=>{
+    const ts=l.querySelector('.log-ts')?.textContent||'';
+    const lv=l.querySelector('.log-level')?.textContent||'';
+    const msg=(l.textContent||'').slice(ts.length+lv.length);
+    return ts+'  '+lv.padEnd(5)+'  '+msg;
+  });
+  if(!lines.length){return;}
+  const pad=n=>String(n).padStart(2,'0');
+  const d=new Date();
+  const stamp=`${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+  const blob=new Blob([lines.join('\n')+'\n'],{type:'text/plain;charset=utf-8'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download=`flowstation-log-${stamp}.log`;
+  document.body.appendChild(a);a.click();
+  setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove();},0);
+}
 
 // ── Config ────────────────────────────────────────────────────────────────
 async function loadConfig(){
@@ -3306,10 +4211,8 @@ function renderWhitelist(){
     return;
   }
   box.innerHTML=whitelistEntries.map(issi=>
-    '<span style="display:inline-flex;align-items:center;gap:6px;background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:4px 10px;font-size:13px">'+
-    issi+
-    '<span style="cursor:pointer;color:var(--danger);font-weight:700" onclick="removeWhitelistEntry('+issi+')">×</span>'+
-    '</span>'
+    '<span class="id-chip">'+issi+
+    '<span class="id-chip-x" onclick="removeWhitelistEntry('+issi+')">×</span></span>'
   ).join('');
 }
 function addWhitelistEntry(){
@@ -3370,6 +4273,111 @@ async function saveWx(){
   }catch{setWxMsg(t('conn_error'),false);}
 }
 function setWxMsg(txt,ok){const el=document.getElementById('wx-msg');el.textContent=txt;el.style.color=ok?'var(--accent)':'var(--danger)';setTimeout(()=>{if(el.textContent===txt)el.textContent='';},4000);}
+
+// ── Telegram alerts ─────────────────────────────────────────────────────────
+let tgChats=[];            // recipient chat IDs (numbers)
+let tgChatNames={};        // id -> best-effort friendly name (display only)
+let tgDetected=[];         // last "detect" result, for the Add buttons
+let tgTokenDirty=false;    // true once the user edits the token field (so we send it)
+function tgEsc(s){return (s||'').toString().replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+// The token to send: a freshly-typed value (never the masked placeholder), else '' = keep saved.
+function tgTokenField(){const v=(document.getElementById('tg-token').value||'').trim();return (tgTokenDirty&&v&&!v.includes('…'))?v:'';}
+async function loadTelegram(){
+  try{
+    const r=await fetch('/api/telegram');
+    if(!r.ok){setTgMsg(t('conn_error'),false);return;}
+    const d=await r.json();
+    document.getElementById('tg-enabled').checked=!!d.enabled;
+    const tok=document.getElementById('tg-token');
+    tok.value=d.token_set?(d.bot_token_masked||''):'';
+    tgTokenDirty=false;
+    tgChats=(d.chat_ids||[]).slice();
+    renderTgChips();
+    document.getElementById('tg-connect').checked=!!d.alert_connect;
+    document.getElementById('tg-disconnect').checked=!!d.alert_disconnect;
+    document.getElementById('tg-t351').checked=!!d.alert_t351;
+    document.getElementById('tg-lip').checked=!!d.alert_lip;
+    document.getElementById('tg-backhaul').checked=!!d.alert_backhaul;
+    document.getElementById('tg-logs').checked=!!d.alert_critical_logs;
+    document.getElementById('tg-verify-status').textContent='';
+    document.getElementById('tg-detected').innerHTML='';
+  }catch{setTgMsg(t('conn_error'),false);}
+}
+function renderTgChips(){
+  const box=document.getElementById('tg-chips');
+  if(!tgChats.length){box.innerHTML='<span style="color:var(--muted);font-size:13px">'+t('tg_no_recipients')+'</span>';return;}
+  box.innerHTML=tgChats.map(id=>{
+    const nm=tgChatNames[id]?(' · '+tgEsc(tgChatNames[id])):'';
+    return '<span class="id-chip">'+id+nm+
+      '<span class="id-chip-x" onclick="removeRecipient('+id+')">×</span></span>';
+  }).join('');
+}
+function addRecipient(){
+  const inp=document.getElementById('tg-chat-input');
+  const v=parseInt(inp.value,10);
+  if(!Number.isInteger(v)||v===0){setTgRecipMsg(t('tg_invalid_chat'),false);inp.focus();return;}
+  if(!tgChats.includes(v))tgChats.push(v);
+  renderTgChips();inp.value='';inp.focus();
+}
+function removeRecipient(id){tgChats=tgChats.filter(x=>x!==id);renderTgChips();}
+function addDetected(i){const c=tgDetected[i];if(!c)return;if(!tgChats.includes(c.id)){tgChats.push(c.id);tgChatNames[c.id]=c.name;renderTgChips();}}
+async function verifyTelegram(){
+  const st=document.getElementById('tg-verify-status');
+  st.textContent=t('tg_verifying');st.style.color='var(--muted)';
+  try{
+    const r=await fetch('/api/telegram/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({bot_token:tgTokenField()})});
+    const d=await r.json();
+    if(d.ok){st.textContent='✓ @'+(d.username||'bot');st.style.color='var(--accent)';}
+    else{st.textContent='✗ '+tgEsc(d.error||'error');st.style.color='var(--danger)';}
+  }catch{st.textContent=t('conn_error');st.style.color='var(--danger)';}
+}
+async function detectTelegramChats(){
+  const box=document.getElementById('tg-detected');
+  box.innerHTML='<span style="color:var(--muted);font-size:13px">'+t('tg_detecting')+'</span>';
+  try{
+    const r=await fetch('/api/telegram/detect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({bot_token:tgTokenField()})});
+    const d=await r.json();
+    if(!d.ok){box.innerHTML='<span style="color:var(--danger);font-size:13px">✗ '+tgEsc(d.error||'error')+'</span>';return;}
+    tgDetected=d.chats||[];
+    if(!tgDetected.length){box.innerHTML='<span style="color:var(--muted);font-size:13px">'+t('tg_detect_none')+'</span>';return;}
+    box.innerHTML='<div style="color:var(--muted);font-size:13px;margin-bottom:6px">'+t('tg_detect_found')+'</div>'+
+      tgDetected.map((c,i)=>
+        '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:6px 0">'+
+        '<span style="font-size:13px">'+tgEsc(c.name)+' <span style="color:var(--muted)">('+c.id+' · '+tgEsc(c.kind)+')</span></span>'+
+        '<button class="btn" onclick="addDetected('+i+')">+ '+t('tg_add')+'</button></div>'
+      ).join('');
+  }catch{box.innerHTML='<span style="color:var(--danger);font-size:13px">'+t('conn_error')+'</span>';}
+}
+async function saveTelegram(){
+  const body={
+    enabled:document.getElementById('tg-enabled').checked,
+    chat_ids:tgChats,
+    alert_connect:document.getElementById('tg-connect').checked,
+    alert_disconnect:document.getElementById('tg-disconnect').checked,
+    alert_t351:document.getElementById('tg-t351').checked,
+    alert_lip:document.getElementById('tg-lip').checked,
+    alert_backhaul:document.getElementById('tg-backhaul').checked,
+    alert_critical_logs:document.getElementById('tg-logs').checked
+  };
+  const tok=tgTokenField();if(tok)body.bot_token=tok;
+  try{
+    const r=await fetch('/api/telegram',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(r.ok){setTgMsg(t('saved'),true);loadTelegram();}
+    else setTgMsg(t('save_fail')+': '+await r.text(),false);
+  }catch{setTgMsg(t('conn_error'),false);}
+}
+async function testTelegram(){
+  setTgMsg(t('tg_testing'),true);
+  const body={chat_ids:tgChats};const tok=tgTokenField();if(tok)body.bot_token=tok;
+  try{
+    const r=await fetch('/api/telegram/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const d=await r.json();
+    if(d.ok)setTgMsg(t('tg_test_ok',{n:d.sent}),true);
+    else setTgMsg('✗ '+tgEsc(d.error||'error'),false);
+  }catch{setTgMsg(t('conn_error'),false);}
+}
+function setTgMsg(txt,ok){const el=document.getElementById('tg-msg');el.textContent=txt;el.style.color=ok?'var(--accent)':'var(--danger)';setTimeout(()=>{if(el.textContent===txt)el.textContent='';},5000);}
+function setTgRecipMsg(txt,ok){const el=document.getElementById('tg-recipients-msg');el.textContent=txt;el.style.color=ok?'var(--accent)':'var(--danger)';setTimeout(()=>{if(el.textContent===txt)el.textContent='';},4000);}
 
 
 function wsSend(msg){if(ws&&ws.readyState===WebSocket.OPEN){ws.send(JSON.stringify(msg));return true;}return false;}
@@ -3436,6 +4444,50 @@ function loadBrightness(){
       if(typeof d.brightness==='number'){sl.value=d.brightness;const lbl=document.getElementById('brightness-val');if(lbl)lbl.textContent=d.brightness;}
     }
   }).catch(()=>{});
+}
+
+// Inline glyphs for the BTS header chips (no extra requests).
+const BTS_TOWER_ICON='<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 9v13"/><path d="M8.5 22h7"/><path d="M7 8a6 6 0 0 1 10 0"/><path d="M4.5 6a9 9 0 0 1 15 0"/></svg>';
+const BTS_CLOCK_ICON='<svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>';
+// TETRA BTS Details card — static cell + RF identity pulled from config (one fetch).
+async function loadBtsInfo(){
+  try{
+    const r=await fetch('/api/btsinfo',{credentials:'same-origin'});
+    if(!r.ok)return;
+    const d=await r.json();
+    const set=(id,v)=>setText(id,(v==null||v==='')?'—':v);
+    const mhz=(hz,dp)=>(hz!=null&&isFinite(hz))?(hz/1e6).toFixed(dp==null?4:dp)+' MHz':'—';
+    set('bts-tx', mhz(d.tx_freq_hz));
+    set('bts-rx', mhz(d.rx_freq_hz));
+    set('bts-shift', (d.shift_hz!=null&&isFinite(d.shift_hz))?((d.shift_hz>=0?'+':'')+(d.shift_hz/1e6).toFixed(3)+' MHz'):'—');
+    set('bts-mcc', d.mcc);
+    set('bts-mnc', d.mnc);
+    set('bts-carrier', d.main_carrier);
+    // Neighbor-cell + hangtime chips in the card header
+    const nb=document.getElementById('bts-neighbor');
+    if(nb){
+      const n=d.neighbor_count||0;
+      nb.innerHTML=BTS_TOWER_ICON+'Neighbor Cell · '+(n>0?('ON ('+n+' '+(n===1?'neighbor':'neighbors')+')'):'OFF');
+      nb.className='bts-chip '+(n>0?'on':'off');
+    }
+    const hg=document.getElementById('bts-hang');
+    if(hg){
+      hg.innerHTML=BTS_CLOCK_ICON+'HangTime · '+(d.hangtime_secs!=null?d.hangtime_secs:'—')+' sec';
+      hg.className='bts-chip time';
+    }
+    const acc=document.getElementById('bts-access');
+    if(acc){
+      const restricted=!!d.whitelist_restricted;
+      acc.textContent=restricted?'RESTRICTED':'OPEN';
+      acc.className='bts-access '+(restricted?'restricted':'open');
+    }
+    const sub=document.getElementById('bts-access-sub');
+    if(sub){
+      sub.textContent=d.whitelist_restricted
+        ? ((d.whitelist_count||0)+' '+t('bts_wl_entries'))
+        : t('bts_wl_open');
+    }
+  }catch(e){/* config endpoint unavailable — leave placeholders */}
 }
 
 async function loadSystemInfo(){
@@ -3714,6 +4766,7 @@ setInterval(()=>{
 if(sidebarCollapsed)document.getElementById('sidebar').classList.add('collapsed');
 setLang(currentLang);
 setTheme(currentTheme);
+applyUiSize();
 applyTouchMode();
 
 // Logout: hits /api/logout (clears the session cookie server-side) and navigates
@@ -3843,20 +4896,13 @@ function handleTxQuality(msg){
   const papr = rfPushAvg('papr_db',                   msg.papr_db);
   const cl   = rfPushAvg('carrier_leakage_db',        msg.carrier_leakage_db);
   const obw  = rfPushAvg('occupied_bandwidth_hz',     msg.occupied_bandwidth_hz);
-  const dci  = rfPushAvg('dc_offset_i',               msg.dc_offset_i);
-  const dcq  = rfPushAvg('dc_offset_q',               msg.dc_offset_q);
-  const iqa  = rfPushAvg('iq_amplitude_imbalance_db', msg.iq_amplitude_imbalance_db);
-  const iqp  = rfPushAvg('iq_phase_imbalance_deg',    msg.iq_phase_imbalance_deg);
 
+  // Show only the operationally-relevant TX metrics. DC offset + IQ amplitude/phase
+  // imbalance are modulator-calibration diagnostics and were trimmed from the UI.
   paintQuality('rf-evm',     'rf-q-evm-wrap',  fmtPct(evm, 2),       evalEvm(evm));
   paintQuality('rf-papr',    'rf-q-papr-wrap', fmtDb(papr, 1),       evalPapr(papr));
   paintQuality('rf-carrier', 'rf-q-cl-wrap',   fmtDb(cl, 1, true),   evalCarrierLeakage(cl));
   paintQuality('rf-obw',     'rf-q-obw-wrap',  fmtKhz(obw),          evalObw(obw));
-  paintQuality('rf-dc',      'rf-q-dc-wrap',   fmtDcPair(dci, dcq),  evalDcOffset(dci, dcq));
-  paintQuality('rf-iqa',     'rf-q-iqa-wrap',  fmtDb(iqa, 2, true),  evalIqAmpImbal(iqa));
-  paintQuality('rf-iqp',     'rf-q-iqp-wrap',
-                isFinite(iqp) ? iqp.toFixed(2)+'°' : '—',
-                evalIqPhaseImbal(iqp));
 }
 
 function handleSdrHealth(msg){
@@ -4246,49 +5292,65 @@ function drawRfWaterfall(){
   // Background colour as RGB for the noise-floor mask. We replace viridis(0)≈purple
   // with the page background for bins below threshold so the waterfall reads as
   // "signal vs nothing" instead of "purple everywhere".
-  const bgRgb = parseHexRgb(col.bg) || [10, 17, 24];
+  const bgRgb = parseHexRgb(col.bg) || [9, 13, 20];
 
-  ctx.fillStyle = col.bg;
-  ctx.fillRect(0, 0, w, h);
-
-  const rows = Math.min(rfState.waterfall.length, h|0);
+  const rows = rfState.waterfall.length;
   const bins = rfState.waterfall[0].length;
-  const leftPad = 40;
-  const drawW = (w - leftPad)|0;
-  if(drawW <= 0 || rows <= 0) return;
+  if(rows <= 0 || bins <= 0) return;
 
-  // Noise-floor threshold in [0..1]. pushWaterfall normalises -100..0 dBFS into 0..1,
-  // so 0.18 corresponds to ~-82 dBFS — well below any real TETRA signal.
-  const NOISE_FLOOR = 0.18;
+  // Noise-floor threshold in [0..1]. pushWaterfall normalises -100..0 dBFS into 0..1.
+  const NOISE_FLOOR = 0.16;
 
-  const img = ctx.createImageData(drawW, rows);
+  // Render the heatmap at its native resolution (bins × rows) onto an offscreen
+  // canvas, then scale it to fill the panel with drawImage(). drawImage honours the
+  // HiDPI transform set by rfResizeCanvas — the old putImageData() path did NOT,
+  // which is what left the column shifted to the left and only partly filled the
+  // height. Scaling also makes the limited history fill top-to-bottom and keeps the
+  // (fft-shifted) carrier dead-centre.
+  let buf = rfState._wfBuf;
+  if(!buf){ buf = rfState._wfBuf = document.createElement('canvas'); }
+  if(buf.width !== bins || buf.height !== rows){ buf.width = bins; buf.height = rows; }
+  const bctx = buf.getContext('2d');
+  const img = bctx.createImageData(bins, rows);
   for(let row = 0; row < rows; row++){
     const spec = rfState.waterfall[row];
-    for(let x = 0; x < drawW; x++){
-      const binIdx = Math.min(bins - 1, ((x / drawW) * bins)|0);
-      const v = spec[binIdx];
+    for(let x = 0; x < bins; x++){
+      const v = spec[x];
       const rgb = v < NOISE_FLOOR ? bgRgb : viridisColor(v);
-      const p = (row * drawW + x) * 4;
+      const p = (row * bins + x) * 4;
       img.data[p]   = rgb[0];
       img.data[p+1] = rgb[1];
       img.data[p+2] = rgb[2];
       img.data[p+3] = 255;
     }
   }
-  ctx.putImageData(img, leftPad, 0);
+  bctx.putImageData(img, 0, 0);
 
-  // Time axis on the left: tick every 30 rows ≈ 30s (one row per snapshot, ~1Hz).
-  // Only draw ticks up to the number of rows we actually have, so the axis never
-  // pretends "-180s" when we only have 30s of history.
+  ctx.fillStyle = col.bg;
+  ctx.fillRect(0, 0, w, h);
+
+  // Zoom to the central frequency window so the narrow-band TETRA carrier fills the
+  // view (instead of a thin strip lost in a wide span), centred on DC.
+  const leftPad = 38;
+  const VIEW = 0.5;                       // show the central 50% of the FFT span
+  const srcX = bins * (1 - VIEW) / 2, srcW = bins * VIEW;
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(buf, srcX, 0, srcW, rows, leftPad, 0, w - leftPad, h);
+
+  // Time axis on the left. History now fills the full height, so map labels across h.
   ctx.font = '9px ui-monospace, Cascadia Code, Consolas, monospace';
   ctx.fillStyle = col.text3;
   ctx.textAlign = 'right';
   ctx.textBaseline = 'middle';
-  for(let s = 0; s <= rows; s += 30){
-    ctx.fillText('-'+s+'s', leftPad - 4, s + 1);
+  const step = rows <= 45 ? 10 : (rows <= 120 ? 30 : 60);
+  ctx.fillText('0s', leftPad - 4, 7);
+  for(let s = step; s < rows - step*0.4; s += step){
+    const y = (s / rows) * h;
+    ctx.fillText('-'+s+'s', leftPad - 4, y);
     ctx.strokeStyle = col.grid;
     ctx.beginPath();
-    ctx.moveTo(leftPad - 2, s); ctx.lineTo(leftPad, s);
+    ctx.moveTo(leftPad - 2, y); ctx.lineTo(leftPad, y);
     ctx.stroke();
   }
 }
@@ -4350,6 +5412,10 @@ async function boot(){
   }
   if(anonymous){ enterPublicMode(); return; }
   connect();
+  // Populate the topbar SDR badge (and prime system data) immediately on load,
+  // instead of waiting for the user to open the System tab.
+  loadSystemInfo();
+  loadBtsInfo();        // TETRA BTS Details card on the default (Radios) page
   wifiProbeAvailable(); // toggles the WiFi nav item
   checkUpdate();
 }
@@ -4393,14 +5459,14 @@ pub const LOGIN_HTML: &str = r##"<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<meta name="theme-color" content="#0a1118">
+<meta name="theme-color" content="#eceff4">
 <title>FlowStation — Login</title>
 <style>
 :root{
-  --bg:#0a1118;--bg2:#0f1820;--bg3:#172230;--bg4:#1d2a3a;
-  --border:#243244;--border2:#2a3a52;
-  --text:#e8edf3;--text2:#b5c0d0;--text3:#7a8a9c;
-  --accent:#00d4a8;--accent2:#4da6ff;--danger:#ff4d5e;
+  --bg:#eceff4;--bg2:#ffffff;--bg3:#e6eaf1;--bg4:#d6dde7;
+  --border:#dde3ec;--border2:#c4cdd9;
+  --text:#16202e;--text2:#3d4f66;--text3:#5f7188;
+  --accent:#00876a;--accent2:#1565c0;--danger:#c0203a;
   --mono:'ui-monospace','Cascadia Code','Consolas','Liberation Mono','Menlo',monospace;
   --sans: 'ui-sans-serif', system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', 'Noto Sans SC', 'PingFang SC', 'Hiragino Sans GB', 'WenQuanYi Micro Hei', sans-serif;
 }
@@ -4411,20 +5477,25 @@ body{
   display:flex;align-items:center;justify-content:center;
   min-height:100vh;min-height:100dvh;
   padding:20px;
-  /* Subtle gradient backdrop so the card pops without distracting */
+  /* Premium light backdrop: faint dot-grid texture + soft brand glows */
   background:
-    radial-gradient(circle at 20% 10%, rgba(77,166,255,0.10), transparent 50%),
-    radial-gradient(circle at 80% 90%, rgba(0,212,168,0.10), transparent 50%),
+    radial-gradient(circle at 1px 1px, rgba(30,45,70,0.05) 1px, transparent 0) 0 0/22px 22px,
+    radial-gradient(900px 520px at 18% 6%, rgba(21,101,192,0.07), transparent 55%),
+    radial-gradient(900px 560px at 84% 96%, rgba(0,135,106,0.07), transparent 55%),
     var(--bg);
   -webkit-tap-highlight-color:transparent;
 }
 
 .login-card{
   width:100%;max-width:380px;
-  background:var(--bg2);border:1px solid var(--border2);
-  border-radius:14px;
-  box-shadow:0 20px 50px rgba(0,0,0,0.5), 0 0 0 1px rgba(255,255,255,0.02);
-  padding:36px 32px 32px;
+  background:linear-gradient(180deg, #ffffff 0%, #f7f9fc 100%);
+  border:1px solid var(--border);
+  border-radius:16px;
+  box-shadow:
+    0 22px 54px -22px rgba(30,45,70,0.28),
+    0 6px 16px rgba(30,45,70,0.10),
+    inset 0 1px 0 rgba(255,255,255,0.8);
+  padding:38px 32px 30px;
   position:relative;overflow:hidden;
 }
 /* Top accent bar */
@@ -4438,10 +5509,10 @@ body{
 .logo-mark{
   width:64px;height:64px;
   border-radius:14px;
-  background:linear-gradient(135deg, rgba(0,212,168,0.15) 0%, rgba(77,166,255,0.15) 100%);
-  border:1px solid rgba(0,212,168,0.3);
+  background:linear-gradient(135deg, rgba(0,135,106,0.12) 0%, rgba(21,101,192,0.12) 100%);
+  border:1px solid rgba(0,135,106,0.30);
   display:flex;align-items:center;justify-content:center;
-  box-shadow:0 0 24px rgba(0,212,168,0.15);
+  box-shadow:0 6px 18px -6px rgba(0,135,106,0.30);
 }
 .logo-mark svg{width:36px;height:36px;}
 
@@ -4479,14 +5550,14 @@ input:focus{border-color:var(--accent2);background:var(--bg4);}
 
 .btn-login{
   width:100%;
-  background:linear-gradient(180deg, var(--accent) 0%, #00b893 100%);
-  color:#06231d;font-weight:700;letter-spacing:0.04em;
+  background:linear-gradient(180deg, #00a07e 0%, var(--accent) 100%);
+  color:#ffffff;font-weight:700;letter-spacing:0.04em;
   border:none;border-radius:8px;
   padding:13px 16px;font-family:var(--sans);font-size:14px;
   cursor:pointer;
   margin-top:6px;
   transition:transform 0.05s, box-shadow 0.15s, filter 0.15s;
-  box-shadow:0 4px 14px rgba(0,212,168,0.3);
+  box-shadow:0 6px 16px -4px rgba(0,135,106,0.45);
 }
 .btn-login:hover{filter:brightness(1.05);}
 .btn-login:active{transform:translateY(1px);}

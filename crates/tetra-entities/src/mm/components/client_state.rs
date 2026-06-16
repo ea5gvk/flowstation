@@ -279,13 +279,10 @@ impl MmClientMgr {
     }
 
     /// Removes a client from the registry, returning its properties if found
-    /// Returns (issi, last_handle) for all known clients that have a valid handle (handle != 0).
-    /// Used by mm_bs to send D-LOCATION-UPDATE-COMMAND after Brew reconnection.
-    pub fn all_clients_with_handle(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
-        self.clients
-            .values()
-            .filter(|c| c.last_handle != 0)
-            .map(|c| (c.issi, c.last_handle))
+    /// Returns every known client's ISSI. Used by mm_bs to re-register all MS by ISSI (the L2
+    /// handle is inert: MLE addresses downlink MM PDUs by ISSI; `last_handle` is always 0).
+    pub fn all_known_issis(&self) -> Vec<u32> {
+        self.clients.keys().copied().collect()
     }
 
     /// Per-MS energy-economy monitoring windows, for publishing into shared state so the downlink
@@ -312,6 +309,33 @@ impl MmClientMgr {
         if let Some(client) = self.clients.get_mut(&issi) {
             client.last_handle = handle;
         }
+    }
+
+    /// Project the persistable recovery state of every known client: (issi, groups, energy mode).
+    /// Used by restart recovery to snapshot the registry to disk. The L2 handle is intentionally
+    /// omitted — it is inert (always 0) in this stack, so there is nothing to persist.
+    pub fn snapshot_for_recovery(&self) -> Vec<(u32, Vec<u32>, EnergySavingMode)> {
+        self.clients
+            .values()
+            .map(|c| (c.issi, c.groups.iter().copied().collect(), c.energy_saving_mode))
+            .collect()
+    }
+
+    /// Restore a client loaded from the recovery cache after a BS restart. The client is inserted
+    /// as Detached with its persisted groups + energy mode, a FRESH registration timer, and
+    /// cleared pending-command flags. This makes it `client_is_known()` — so the coverage-return
+    /// re-affiliation fires when it answers our replayed D-LOCATION-UPDATE-COMMAND — while NOT
+    /// flagging it for T351 expiry before the replay sweep completes (which would let the
+    /// second-expiry REJECT+remove path wipe the restored groups). No CMCE/Brew affiliation is
+    /// emitted here; that happens only when the MS actually re-registers.
+    pub fn restore_client(&mut self, issi: u32, groups: &[u32], esm: EnergySavingMode) {
+        let mut client = MmClientProperties::new(issi);
+        client.state = MmClientState::Detached;
+        client.energy_saving_mode = esm;
+        for &g in groups {
+            client.groups.insert(g);
+        }
+        self.clients.insert(issi, client);
     }
 
     pub fn remove_client(&mut self, ssi: u32) -> Option<MmClientProperties> {

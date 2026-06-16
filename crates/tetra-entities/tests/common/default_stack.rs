@@ -1,5 +1,5 @@
 use tetra_config::bluestation::{
-    CfgCellInfo, CfgNetInfo, CfgPhyIo, CfgSecurity, CfgWxService, PhyBackend, StackConfig, StackMode,
+    CfgCellInfo, CfgNetInfo, CfgPhyIo, CfgRecovery, CfgSecurity, CfgWxService, PhyBackend, StackConfig, StackMode,
 };
 use tetra_core::{freqs::FreqInfo, ranges::SortedDisjointSsiRanges};
 
@@ -25,6 +25,8 @@ pub fn default_test_config_bs() -> StackConfig {
         control: None,
         security: CfgSecurity::default(),
         wx_service: CfgWxService::default(),
+        recovery: CfgRecovery::default(),
+        telegram: None,
     }
 }
 
@@ -83,6 +85,7 @@ pub fn default_cell_info(freq_info: FreqInfo) -> CfgCellInfo {
         ul_inactivity_secs: 3,
         periodic_registration_secs: 3600,
         sds_command_control: None,
+        release_group_on_same_speaker_retake: false,
     }
 }
 

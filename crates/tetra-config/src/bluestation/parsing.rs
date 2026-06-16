@@ -14,7 +14,9 @@ use super::sec_brew::{CfgBrewDto, apply_brew_patch};
 use super::sec_dashboard::{CfgDashboardDto, apply_dashboard_patch};
 use super::sec_security::{CfgSecurityDto, apply_security_patch};
 use super::sec_wx::{CfgWxServiceDto, apply_wx_service_patch};
+use super::sec_recovery::{CfgRecoveryDto, apply_recovery_patch};
 use super::sec_telemetry::{CfgTelemetryDto, apply_telemetry_patch};
+use super::sec_telegram::{CfgTelegramDto, apply_telegram_patch};
 use super::{PhyIoDto, phy_dto_to_cfg};
 
 /// Build `StackConfig` from a TOML configuration file
@@ -116,6 +118,18 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
             return Err(format!("Unrecognized fields in telemetry config: {:?}", sorted_keys(&telemetry.extra)).into());
         }
 
+    // Optional telegram_alerts section
+    if let Some(ref telegram) = root.telegram_alerts
+        && !telegram.extra.is_empty() {
+            return Err(format!("Unrecognized fields in telegram_alerts config: {:?}", sorted_keys(&telegram.extra)).into());
+        }
+
+    // Optional recovery section — reject typos so the RF-affecting feature can't be left dormant.
+    if let Some(ref recovery) = root.recovery
+        && !recovery.extra.is_empty() {
+            return Err(format!("Unrecognized fields in recovery config: {:?}", sorted_keys(&recovery.extra)).into());
+        }
+
     // Build cell config, then inject the separately-parsed neighbor cells and sds_command_control
     let mut cell_cfg = cell_dto_to_cfg(root.cell_info);
     cell_cfg.neighbor_cells_ca = neighbor_cells_ca;
@@ -150,6 +164,8 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
         control: None,
         security: apply_security_patch(root.security.unwrap_or_default()),
         wx_service: apply_wx_service_patch(root.wx_service.unwrap_or_default()),
+        recovery: apply_recovery_patch(root.recovery.unwrap_or_default()),
+        telegram: None,
     };
 
     if let Some(brew) = root.brew {
@@ -166,6 +182,10 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
 
     if let Some(command) = root.command {
         cfg.control = Some(apply_control_patch(command)?);
+    }
+
+    if let Some(telegram) = root.telegram_alerts {
+        cfg.telegram = Some(apply_telegram_patch(telegram));
     }
 
     Ok(cfg)
@@ -214,6 +234,9 @@ struct TomlConfigRoot {
     security: Option<CfgSecurityDto>,
     #[serde(rename = "wx_service")]
     wx_service: Option<CfgWxServiceDto>,
+    recovery: Option<CfgRecoveryDto>,
+    #[serde(rename = "telegram_alerts")]
+    telegram_alerts: Option<CfgTelegramDto>,
 
     #[serde(flatten)]
     extra: HashMap<String, Value>,
@@ -309,9 +332,19 @@ use_tls = true
 ca_cert = "/tmp/ca.der"
 username = "station"
 password = "x"
+
+[recovery]
+enabled = true
+issi_allowlist = []
+max_replay_attempts = 150
+replay_per_frame = 1
+debounce_secs = 5
+max_cached_issis = 1024
 "#;
-        from_toml_str(toml)
+        let cfg = from_toml_str(toml)
             .unwrap_or_else(|e| panic!("documented optional blocks must parse when uncommented: {e}"));
+        assert!(cfg.recovery.enabled);
+        assert_eq!(cfg.recovery.max_replay_attempts, 150);
     }
 
     fn minimal_toml(extra_cell: &str) -> String {
@@ -395,5 +428,36 @@ main_carrier_number = 1586
     fn test_unrecognized_cell_info_field_still_rejected() {
         let toml = minimal_toml("bogus_field = 42");
         assert!(from_toml_str(&toml).is_err(), "should reject unknown field");
+    }
+
+    #[test]
+    fn telegram_alerts_section_parses() {
+        let toml = minimal_toml("") + r#"
+[telegram_alerts]
+enabled = true
+bot_token = "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
+chat_ids = [987654321, -1001234567890]
+alert_connect = true
+alert_critical_logs = false
+"#;
+        let cfg = from_toml_str(&toml).expect("telegram_alerts must parse");
+        let tg = cfg.telegram.expect("telegram section present");
+        assert!(tg.enabled);
+        assert_eq!(tg.chat_ids, vec![987654321, -1001234567890]);
+        // Explicit override is respected …
+        assert!(!tg.alert_critical_logs);
+        // … while unspecified toggles default to on.
+        assert!(tg.alert_disconnect);
+        assert!(tg.is_deliverable());
+    }
+
+    #[test]
+    fn telegram_alerts_unknown_field_rejected() {
+        let toml = minimal_toml("") + r#"
+[telegram_alerts]
+enabled = true
+bogus = 1
+"#;
+        assert!(from_toml_str(&toml).is_err(), "should reject unknown telegram_alerts field");
     }
 }

@@ -88,6 +88,9 @@ impl CcBsSubentity {
         call_id: u16,
         requesting_party: TetraAddress,
     ) -> Result<(), GroupTransitionError> {
+        // Read before borrowing the call (avoids a self borrow conflict with release below).
+        let release_on_retake = self.config.config().cell.release_group_on_same_speaker_retake;
+
         let Some(call) = self.active_calls.get_mut(&call_id) else {
             return Err(GroupTransitionError::UnknownCall(call_id));
         };
@@ -99,6 +102,21 @@ impl CcBsSubentity {
         let dest_ssi = call.dest_gssi;
         let current_speaker = call.source_issi;
         let grant_now = matches!(state, GroupCallState::NoActiveSpeaker { .. });
+
+        // Motorola quirk (e): legacy sets (MR5/MR19 era) ACK a same-speaker floor retake taken
+        // during hangtime but never key up the TCH/S, so the group hears a "silent over". When
+        // enabled, release the call instead of reusing the hanging circuit so the next PTT runs
+        // a full U-SETUP/D-CONNECT/D-SETUP cycle. `call`'s last use on this path is the
+        // `current_speaker` read above, so releasing (which needs &mut self) is borrow-safe.
+        if grant_now && release_on_retake && requesting_party.ssi == current_speaker {
+            tracing::info!(
+                "FSM: same-speaker hangtime retake (call_id={} ISSI {}) — releasing group call to force full re-setup (legacy silent-over workaround)",
+                call_id, requesting_party.ssi
+            );
+            self.release_group_call(queue, call_id, DisconnectCause::UserRequestedDisconnection);
+            return Ok(());
+        }
+
         let queue_result = if grant_now {
             call.grant_floor(requesting_party.ssi, Some(requesting_party));
             None

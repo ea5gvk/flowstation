@@ -157,6 +157,26 @@ pub struct WxRuntimeOverride {
     pub periodic_interval_secs: u64,
 }
 
+/// Runtime override for Telegram alerts, edited from the dashboard.
+///
+/// Mirrors the editable `[telegram_alerts]` config. When `Some`, it takes precedence over the
+/// config so toggles/edits (and the detected chat IDs / pasted token) apply immediately without
+/// a restart; the dashboard also writes the values back to the TOML so they persist. `None`
+/// means "no override — use the config value". The token is kept as a plain `String` here (the
+/// state is in-memory only); the config-side `CfgTelegram` wraps it in `SecretField`.
+#[derive(Debug, Clone, Default)]
+pub struct TelegramRuntimeOverride {
+    pub enabled: bool,
+    pub bot_token: String,
+    pub chat_ids: Vec<i64>,
+    pub alert_connect: bool,
+    pub alert_disconnect: bool,
+    pub alert_t351: bool,
+    pub alert_lip: bool,
+    pub alert_backhaul: bool,
+    pub alert_critical_logs: bool,
+}
+
 /// Mutable, stack-editable state (mutex-protected).
 #[derive(Debug, Clone)]
 pub struct StackState {
@@ -179,6 +199,8 @@ pub struct StackState {
     pub issi_whitelist_override: Option<Vec<u32>>,
     /// Runtime override for the WX/METAR service (dashboard toggle). See WxRuntimeOverride.
     pub wx_override: Option<WxRuntimeOverride>,
+    /// Runtime override for Telegram alerts (dashboard editing). See TelegramRuntimeOverride.
+    pub telegram_override: Option<TelegramRuntimeOverride>,
     /// Live map "identity currently reachable on a traffic channel" → (DL timeslot, usage_marker),
     /// republished every tick by CMCE call control from the live call tables (so it is never
     /// stale). Keyed by GSSI for active group calls and by each participant ISSI for connected
@@ -293,6 +315,7 @@ impl Default for StackState {
             next_live_sds_id: 1,
             issi_whitelist_override: None,
             wx_override: None,
+            telegram_override: None,
             active_call_ts: std::collections::HashMap::new(),
             ee_monitoring_windows: std::collections::HashMap::new(),
         }

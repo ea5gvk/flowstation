@@ -672,6 +672,12 @@ impl DashboardServer {
                     s.ms_map.remove(issi);
                     s.push_log("INFO", format!("MS {} deregistered", issi));
                 }
+                TelemetryEvent::MsTimeoutDrop { issi } => {
+                    // Same UI effect as a deregistration (the MS is gone from the cell); the
+                    // distinct event only matters to alert consumers that report the reason.
+                    s.ms_map.remove(issi);
+                    s.push_log("WARN", format!("MS {} dropped (no response to T351)", issi));
+                }
                 TelemetryEvent::MsGroupAttach { issi, gssis } => {
                     if let Some(e) = s.ms_map.get_mut(issi) {
                         for g in gssis { if !e.groups.contains(g) { e.groups.push(*g); } }
@@ -759,6 +765,9 @@ impl DashboardServer {
                 }
                 TelemetryEvent::SdsActivity { source_issi, dest_issi } => {
                     s.push_last_heard(*source_issi, "sds", *dest_issi);
+                }
+                TelemetryEvent::SdsLog { direction, source_issi, dest_issi, is_group, protocol_id, text } => {
+                    s.push_sds_log(direction, *source_issi, *dest_issi, *is_group, *protocol_id, text.clone());
                 }
                 TelemetryEvent::TsVoiceActivity { .. } => {
                     // Handled below with rate limiting — no state update needed
@@ -857,6 +866,8 @@ fn event_to_ws_msg(event: &TelemetryEvent) -> Option<String> {
             serde_json::json!({"type":"ms_registered","issi":issi}),
         TelemetryEvent::MsDeregistration { issi } =>
             serde_json::json!({"type":"ms_deregistered","issi":issi}),
+        TelemetryEvent::MsTimeoutDrop { issi } =>
+            serde_json::json!({"type":"ms_deregistered","issi":issi,"reason":"t351"}),
         TelemetryEvent::MsGroupAttach { issi, gssis } =>
             serde_json::json!({"type":"ms_groups","issi":issi,"groups":gssis}),
         TelemetryEvent::MsGroupDetach { issi, gssis } =>
@@ -881,6 +892,8 @@ fn event_to_ws_msg(event: &TelemetryEvent) -> Option<String> {
             serde_json::json!({"type":"brew_status","connected":connected,"brew_version":server_version}),
         TelemetryEvent::SdsActivity { source_issi, dest_issi } =>
             serde_json::json!({"type":"last_heard","issi":source_issi,"activity":"sds","dest":dest_issi}),
+        TelemetryEvent::SdsLog { direction, source_issi, dest_issi, is_group, protocol_id, text } =>
+            serde_json::json!({"type":"sds_log","direction":direction,"source_issi":source_issi,"dest_issi":dest_issi,"is_group":is_group,"protocol_id":protocol_id,"text":text}),
         TelemetryEvent::TsVoiceActivity { ts } =>
             serde_json::json!({"type":"ts_voice","ts":ts}),
         TelemetryEvent::TxVisual {
@@ -992,6 +1005,16 @@ fn send_control_cmd(cmd_tx: &Arc<Mutex<Option<CmdSender>>>, cmd: ControlCommand)
             let _ = tx.send(cmd);
         }
     }
+}
+
+/// GET /api/sds-log — the persisted SDS Log as a JSON array, newest entry first.
+fn serve_sds_log(stream: TcpStream, state: &DashboardState) {
+    let body = {
+        let s = state.read().unwrap();
+        let list: Vec<_> = s.sds_log.iter().rev().cloned().collect();
+        serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string())
+    };
+    http_json_response(stream, 200, &body);
 }
 
 /// Serialize the current live SDS queue to JSON and serve it.
@@ -1382,6 +1405,14 @@ fn handle_connection(
             Ok(_) => http_response(buf.into_inner(), 200, "OK"),
             Err(e) => http_response(buf.into_inner(), 500, &e.to_string()),
         }
+    } else if req_line.contains("GET /api/btsinfo") {
+        let mut buf = BufReader::new(stream);
+        loop {
+            let mut line = String::new();
+            let _ = buf.read_line(&mut line);
+            if line == "\r\n" || line.is_empty() || line == "\n" { break; }
+        }
+        serve_bts_info(buf.into_inner(), &shared_config);
     } else if req_line.contains("GET /api/whitelist") {
         let mut buf = BufReader::new(stream);
         loop {
@@ -1434,6 +1465,22 @@ fn handle_connection(
         let _ = buf.read_exact(&mut body);
         let body_str = String::from_utf8_lossy(&body);
         serve_wx_post(buf.into_inner(), &shared_config, &config_path, body_str.as_ref());
+    } else if req_line.contains("POST /api/telegram/verify") {
+        let (inner, body_str) = read_post_body(stream);
+        serve_telegram_verify(inner, &shared_config, &body_str);
+    } else if req_line.contains("POST /api/telegram/detect") {
+        let (inner, body_str) = read_post_body(stream);
+        serve_telegram_detect(inner, &shared_config, &body_str);
+    } else if req_line.contains("POST /api/telegram/test") {
+        let (inner, body_str) = read_post_body(stream);
+        serve_telegram_test(inner, &shared_config, &body_str);
+    } else if req_line.contains("GET /api/telegram") {
+        let mut s = stream;
+        drain_http_headers(&mut s);
+        serve_telegram_get(s, &shared_config);
+    } else if req_line.contains("POST /api/telegram") {
+        let (inner, body_str) = read_post_body(stream);
+        serve_telegram_post(inner, &shared_config, &config_path, &body_str);
     } else if req_line.contains("GET /api/config") {
         let mut buf = BufReader::new(stream);
         loop {
@@ -1442,6 +1489,15 @@ fn handle_connection(
             if line == "\r\n" || line.is_empty() || line == "\n" { break; }
         }
         serve_config_get(buf.into_inner(), &config_path);
+    } else if req_line.contains("GET /api/sds-log") {
+        // Return the persisted SDS Log (newest first) as JSON.
+        let mut buf = BufReader::new(stream);
+        loop {
+            let mut line = String::new();
+            let _ = buf.read_line(&mut line);
+            if line == "\r\n" || line.is_empty() || line == "\n" { break; }
+        }
+        serve_sds_log(buf.into_inner(), &state);
     } else if req_line.contains("GET /api/live-sds") {
         // Return current live SDS queue as JSON.
         let mut buf = BufReader::new(stream);
@@ -1880,6 +1936,52 @@ fn serve_update_check(mut stream: TcpStream) {
 /// GET /api/whitelist — return the effective whitelist as JSON:
 /// `{"issi_whitelist":[...], "source":"override"|"config", "enabled":bool}`.
 /// `enabled` is false when the list is empty (open network).
+/// GET /api/btsinfo — static cell + RF identity pulled from the running config, for the
+/// "TETRA BTS Details" card on the dashboard. Read-only; non-sensitive scalars only.
+fn serve_bts_info(
+    mut stream: TcpStream,
+    shared_config: &Option<tetra_config::bluestation::SharedConfig>,
+) {
+    let body = match shared_config {
+        Some(cfg) => {
+            // Whitelist status (runtime override beats config) — mirrors serve_whitelist_get.
+            let wl = match cfg.state_read().issi_whitelist_override.clone() {
+                Some(l) => l,
+                None => cfg.config().security.issi_whitelist.clone(),
+            };
+            let restricted = !wl.is_empty();
+            let wl_count = wl.len();
+
+            let c = cfg.config();
+            let soapy = c.phy_io.soapysdr.as_ref();
+            let tx = soapy.map(|s| s.dl_freq);     // downlink = BS transmit
+            let rx = soapy.map(|s| s.ul_freq);     // uplink   = BS receive
+            // Duplex shift expressed relative to TX (offset to add to TX to reach RX).
+            let shift = match (tx, rx) { (Some(t), Some(r)) => Some(r - t), _ => None };
+
+            serde_json::json!({
+                "tx_freq_hz": tx,
+                "rx_freq_hz": rx,
+                "shift_hz": shift,
+                "mcc": c.net.mcc,
+                "mnc": c.net.mnc,
+                "main_carrier": c.cell.main_carrier,
+                "neighbor_count": c.cell.neighbor_cells_ca.len(),
+                "hangtime_secs": c.cell.hangtime_secs,
+                "whitelist_restricted": restricted,
+                "whitelist_count": wl_count,
+            }).to_string()
+        }
+        None => "{}".to_string(),
+    };
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(header.as_bytes());
+    let _ = stream.write_all(body.as_bytes());
+}
+
 fn serve_whitelist_get(
     mut stream: TcpStream,
     shared_config: &Option<tetra_config::bluestation::SharedConfig>,
@@ -2076,6 +2178,247 @@ fn serve_wx_post(
         ov.enabled, ov.service_issi, ov.periodic_enabled, ov.periodic_issi, ov.periodic_icao
     );
     http_response(stream, 200, "OK");
+}
+
+/// Read an HTTP POST body off `stream`, returning the stream plus the body as a UTF-8 string.
+fn read_post_body(mut stream: TcpStream) -> (TcpStream, String) {
+    let body = read_http_body(&mut stream);
+    let s = String::from_utf8_lossy(&body).into_owned();
+    (stream, s)
+}
+
+/// Resolve the bot token to use for a verify/detect/test/save request: a freshly-typed token from
+/// the body (never the masked placeholder, which contains '…'), else the currently-saved one.
+fn telegram_resolve_token(
+    json: &serde_json::Value,
+    shared_config: &Option<tetra_config::bluestation::SharedConfig>,
+) -> String {
+    if let Some(t) = json.get("bot_token").and_then(|v| v.as_str()) {
+        let t = t.trim();
+        if !t.is_empty() && !t.contains('…') {
+            return t.to_string();
+        }
+    }
+    match shared_config {
+        Some(cfg) => cfg.effective_telegram().bot_token.as_ref().to_string(),
+        None => String::new(),
+    }
+}
+
+/// Whether a bot token is safe to store. Empty is allowed (not yet configured). A real Telegram
+/// token is `<bot-id>:<auth>` with no whitespace or control characters — rejecting anything else
+/// keeps the token safe inside the config TOML (a stray newline would corrupt the file) and inside
+/// the API URL path.
+fn telegram_token_acceptable(t: &str) -> bool {
+    t.is_empty()
+        || (t.contains(':') && t.chars().all(|c| !c.is_whitespace() && !c.is_control()))
+}
+
+/// GET /api/telegram — return the effective Telegram settings as JSON. The token is masked and is
+/// never echoed in the clear; `token_set` tells the UI whether one is stored.
+fn serve_telegram_get(
+    stream: TcpStream,
+    shared_config: &Option<tetra_config::bluestation::SharedConfig>,
+) {
+    let tg = match shared_config {
+        Some(cfg) => cfg.effective_telegram(),
+        None => tetra_config::bluestation::CfgTelegram::default(),
+    };
+    let masked = crate::net_dashboard::telegram::mask_token(tg.bot_token.as_ref());
+    let token_set = !tg.bot_token.as_ref().trim().is_empty();
+    let chat_ids = tg.chat_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+    let body = format!(
+        "{{\"enabled\":{},\"bot_token_masked\":\"{}\",\"token_set\":{},\"chat_ids\":[{}],\"alert_connect\":{},\"alert_disconnect\":{},\"alert_t351\":{},\"alert_lip\":{},\"alert_backhaul\":{},\"alert_critical_logs\":{}}}",
+        tg.enabled,
+        crate::net_dashboard::telegram::json_escape(&masked),
+        token_set,
+        chat_ids,
+        tg.alert_connect, tg.alert_disconnect, tg.alert_t351, tg.alert_lip, tg.alert_backhaul, tg.alert_critical_logs,
+    );
+    http_json_response(stream, 200, &body);
+}
+
+/// POST /api/telegram — save Telegram settings. Applies immediately via the StackState override
+/// AND rewrites the TOML. The token is only changed when a fresh (non-masked) one is supplied.
+fn serve_telegram_post(
+    stream: TcpStream,
+    shared_config: &Option<tetra_config::bluestation::SharedConfig>,
+    config_path: &str,
+    body: &str,
+) {
+    use tetra_config::bluestation::TelegramRuntimeOverride;
+
+    let json: serde_json::Value = match serde_json::from_str(body.trim()) {
+        Ok(v) => v,
+        Err(e) => {
+            http_response(stream, 400, &format!("Invalid JSON: {e}"));
+            return;
+        }
+    };
+    let Some(cfg) = shared_config else {
+        http_response(stream, 503, "Config not available");
+        return;
+    };
+
+    let cur = cfg.effective_telegram();
+    let as_bool = |k: &str, d: bool| json.get(k).and_then(|x| x.as_bool()).unwrap_or(d);
+
+    let bot_token = telegram_resolve_token(&json, shared_config);
+    if !telegram_token_acceptable(&bot_token) {
+        http_response(stream, 400, "Token invalid: fără spații/caractere de control și trebuie să conțină ':'.");
+        return;
+    }
+    let chat_ids = match json.get("chat_ids").and_then(|v| v.as_array()) {
+        Some(arr) => arr.iter().filter_map(|v| v.as_i64()).collect::<Vec<i64>>(),
+        None => cur.chat_ids.clone(),
+    };
+
+    let ov = TelegramRuntimeOverride {
+        enabled: as_bool("enabled", cur.enabled),
+        bot_token,
+        chat_ids,
+        alert_connect: as_bool("alert_connect", cur.alert_connect),
+        alert_disconnect: as_bool("alert_disconnect", cur.alert_disconnect),
+        alert_t351: as_bool("alert_t351", cur.alert_t351),
+        alert_lip: as_bool("alert_lip", cur.alert_lip),
+        alert_backhaul: as_bool("alert_backhaul", cur.alert_backhaul),
+        alert_critical_logs: as_bool("alert_critical_logs", cur.alert_critical_logs),
+    };
+
+    {
+        let mut state = cfg.state_write();
+        state.telegram_override = Some(ov.clone());
+    }
+
+    if let Err(e) = crate::net_dashboard::telegram::write_telegram_to_toml(config_path, &ov) {
+        tracing::warn!("Dashboard: Telegram applied at runtime but failed to persist to TOML: {}", e);
+        http_response(stream, 200, "Applied at runtime; failed to write config file (check permissions)");
+        return;
+    }
+
+    tracing::info!(
+        "Dashboard: Telegram alerts updated (enabled={} chats={})",
+        ov.enabled,
+        ov.chat_ids.len()
+    );
+    http_response(stream, 200, "OK");
+}
+
+/// POST /api/telegram/verify — validate the token via getMe and return the bot @username.
+fn serve_telegram_verify(
+    stream: TcpStream,
+    shared_config: &Option<tetra_config::bluestation::SharedConfig>,
+    body: &str,
+) {
+    let json: serde_json::Value = serde_json::from_str(body.trim()).unwrap_or(serde_json::Value::Null);
+    let token = telegram_resolve_token(&json, shared_config);
+    if token.is_empty() {
+        http_json_response(stream, 200, "{\"ok\":false,\"error\":\"Niciun token setat\"}");
+        return;
+    }
+    let client = crate::net_telegram::TelegramClient::new();
+    match client.get_me(&token) {
+        Ok(info) => {
+            let body = format!(
+                "{{\"ok\":true,\"username\":\"{}\"}}",
+                crate::net_dashboard::telegram::json_escape(&info.username)
+            );
+            http_json_response(stream, 200, &body);
+        }
+        Err(e) => {
+            let body = format!(
+                "{{\"ok\":false,\"error\":\"{}\"}}",
+                crate::net_dashboard::telegram::json_escape(&e)
+            );
+            http_json_response(stream, 200, &body);
+        }
+    }
+}
+
+/// POST /api/telegram/detect — return the chats that recently messaged the bot (getUpdates).
+fn serve_telegram_detect(
+    stream: TcpStream,
+    shared_config: &Option<tetra_config::bluestation::SharedConfig>,
+    body: &str,
+) {
+    let json: serde_json::Value = serde_json::from_str(body.trim()).unwrap_or(serde_json::Value::Null);
+    let token = telegram_resolve_token(&json, shared_config);
+    if token.is_empty() {
+        http_json_response(stream, 200, "{\"ok\":false,\"error\":\"Niciun token setat\"}");
+        return;
+    }
+    let client = crate::net_telegram::TelegramClient::new();
+    match client.get_updates(&token) {
+        Ok(chats) => {
+            let items = chats
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{{\"id\":{},\"name\":\"{}\",\"kind\":\"{}\"}}",
+                        c.id,
+                        crate::net_dashboard::telegram::json_escape(&c.name),
+                        crate::net_dashboard::telegram::json_escape(&c.kind)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let body = format!("{{\"ok\":true,\"chats\":[{}]}}", items);
+            http_json_response(stream, 200, &body);
+        }
+        Err(e) => {
+            let body = format!(
+                "{{\"ok\":false,\"error\":\"{}\"}}",
+                crate::net_dashboard::telegram::json_escape(&e)
+            );
+            http_json_response(stream, 200, &body);
+        }
+    }
+}
+
+/// POST /api/telegram/test — send a test alert to the configured (or body-supplied) chats.
+fn serve_telegram_test(
+    stream: TcpStream,
+    shared_config: &Option<tetra_config::bluestation::SharedConfig>,
+    body: &str,
+) {
+    let json: serde_json::Value = serde_json::from_str(body.trim()).unwrap_or(serde_json::Value::Null);
+    let Some(cfg) = shared_config else {
+        http_json_response(stream, 200, "{\"ok\":false,\"error\":\"Config indisponibil\"}");
+        return;
+    };
+    let token = telegram_resolve_token(&json, shared_config);
+    let tg = cfg.effective_telegram();
+    let chat_ids: Vec<i64> = match json.get("chat_ids").and_then(|v| v.as_array()) {
+        Some(arr) => arr.iter().filter_map(|v| v.as_i64()).collect(),
+        None => tg.chat_ids.clone(),
+    };
+    if token.is_empty() {
+        http_json_response(stream, 200, "{\"ok\":false,\"error\":\"Niciun token setat\"}");
+        return;
+    }
+    if chat_ids.is_empty() {
+        http_json_response(stream, 200, "{\"ok\":false,\"error\":\"Niciun Chat ID setat\"}");
+        return;
+    }
+    let station = crate::net_telegram::format::StationInfo::from_config(cfg);
+    let html = crate::net_telegram::format::test_message(&station);
+    let client = crate::net_telegram::TelegramClient::new();
+    let mut sent = 0u32;
+    let mut errors: Vec<String> = Vec::new();
+    for id in &chat_ids {
+        match client.send_message_html(&token, *id, &html) {
+            Ok(_) => sent += 1,
+            Err(e) => errors.push(format!("{id}: {e}")),
+        }
+    }
+    let ok = errors.is_empty();
+    let body = format!(
+        "{{\"ok\":{},\"sent\":{},\"error\":\"{}\"}}",
+        ok,
+        sent,
+        crate::net_dashboard::telegram::json_escape(&errors.join("; "))
+    );
+    http_json_response(stream, 200, &body);
 }
 
 fn serve_system_info(mut stream: TcpStream, config_path: &str) {

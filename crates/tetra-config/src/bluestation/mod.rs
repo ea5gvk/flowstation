@@ -34,5 +34,11 @@ pub use sec_security::*;
 pub mod sec_wx;
 pub use sec_wx::*;
 
+pub mod sec_telegram;
+pub use sec_telegram::*;
+
+pub mod sec_recovery;
+pub use sec_recovery::*;
+
 pub mod state;
 pub use state::*;

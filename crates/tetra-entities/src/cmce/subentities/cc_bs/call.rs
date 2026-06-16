@@ -87,6 +87,14 @@ pub(super) struct ActiveCall {
     pub(super) hangtime_start: Option<TdmaTime>,
     pub(super) queued_tx_demand: Option<TetraAddress>,
     pub(super) brew_uuid: Option<uuid::Uuid>,
+    /// Energy-economy announce coverage: affiliated member ISSIs that have had a downlink wake
+    /// frame since the call started (so they will have received the group D-SETUP). Members on
+    /// different EE phases wake at different frames, so the BS re-emits the announcement until
+    /// every EE member is covered. See `drive_group_ee_announce`.
+    pub(super) ee_announce_covered: std::collections::HashSet<u32>,
+    /// Set once every affiliated EE member is covered (or the bounded announce window elapses),
+    /// after which the per-frame re-emit stops and the normal late-entry cadence takes over.
+    pub(super) ee_announce_done: bool,
 }
 
 impl ActiveCall {
@@ -111,6 +119,8 @@ impl ActiveCall {
             hangtime_start: None,
             queued_tx_demand: None,
             brew_uuid: None,
+            ee_announce_covered: std::collections::HashSet::new(),
+            ee_announce_done: false,
         }
     }
 
@@ -135,6 +145,8 @@ impl ActiveCall {
             hangtime_start: None,
             queued_tx_demand: None,
             brew_uuid: Some(brew_uuid),
+            ee_announce_covered: std::collections::HashSet::new(),
+            ee_announce_done: false,
         }
     }
 

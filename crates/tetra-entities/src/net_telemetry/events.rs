@@ -17,6 +17,11 @@ pub enum TelemetryEvent {
     MsRegistration { issi: u32 },
     /// MS deregistered. Also counts as deregistration for all groups.
     MsDeregistration { issi: u32 },
+    /// MS dropped because it did not answer the periodic registration (T351). Emitted in
+    /// addition to `MsDeregistration` for the same ISSI — consumers that distinguish the reason
+    /// (e.g. Telegram alerts) should coalesce the two. LIP/APRS position beacons are detected
+    /// separately from `SdsLog { protocol_id: 10 }`, so no dedicated event is needed for them.
+    MsTimeoutDrop { issi: u32 },
     /// MS affiliated to groups
     MsGroupAttach { issi: u32, gssis: Vec<u32> },
     /// Full snapshot of all currently attached groups — emitted after any attach/detach
@@ -41,6 +46,19 @@ pub enum TelemetryEvent {
     BrewConnected { connected: bool, server_version: u8 },
     /// SDS message activity (local delivery or group)
     SdsActivity { source_issi: u32, dest_issi: u32 },
+    /// One SDS message handled by the BS, for the dashboard SDS Log tab. `direction`:
+    /// "rx" = uplink received from a local MS over the air, "net" = arrived from the
+    /// network (Brew/SwMI) for local delivery, "tx" = injected by the dashboard operator.
+    /// `text` is the best-effort decoded message body (empty for status/report/binary
+    /// payloads); `protocol_id` is the leading SDS protocol-identifier byte.
+    SdsLog {
+        direction: String,
+        source_issi: u32,
+        dest_issi: u32,
+        is_group: bool,
+        protocol_id: u8,
+        text: String,
+    },
     /// Voice frame activity on a traffic timeslot (UL or DL)
     TsVoiceActivity { ts: u8 },
     /// Fast visual feed for the RF dashboard: spectrum + constellation + RMS/peak.

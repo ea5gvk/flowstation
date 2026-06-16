@@ -2,11 +2,12 @@ use serde::Deserialize;
 use std::sync::{Arc, RwLock};
 use tetra_core::freqs::FreqInfo;
 
-use crate::bluestation::{CfgCellInfo, CfgControl, CfgNetInfo, CfgPhyIo, CfgSecurity, CfgWxService, PhyBackend, StackState};
+use crate::bluestation::{CfgCellInfo, CfgControl, CfgNetInfo, CfgPhyIo, CfgRecovery, CfgSecurity, CfgWxService, PhyBackend, StackState};
 
 use super::sec_dashboard::CfgDashboard;
 use super::sec_brew::CfgBrew;
 use super::sec_telemetry::CfgTelemetry;
+use super::sec_telegram::CfgTelegram;
 
 /// Wrapper for a string that should be treated as a secret. Display and Debug will redact the actual value,
 /// to prevent accidental logging of secrets.
@@ -85,6 +86,12 @@ pub struct StackConfig {
 
     /// Built-in WX/METAR SDS service configuration
     pub wx_service: CfgWxService,
+
+    /// Restart-recovery configuration (proactive cold-start re-registration). Default disabled.
+    pub recovery: CfgRecovery,
+
+    /// Telegram alerts configuration (None = no `[telegram_alerts]` section in the config file).
+    pub telegram: Option<CfgTelegram>,
 }
 
 impl StackConfig {
@@ -195,6 +202,15 @@ impl StackConfig {
                 && v > 0x3F { return Err("cell.neighbor_cells_ca: tdma_frame_offset must be 0-63"); }
         }
 
+        // Restart recovery: an explicit allowlist must not exceed the cache cap (the numeric
+        // ranges are already clamped in apply_recovery_patch). Only meaningful when enabled.
+        if self.recovery.enabled
+            && !self.recovery.issi_allowlist.is_empty()
+            && self.recovery.issi_allowlist.len() as u32 > self.recovery.max_cached_issis
+        {
+            return Err("recovery.issi_allowlist has more entries than recovery.max_cached_issis");
+        }
+
         Ok(())
     }
 }
@@ -251,6 +267,29 @@ impl SharedConfig {
                 periodic_is_group: o.periodic_is_group,
                 periodic_icao: o.periodic_icao.clone(),
                 periodic_interval_secs: o.periodic_interval_secs,
+            }
+        } else {
+            base
+        }
+    }
+
+    /// Effective Telegram alerts settings: the dashboard runtime override if present, otherwise
+    /// the config file values (or defaults when there is no `[telegram_alerts]` section). Returns
+    /// an owned [`CfgTelegram`] so callers don't hold the state lock. The alerter and the
+    /// dashboard both read through this so a live edit applies without a restart.
+    pub fn effective_telegram(&self) -> crate::bluestation::CfgTelegram {
+        let base = self.cfg.telegram.clone().unwrap_or_default();
+        if let Some(o) = self.state_read().telegram_override.as_ref() {
+            crate::bluestation::CfgTelegram {
+                enabled: o.enabled,
+                bot_token: crate::bluestation::SecretField::from(o.bot_token.clone()),
+                chat_ids: o.chat_ids.clone(),
+                alert_connect: o.alert_connect,
+                alert_disconnect: o.alert_disconnect,
+                alert_t351: o.alert_t351,
+                alert_lip: o.alert_lip,
+                alert_backhaul: o.alert_backhaul,
+                alert_critical_logs: o.alert_critical_logs,
             }
         } else {
             base
