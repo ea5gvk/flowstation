@@ -606,3 +606,7 @@ voice_service = true
 # (only local_ssi_ranges rejects inbound). If left commented, all calls outside
 # local_ssi_ranges are forwarded to Brew.
 # whitelisted_ssis = [91]
+
+# Optional PBX gateway ISSIs that should always be considered Brew-routable
+# (useful for phone/PBX interconnect IDs that do not follow normal Tetrapack ISSI rules)
+# pbx_gateway_issis = [16777184, 16777186]

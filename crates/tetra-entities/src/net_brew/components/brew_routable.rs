@@ -21,6 +21,15 @@ fn is_tetrapack(config: &SharedConfig) -> bool {
     }
 }
 
+fn is_pbx_gateway_issi(config: &SharedConfig, issi: u32) -> bool {
+    config
+        .config()
+        .brew
+        .as_ref()
+        .and_then(|brew| brew.pbx_gateway_issis.as_ref())
+        .is_some_and(|allowed| allowed.contains(&issi))
+}
+
 /// Determine if a given GSSI should be routed over Brew, or is restricted to local handling
 pub fn is_brew_gssi_routable(config: &SharedConfig, ssi: u32) -> bool {
     let Some(brew_config) = &config.config().brew else {
@@ -76,7 +85,7 @@ pub fn is_brew_issi_routable(config: &SharedConfig, issi: u32) -> bool {
         // 7-digit subscriber ISSIs are always routable.
         // Short ISSIs (< 1_000_000) are service numbers handled by TetraPack Core —
         // let them through so the core can respond (echo test 600, etc.)
-        issi >= 1_000_000 && issi <= 9_999_999 || issi < 1_000_000
+        (issi >= 1_000_000 && issi <= 9_999_999) || issi < 1_000_000 || is_pbx_gateway_issi(config, issi)
     } else {
         true
     }

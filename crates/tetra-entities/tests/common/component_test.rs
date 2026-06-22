@@ -199,10 +199,11 @@ impl ComponentTest {
         let mut msgs = vec![];
         for sink in self.sinks.iter() {
             if let Some(component) = self.router.get_entity(*sink)
-                && let Some(sink) = component.as_any_mut().downcast_mut::<Sink>() {
-                    let mut sink_msgs = sink.take_msgqueue();
-                    msgs.append(&mut sink_msgs);
-                }
+                && let Some(sink) = component.as_any_mut().downcast_mut::<Sink>()
+            {
+                let mut sink_msgs = sink.take_msgqueue();
+                msgs.append(&mut sink_msgs);
+            }
         }
         msgs
     }

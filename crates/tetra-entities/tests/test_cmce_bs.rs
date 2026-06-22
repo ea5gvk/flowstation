@@ -407,8 +407,7 @@ fn test_duplex_individual_uses_infinite_timeout() {
     test.run_stack(Some(1));
     let setup_msgs = test.dump_sinks();
 
-    let (mut setup_sdu, _) =
-        find_lcmc_req(&setup_msgs, called_issi, CmcePduTypeDl::DSetup).expect("Expected D-SETUP to called ISSI");
+    let (mut setup_sdu, _) = find_lcmc_req(&setup_msgs, called_issi, CmcePduTypeDl::DSetup).expect("Expected D-SETUP to called ISSI");
     let d_setup = DSetup::from_bitbuf(&mut setup_sdu).expect("Failed to parse DSetup");
     assert_eq!(d_setup.call_time_out, CallTimeout::Infinite);
     assert!(d_setup.simplex_duplex_selection);
@@ -740,6 +739,7 @@ fn test_network_group_speaker_change_uses_remote_floor_grant() {
         feature_sds_enabled: true,
         whitelisted_ssis: None,
         feature_rssi_export: false,
+        pbx_gateway_issis: None,
     });
     let mut test = ComponentTest::from_config(config, Some(TdmaTime { h: 0, m: 1, f: 1, t: 1 }));
     test.populate_entities(
