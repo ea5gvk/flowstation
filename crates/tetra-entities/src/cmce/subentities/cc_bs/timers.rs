@@ -175,6 +175,29 @@ impl CcBsSubentity {
         }
     }
 
+    /// Publish the live "identity on a traffic channel → (timeslot, usage_marker)" map into
+    /// shared state so the SDS path can FACCH-steal to an MS engaged in a call instead of
+    /// sending on the MCCH it is no longer monitoring (ETSI EN 300 392-2 §23.5). Rebuilt from
+    /// the live call tables every tick, so it can never reference a stale/closed circuit.
+    pub fn publish_active_call_ts(&self) {
+        use std::collections::HashMap;
+        let mut map: HashMap<u32, (u8, u8)> = HashMap::new();
+        // Group calls: the group address and the current/last speaker ISSI are both on the
+        // group's assigned traffic slot.
+        for call in self.active_calls.values() {
+            map.insert(call.dest_gssi, (call.ts, call.usage));
+            map.insert(call.source_issi, (call.ts, call.usage));
+        }
+        // Individual calls: parties are on a traffic channel only once the call is connected.
+        for call in self.individual_calls.values() {
+            if call.is_active() {
+                map.insert(call.calling_addr.ssi, (call.calling_ts, call.calling_usage));
+                map.insert(call.called_addr.ssi, (call.called_ts, call.called_usage));
+            }
+        }
+        self.config.state_write().active_call_ts = map;
+    }
+
     /// Release active calls when their configured call timeout expires.
     pub(super) fn check_call_timeout_expiry(&mut self, queue: &mut MessageQueue) {
         let expired_group_calls: Vec<u16> = self

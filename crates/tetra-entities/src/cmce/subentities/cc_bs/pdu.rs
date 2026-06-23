@@ -284,6 +284,59 @@ impl CcBsSubentity {
         }
     }
 
+    // ── Dashboard / API helpers ────────────────────────────────────────────────
+
+    /// Returns all currently registered ISSI values.
+    pub fn subscriber_issis(&self) -> Vec<u32> {
+        self.subscriber_groups.keys().copied().collect()
+    }
+
+    /// Returns the list of GSSIs the given ISSI is affiliated to.
+    pub fn subscriber_groups_for(&self, issi: u32) -> Vec<u32> {
+        self.subscriber_groups
+            .get(&issi)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Force-deregister an MS: release its active calls and clean up state.
+    /// Returns true if the MS was known.
+    pub fn kick_ms(&mut self, queue: &mut MessageQueue, issi: u32) -> bool {
+        if !self.subscriber_groups.contains_key(&issi) {
+            tracing::warn!("CMCE: kick_ms issi={} not found in subscriber_groups", issi);
+            return false;
+        }
+        // Release all active individual calls involving this MS
+        let individual_ids: Vec<u16> = self
+            .individual_calls
+            .iter()
+            .filter(|(_, c)| c.calling_addr.ssi == issi || c.called_addr.ssi == issi)
+            .map(|(&id, _)| id)
+            .collect();
+        for id in individual_ids {
+            self.release_individual_call(queue, id, DisconnectCause::UserRequestedDisconnection);
+        }
+        // Clean up CMCE state
+        if let Some(groups) = self.subscriber_groups.remove(&issi) {
+            for g in &groups {
+                self.dec_group_listener(*g);
+            }
+        }
+        // Tell MM to deregister the MS — this also notifies Brew
+        queue.push_back(SapMsg {
+            sap: Sap::Control,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Mm,
+            msg: SapMsgInner::MmSubscriberUpdate(MmSubscriberUpdate {
+                issi,
+                groups: Vec::new(),
+                action: BrewSubscriberAction::Deregister,
+            }),
+        });
+        tracing::info!("CMCE: kick_ms issi={} — deregistered", issi);
+        true
+    }
+
     pub(super) fn find_individual_call_by_issi(&self, issi: u32) -> Option<(u16, IndividualCallState)> {
         self.individual_calls
             .iter()

@@ -1116,8 +1116,16 @@ impl BsChannelScheduler {
             return Some(q.remove(i));
         }
 
-        // Return Resources last
+        // Return Resources next
         if let Some(i) = q.iter().position(|e| matches!(e, DlSchedElem::Resource(_, _, _))) {
+            return Some(q.remove(i));
+        }
+
+        // Return Stealing items last. They belong on traffic timeslots; surfacing them
+        // here lets dl_build_block_from_signalling_schedule's Stealing arm discard any that
+        // wrongly landed on a signalling slot, rather than leaving them queued forever
+        // (which would also leak the traffic timeslot via has_pending_stealing).
+        if let Some(i) = q.iter().position(|e| matches!(e, DlSchedElem::Stealing(..))) {
             return Some(q.remove(i));
         }
 

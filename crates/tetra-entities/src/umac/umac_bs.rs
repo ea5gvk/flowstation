@@ -1349,11 +1349,10 @@ impl UmacBs {
             // DL voice from Brew/upper layer → schedule for DL transmission
             SapMsgInner::TmdCircuitDataReq(prim) => {
                 let ts = prim.ts;
-                // Refresh UL inactivity timer when DL voice is being fed (network call scenario).
-                // This prevents false timeout when Brew is the speaker and no UL radio is transmitting.
-                if (1..=4).contains(&ts) && self.channel_scheduler.circuit_is_active(Direction::Ul, ts) {
-                    self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
-                }
+                // Network/shared downlink media (Brew/TetraPack -> DL) must NOT arm the local
+                // UL stuck-transmitter timer: the speaker is remote and no local radio is
+                // transmitting. The timer only tracks locally-owned uplink, which is armed by
+                // CallControl::FloorGranted and refreshed by TmdCircuitDataInd (real UL frames).
                 if self.channel_scheduler.circuit_is_active(Direction::Dl, ts) {
                     self.channel_scheduler.dl_schedule_tmd(ts, prim.data);
                 } else {
@@ -1548,10 +1547,12 @@ impl UmacBs {
             };
             self.channel_scheduler.create_circuit(d, c);
 
-            // Start UL inactivity timer when opening a UL circuit
-            if d == Direction::Ul && (1..=4).contains(&ts) {
-                self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
-            }
+            // Do NOT arm the UL inactivity (stuck-transmitter) timer merely because a
+            // UL-capable circuit was opened. A UL circuit is a shared resource; opening it
+            // says nothing about whether local uplink voice is expected. For locally-owned
+            // calls the timer is armed by CallControl::FloorGranted and refreshed by real UL
+            // frames; for SwMI network/shared calls no local radio transmits, so it must
+            // stay disarmed (None) to avoid a false UlInactivityTimeout.
 
             tracing::debug!("  rx_control_circuit_open: Setup {:?} circuit for ts {}", d, ts);
         }
