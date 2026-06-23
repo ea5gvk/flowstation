@@ -4,6 +4,9 @@ use tetra_core::Direction;
 use tetra_config::bluestation::StackMode;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Layer2Service, PhyBlockNum, Sap, SsiType, TdmaTime, TetraAddress, debug};
+use tetra_pdus::umac::pdus::mac_access::MacAccess;
+use tetra_pdus::umac::pdus::mac_resource::MacResource;
+use tetra_pdus::umac::pdus::mac_u_signal::MacUSignal;
 use tetra_saps::control::call_control::{CallControl, Circuit, CircuitDlMediaSource};
 use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
 use tetra_saps::lcmc::enums::alloc_type::ChanAllocType;
@@ -11,10 +14,196 @@ use tetra_saps::lcmc::enums::ul_dl_assignment::UlDlAssignment;
 use tetra_saps::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
 use tetra_saps::lmm::LmmMleUnitdataReq;
 use tetra_saps::sapmsg::{SapMsg, SapMsgInner};
-use tetra_saps::tma::TmaUnitdataReq;
+use tetra_saps::tmd::TmdCircuitDataReq;
+use tetra_saps::tma::{TmaUnitdataInd, TmaUnitdataReq};
 use tetra_saps::tmv::{TmvUnitdataInd, enums::logical_chans::LogicalChannel};
 
 use crate::common::ComponentTest;
+
+fn open_shared_voice_circuit(ts: u8) -> SapMsg {
+    SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Cmce,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::CmceCallControl(CallControl::Open(Circuit {
+            direction: Direction::Both,
+            ts,
+            peer_ts: None,
+            usage: 4,
+            circuit_mode: CircuitModeType::TchS,
+            speech_service: Some(0),
+            etee_encrypted: false,
+            dl_media_source: CircuitDlMediaSource::SwMI,
+        })),
+    }
+}
+
+#[test]
+fn test_opening_shared_circuit_does_not_start_ul_inactivity_timer() {
+    debug::setup_logging_verbose();
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { h: 0, m: 1, f: 1, t: 1 }));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Cmce]);
+
+    test.submit_message(open_shared_voice_circuit(2));
+    test.run_stack(Some(3 * 18 * 4 + 10));
+    let sink_msgs = test.dump_sinks();
+
+    assert!(
+        !sink_msgs
+            .iter()
+            .any(|msg| matches!(&msg.msg, SapMsgInner::CmceCallControl(CallControl::UlInactivityTimeout { ts: 2 }))),
+        "Opening an UL-capable circuit must not imply that local uplink voice is expected"
+    );
+}
+
+#[test]
+fn test_floor_grant_starts_ul_inactivity_timer() {
+    debug::setup_logging_verbose();
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { h: 0, m: 1, f: 1, t: 1 }));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Cmce]);
+
+    test.submit_message(open_shared_voice_circuit(2));
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Cmce,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+            call_id: 1,
+            source_issi: 1000001,
+            dest_gssi: 1000002,
+            ts: 2,
+        }),
+    });
+    test.run_stack(Some(3 * 18 * 4 + 10));
+    let sink_msgs = test.dump_sinks();
+
+    assert!(
+        sink_msgs
+            .iter()
+            .any(|msg| matches!(&msg.msg, SapMsgInner::CmceCallControl(CallControl::UlInactivityTimeout { ts: 2 }))),
+        "A local floor grant should still arm stuck-uplink detection"
+    );
+}
+
+#[test]
+fn test_network_downlink_voice_does_not_start_ul_inactivity_timer() {
+    debug::setup_logging_verbose();
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { h: 0, m: 1, f: 1, t: 1 }));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Cmce]);
+
+    test.submit_message(open_shared_voice_circuit(2));
+    test.submit_message(SapMsg {
+        sap: Sap::TmdSap,
+        src: TetraEntity::Brew,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmdCircuitDataReq(TmdCircuitDataReq { ts: 2, data: vec![0; 36] }),
+    });
+    test.run_stack(Some(3 * 18 * 4 + 10));
+    let sink_msgs = test.dump_sinks();
+
+    assert!(
+        !sink_msgs
+            .iter()
+            .any(|msg| matches!(&msg.msg, SapMsgInner::CmceCallControl(CallControl::UlInactivityTimeout { ts: 2 }))),
+        "Remote downlink media must not arm local stuck-uplink detection"
+    );
+}
+
+#[test]
+fn test_remote_floor_grant_resumes_traffic_without_ul_inactivity_timer() {
+    debug::setup_logging_verbose();
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { h: 0, m: 1, f: 1, t: 1 }));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Cmce]);
+
+    test.submit_message(open_shared_voice_circuit(2));
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Cmce,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::CmceCallControl(CallControl::FloorReleased { call_id: 1, ts: 2 }),
+    });
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Cmce,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::CmceCallControl(CallControl::RemoteFloorGranted { call_id: 1, ts: 2 }),
+    });
+    test.run_stack(Some(3 * 18 * 4 + 10));
+    let sink_msgs = test.dump_sinks();
+
+    assert!(
+        !sink_msgs
+            .iter()
+            .any(|msg| matches!(&msg.msg, SapMsgInner::CmceCallControl(CallControl::UlInactivityTimeout { ts: 2 }))),
+        "Remote floor grants must resume traffic mode without arming local stuck-uplink detection"
+    );
+}
+
+#[test]
+fn test_ul_mac_u_signal_uses_floor_owner_and_timeslot_link() {
+    debug::setup_logging_verbose();
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { h: 0, m: 1, f: 1, t: 3 }));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Llc]);
+
+    test.submit_message(open_shared_voice_circuit(2));
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Cmce,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+            call_id: 1,
+            source_issi: 2200769,
+            dest_gssi: 2200699,
+            ts: 2,
+        }),
+    });
+    test.run_stack(Some(1));
+    test.dump_sinks();
+
+    let mut pdu = BitBuffer::new_autoexpand(16);
+    MacUSignal {
+        second_half_stolen: false,
+    }
+    .to_bitbuf(&mut pdu);
+    pdu.write_bits(0b1010_1010, 8);
+    pdu.seek(0);
+
+    test.submit_message(SapMsg {
+        sap: Sap::TmvSap,
+        src: TetraEntity::Lmac,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmvUnitdataInd(TmvUnitdataInd {
+            pdu,
+            block_num: PhyBlockNum::Block1,
+            logical_channel: LogicalChannel::Stch,
+            crc_pass: true,
+            scrambling_code: 864282631,
+            rssi_dbfs: f32::NEG_INFINITY,
+        }),
+    });
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    assert_eq!(sink_msgs.len(), 1);
+    let SapMsgInner::TmaUnitdataInd(TmaUnitdataInd {
+        main_address,
+        link_id,
+        pdu: Some(payload),
+        ..
+    }) = &sink_msgs[0].msg
+    else {
+        panic!("expected TMA-UNITDATA indication");
+    };
+
+    assert_eq!(main_address.ssi, 2200769);
+    assert_eq!(*link_id, 2);
+    assert_eq!(payload.get_len(), 8);
+}
 
 #[test]
 fn test_in_fragmented_sch_hu_and_sch_f() {
@@ -178,6 +367,194 @@ fn test_out_fragmented_resource() {
     tracing::info!("Validation of result not implemented");
 }
 
+#[test]
+fn test_facch_stealing_does_not_set_random_access_flag_without_pending_ra() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+    let components = vec![TetraEntity::Umac];
+    let sinks: Vec<TetraEntity> = vec![TetraEntity::Lmac];
+    test.populate_entities(components, sinks);
+
+    let ts = 2u8;
+    let dest = TetraAddress { ssi: 2200699, ssi_type: SsiType::Issi };
+
+    test.submit_message(open_shared_voice_circuit(ts));
+    test.run_stack(Some(1));
+    test.dump_sinks();
+
+    let tma = TmaUnitdataReq {
+        req_handle: 0,
+        pdu: BitBuffer::from_bitstr("1010101010101010"),
+        main_address: dest,
+        link_id: ts as u32,
+        endpoint_id: 0,
+        stealing_permission: true,
+        subscriber_class: 0,
+        air_interface_encryption: None,
+        stealing_repeats_flag: None,
+        data_category: None,
+        chan_alloc: Some(CmceChanAllocReq {
+            usage: Some(4),
+            carrier: None,
+            timeslots: [false, true, false, false],
+            alloc_type: ChanAllocType::Replace,
+            ul_dl_assigned: UlDlAssignment::Both,
+        }),
+        tx_reporter: None,
+    };
+
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(tma),
+    });
+    test.run_stack(Some(8));
+    let sink_msgs = test.dump_sinks();
+
+    let mut found = false;
+    for msg in sink_msgs {
+        let SapMsgInner::TmvUnitdataReq(slot) = msg.msg else {
+            continue;
+        };
+        if slot.ts.t != ts {
+            continue;
+        }
+        let Some(blk1) = slot.blk1 else {
+            continue;
+        };
+        if blk1.logical_channel != LogicalChannel::Stch {
+            continue;
+        }
+
+        let mut mac_block = blk1.mac_block.clone();
+        let pdu = MacResource::from_bitbuf(&mut mac_block).expect("STCH blk1 should start with MAC-RESOURCE");
+        assert!(
+            !pdu.random_access_flag,
+            "FACCH stealing without pending RA must not set random_access_flag"
+        );
+        assert_eq!(
+            pdu.usage_marker, None,
+            "FACCH stealing must not encode a usage marker in the MAC-RESOURCE header"
+        );
+        found = true;
+        break;
+    }
+
+    assert!(found, "expected an STCH downlink block on ts {}", ts);
+}
+
+#[test]
+fn test_traffic_mac_access_does_not_mark_next_facch_as_random_access() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+    let components = vec![TetraEntity::Umac];
+    let sinks: Vec<TetraEntity> = vec![TetraEntity::Lmac];
+    test.populate_entities(components, sinks);
+
+    let ts = 2u8;
+    let dest = TetraAddress { ssi: 2200699, ssi_type: SsiType::Issi };
+
+    test.submit_message(open_shared_voice_circuit(ts));
+    test.run_stack(Some(1));
+    test.dump_sinks();
+
+    let mut uplink = BitBuffer::new_autoexpand(64);
+    MacAccess {
+        fill_bits: true,
+        encrypted: false,
+        addr: Some(dest),
+        event_label: None,
+        length_ind: Some(6),
+        frag_flag: None,
+        reservation_req: None,
+    }
+    .to_bitbuf(&mut uplink);
+    uplink.write_bits(0, 12);
+    uplink.seek(0);
+
+    test.submit_message(SapMsg {
+        sap: Sap::TmvSap,
+        src: TetraEntity::Lmac,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmvUnitdataInd(TmvUnitdataInd {
+            pdu: uplink,
+            block_num: PhyBlockNum::Block1,
+            logical_channel: LogicalChannel::SchHu,
+            crc_pass: true,
+            scrambling_code: 864282631,
+            rssi_dbfs: f32::NEG_INFINITY,
+        }),
+    });
+    test.run_stack(Some(2));
+    test.dump_sinks();
+
+    let tma = TmaUnitdataReq {
+        req_handle: 0,
+        pdu: BitBuffer::from_bitstr("1010101010101010"),
+        main_address: dest,
+        link_id: ts as u32,
+        endpoint_id: 0,
+        stealing_permission: true,
+        subscriber_class: 0,
+        air_interface_encryption: None,
+        stealing_repeats_flag: None,
+        data_category: None,
+        chan_alloc: Some(CmceChanAllocReq {
+            usage: Some(4),
+            carrier: None,
+            timeslots: [false, true, false, false],
+            alloc_type: ChanAllocType::Replace,
+            ul_dl_assigned: UlDlAssignment::Both,
+        }),
+        tx_reporter: None,
+    };
+
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(tma),
+    });
+    test.run_stack(Some(8));
+    let sink_msgs = test.dump_sinks();
+
+    let mut found = false;
+    for msg in sink_msgs {
+        let SapMsgInner::TmvUnitdataReq(slot) = msg.msg else {
+            continue;
+        };
+        if slot.ts.t != ts {
+            continue;
+        }
+        let Some(blk1) = slot.blk1 else {
+            continue;
+        };
+        if blk1.logical_channel != LogicalChannel::Stch {
+            continue;
+        }
+
+        let mut mac_block = blk1.mac_block.clone();
+        let pdu = MacResource::from_bitbuf(&mut mac_block).expect("STCH blk1 should start with MAC-RESOURCE");
+        assert!(
+            !pdu.random_access_flag,
+            "traffic-slot MAC-ACCESS must not make the next FACCH look like a random-access response"
+        );
+        assert_eq!(
+            pdu.usage_marker, None,
+            "traffic-slot FACCH stealing must not encode a usage marker in the MAC-RESOURCE header"
+        );
+        found = true;
+        break;
+    }
+
+    assert!(found, "expected an STCH downlink block on ts {}", ts);
+}
+
 /// FH-BUG-034 follow-up regression: a stealing TmaUnitdataReq whose MAC-RESOURCE + SDU does
 /// not fit in one 124-bit STCH half-slot must be fragmented across consecutive stolen
 /// half-slots — NOT written into a fixed 124-bit buffer, which panicked the whole stack
@@ -224,6 +601,7 @@ fn test_stealing_large_sdu_fragments_without_panic() {
         req_handle: 0,
         pdu: BitBuffer::from_bitstr(&big_sdu),
         main_address: dest,
+        link_id: 2,
         endpoint_id: 0,
         stealing_permission: true,
         subscriber_class: 0,

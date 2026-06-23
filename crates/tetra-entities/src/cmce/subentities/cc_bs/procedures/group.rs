@@ -14,6 +14,7 @@ pub(in crate::cmce::subentities::cc_bs) enum GroupTransitionError {
     InvalidTransition {
         call_id: u16,
         state: GroupCallState,
+        formal_state: CcFormalState,
         event: GroupEvent,
     },
     NotCurrentSpeaker {
@@ -25,21 +26,40 @@ pub(in crate::cmce::subentities::cc_bs) enum GroupTransitionError {
 }
 
 impl CcBsSubentity {
-    fn validate_group_transition(call_id: u16, state: GroupCallState, event: GroupEvent) -> Result<(), GroupTransitionError> {
-        let allowed = matches!(
-            (state, event),
-            (GroupCallState::Transmitting, GroupEvent::TxDemand)
-                | (GroupCallState::NoActiveSpeaker { .. }, GroupEvent::TxDemand)
-                | (GroupCallState::Transmitting, GroupEvent::TxCeased)
-                | (GroupCallState::Transmitting, GroupEvent::NetworkCallStart)
-                | (GroupCallState::NoActiveSpeaker { .. }, GroupEvent::NetworkCallStart)
-                | (GroupCallState::Transmitting, GroupEvent::NetworkCallEnd)
-                | (GroupCallState::NoActiveSpeaker { .. }, GroupEvent::NetworkCallEnd)
-        );
+    fn validate_group_transition(
+        call_id: u16,
+        state: GroupCallState,
+        formal_state: CcFormalState,
+        event: GroupEvent,
+    ) -> Result<(), GroupTransitionError> {
+        let allowed = state.formal_state() == formal_state
+            && matches!(
+                (formal_state, state, event),
+                (CcFormalState::Active, GroupCallState::Transmitting, GroupEvent::TxDemand)
+                    | (CcFormalState::Active, GroupCallState::NoActiveSpeaker { .. }, GroupEvent::TxDemand)
+                    | (CcFormalState::Active, GroupCallState::Transmitting, GroupEvent::TxCeased)
+                    | (CcFormalState::Active, GroupCallState::Transmitting, GroupEvent::NetworkCallStart)
+                    | (
+                        CcFormalState::Active,
+                        GroupCallState::NoActiveSpeaker { .. },
+                        GroupEvent::NetworkCallStart
+                    )
+                    | (CcFormalState::Active, GroupCallState::Transmitting, GroupEvent::NetworkCallEnd)
+                    | (
+                        CcFormalState::Active,
+                        GroupCallState::NoActiveSpeaker { .. },
+                        GroupEvent::NetworkCallEnd
+                    )
+            );
         if allowed {
             Ok(())
         } else {
-            Err(GroupTransitionError::InvalidTransition { call_id, state, event })
+            Err(GroupTransitionError::InvalidTransition {
+                call_id,
+                state,
+                formal_state,
+                event,
+            })
         }
     }
 
@@ -78,7 +98,7 @@ impl CcBsSubentity {
         d_tx_granted.to_bitbuf(&mut sdu).expect("Failed to serialize DTxGranted");
         sdu.seek(0);
 
-        let msg = Self::build_sapmsg_stealing(sdu, target_addr, ts, None);
+        let msg = Self::build_sapmsg_stealing(sdu, self.dltime, target_addr, ts, None);
         queue.push_back(msg);
     }
 
@@ -88,35 +108,18 @@ impl CcBsSubentity {
         call_id: u16,
         requesting_party: TetraAddress,
     ) -> Result<(), GroupTransitionError> {
-        // Read before borrowing the call (avoids a self borrow conflict with release below).
-        let release_on_retake = self.config.config().cell.release_group_on_same_speaker_retake;
-
         let Some(call) = self.active_calls.get_mut(&call_id) else {
             return Err(GroupTransitionError::UnknownCall(call_id));
         };
 
         let state = call.state();
-        Self::validate_group_transition(call_id, state, GroupEvent::TxDemand)?;
+        let formal_state = call.formal_state;
+        Self::validate_group_transition(call_id, state, formal_state, GroupEvent::TxDemand)?;
 
         let ts = call.ts;
         let dest_ssi = call.dest_gssi;
         let current_speaker = call.source_issi;
         let grant_now = matches!(state, GroupCallState::NoActiveSpeaker { .. });
-
-        // Motorola quirk (e): legacy sets (MR5/MR19 era) ACK a same-speaker floor retake taken
-        // during hangtime but never key up the TCH/S, so the group hears a "silent over". When
-        // enabled, release the call instead of reusing the hanging circuit so the next PTT runs
-        // a full U-SETUP/D-CONNECT/D-SETUP cycle. `call`'s last use on this path is the
-        // `current_speaker` read above, so releasing (which needs &mut self) is borrow-safe.
-        if grant_now && release_on_retake && requesting_party.ssi == current_speaker {
-            tracing::info!(
-                "FSM: same-speaker hangtime retake (call_id={} ISSI {}) — releasing group call to force full re-setup (legacy silent-over workaround)",
-                call_id, requesting_party.ssi
-            );
-            self.release_group_call(queue, call_id, DisconnectCause::UserRequestedDisconnection);
-            return Ok(());
-        }
-
         let queue_result = if grant_now {
             call.grant_floor(requesting_party.ssi, Some(requesting_party));
             None
@@ -174,38 +177,17 @@ impl CcBsSubentity {
         );
         self.send_d_tx_granted_facch(queue, call_id, requesting_party.ssi, dest_addr.ssi, ts);
 
-        // Notify dashboard that the speaker changed (hangtime -> new speaker).
-        self.emit(crate::net_telemetry::TelemetryEvent::GroupCallSpeakerChanged {
-            call_id,
-            gssi: dest_ssi,
-            speaker_issi: requesting_party.ssi,
-        });
-
-        queue.push_back(SapMsg {
-            sap: Sap::Control,
-            src: TetraEntity::Cmce,
-            dest: TetraEntity::Umac,
-            msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+        self.notify_floor_granted(
+            queue,
+            GroupFloorGrant {
                 call_id,
                 source_issi: requesting_party.ssi,
                 dest_gssi: dest_addr.ssi,
                 ts,
-            }),
-        });
-
-        if net_brew::is_brew_gssi_routable(&self.config, dest_ssi) {
-            queue.push_back(SapMsg {
-                sap: Sap::Control,
-                src: TetraEntity::Cmce,
-                dest: TetraEntity::Brew,
-                msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
-                    call_id,
-                    source_issi: requesting_party.ssi,
-                    dest_gssi: dest_addr.ssi,
-                    ts,
-                }),
-            });
-        }
+            },
+            true,
+            BrewNotification::IfGroupRoutable(dest_ssi),
+        );
 
         Ok(())
     }
@@ -221,7 +203,8 @@ impl CcBsSubentity {
         };
 
         let state = call.state();
-        Self::validate_group_transition(call_id, state, GroupEvent::TxCeased)?;
+        let formal_state = call.formal_state;
+        Self::validate_group_transition(call_id, state, formal_state, GroupEvent::TxCeased)?;
 
         if !call.is_current_speaker(sender.ssi) {
             return Err(GroupTransitionError::NotCurrentSpeaker {
@@ -251,38 +234,17 @@ impl CcBsSubentity {
             self.fsm_send_d_tx_granted_individual(queue, call_id, requester, ts, TransmissionGrant::Granted, Some(requester.ssi));
             self.send_d_tx_granted_facch(queue, call_id, requester.ssi, dest_addr.ssi, ts);
 
-            // Notify dashboard that the queued speaker got the floor.
-            self.emit(crate::net_telemetry::TelemetryEvent::GroupCallSpeakerChanged {
-                call_id,
-                gssi: dest_ssi,
-                speaker_issi: requester.ssi,
-            });
-
-            queue.push_back(SapMsg {
-                sap: Sap::Control,
-                src: TetraEntity::Cmce,
-                dest: TetraEntity::Umac,
-                msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+            self.notify_floor_granted(
+                queue,
+                GroupFloorGrant {
                     call_id,
                     source_issi: requester.ssi,
                     dest_gssi: dest_addr.ssi,
                     ts,
-                }),
-            });
-
-            if net_brew::is_brew_gssi_routable(&self.config, dest_ssi) {
-                queue.push_back(SapMsg {
-                    sap: Sap::Control,
-                    src: TetraEntity::Cmce,
-                    dest: TetraEntity::Brew,
-                    msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
-                        call_id,
-                        source_issi: requester.ssi,
-                        dest_gssi: dest_addr.ssi,
-                        ts,
-                    }),
-                });
-            }
+                },
+                true,
+                BrewNotification::IfGroupRoutable(dest_ssi),
+            );
             return Ok(());
         }
 
@@ -299,24 +261,15 @@ impl CcBsSubentity {
         d_tx_ceased.to_bitbuf(&mut sdu).expect("Failed to serialize DTxCeased");
         sdu.seek(0);
 
-        let msg = Self::build_sapmsg_stealing(sdu, dest_addr, ts, None);
+        let msg = Self::build_sapmsg_stealing(sdu, self.dltime, dest_addr, ts, None);
         queue.push_back(msg);
 
-        queue.push_back(SapMsg {
-            sap: Sap::Control,
-            src: TetraEntity::Cmce,
-            dest: TetraEntity::Umac,
-            msg: SapMsgInner::CmceCallControl(CallControl::FloorReleased { call_id, ts }),
-        });
-
-        if net_brew::is_brew_gssi_routable(&self.config, dest_ssi) {
-            queue.push_back(SapMsg {
-                sap: Sap::Control,
-                src: TetraEntity::Cmce,
-                dest: TetraEntity::Brew,
-                msg: SapMsgInner::CmceCallControl(CallControl::FloorReleased { call_id, ts }),
-            });
-        }
+        self.notify_floor_released(
+            queue,
+            CallTimeslot { call_id, ts },
+            true,
+            BrewNotification::IfGroupRoutable(dest_ssi),
+        );
 
         Ok(())
     }
@@ -333,16 +286,15 @@ impl CcBsSubentity {
         };
 
         let state = call.state();
-        Self::validate_group_transition(call_id, state, GroupEvent::NetworkCallStart)?;
+        let formal_state = call.formal_state;
+        Self::validate_group_transition(call_id, state, formal_state, GroupEvent::NetworkCallStart)?;
 
         call.grant_floor(source_issi, None);
-        call.reset_timeout(self.dltime);
         call.brew_uuid = Some(brew_uuid);
         if let CallOrigin::Network { brew_uuid: old_uuid } = call.origin
             && old_uuid != brew_uuid
         {
-            // Each new speaker from Brew arrives with a fresh UUID — expected behavior.
-            tracing::debug!("CMCE FSM: network call speaker change updated brew_uuid call_id={}", call_id);
+            tracing::warn!("CMCE FSM: network call start changed brew_uuid call_id={}", call_id);
             call.origin = CallOrigin::Network { brew_uuid };
         }
 
@@ -352,27 +304,7 @@ impl CcBsSubentity {
 
         self.send_d_tx_granted_facch(queue, call_id, source_issi, dest_gssi, ts);
 
-        // Notify dashboard that the speaker on this group call changed (network/Brew origin).
-        // The local hangtime → new-speaker and queued-speaker paths already emit this; the
-        // network path did not, so the dashboard's per-call active_speaker (and the per-MS
-        // selected_group inference) never updated for Brew-originated speakers.
-        self.emit(crate::net_telemetry::TelemetryEvent::GroupCallSpeakerChanged {
-            call_id,
-            gssi: dest_gssi,
-            speaker_issi: source_issi,
-        });
-
-        queue.push_back(SapMsg {
-            sap: Sap::Control,
-            src: TetraEntity::Cmce,
-            dest: TetraEntity::Umac,
-            msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
-                call_id,
-                source_issi,
-                dest_gssi,
-                ts,
-            }),
-        });
+        self.notify_remote_floor_granted(queue, CallTimeslot { call_id, ts });
 
         queue.push_back(SapMsg {
             sap: Sap::Control,
@@ -399,7 +331,7 @@ impl CcBsSubentity {
         };
 
         let state = call.state();
-        Self::validate_group_transition(call_id, state, GroupEvent::NetworkCallEnd)?;
+        Self::validate_group_transition(call_id, state, call.formal_state, GroupEvent::NetworkCallEnd)?;
 
         if matches!(state, GroupCallState::Transmitting) {
             if let Some(active_call) = self.active_calls.get_mut(&call_id) {
@@ -408,12 +340,7 @@ impl CcBsSubentity {
             }
 
             self.send_d_tx_ceased_facch(queue, call_id, call.dest_gssi, call.ts);
-            queue.push_back(SapMsg {
-                sap: Sap::Control,
-                src: TetraEntity::Cmce,
-                dest: TetraEntity::Umac,
-                msg: SapMsgInner::CmceCallControl(CallControl::FloorReleased { call_id, ts: call.ts }),
-            });
+            self.notify_floor_released(queue, CallTimeslot { call_id, ts: call.ts }, true, BrewNotification::Never);
             return Ok(());
         }
 

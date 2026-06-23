@@ -12,6 +12,7 @@ use crate::net_control::commands::{ControlCommand, ControlResponse};
 // It sends Commands toward the entity and collects CommandResponses back.
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct CommandDispatcher {
     cmd_tx: Sender<ControlCommand>,
     resp_rx: Receiver<ControlResponse>,
@@ -54,6 +55,7 @@ impl CommandDispatcher {
 // toward the worker.
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct ControlEndpoint {
     cmd_rx: Receiver<ControlCommand>,
     resp_tx: Sender<ControlResponse>,

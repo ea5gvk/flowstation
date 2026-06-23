@@ -87,6 +87,12 @@ pub enum BrewEvent {
     /// TetraPack confirmed connect (CONNECT_CONFIRM)
     CircuitConnectConfirm { uuid: Uuid, grant: u8, permission: u8 },
 
+    /// Network granted simplex floor to the local side.
+    CircuitSimplexGranted { uuid: Uuid, grant: u8, permission: u8 },
+
+    /// Network released simplex floor / returned to idle.
+    CircuitSimplexIdle { uuid: Uuid, grant: u8, permission: u8 },
+
     /// Circuit call released (CALL_RELEASE, inbound)
     CircuitCallRelease { uuid: Uuid, cause: u8 },
 
@@ -159,6 +165,12 @@ pub enum BrewCommand {
 
     /// CMCE → Brew: call confirmed and connected
     SendConnectConfirm { uuid: Uuid, grant: u8, permission: u8 },
+
+    /// CMCE → Brew: local simplex side granted the floor.
+    SendSimplexGranted { uuid: Uuid, grant: u8, permission: u8 },
+
+    /// CMCE → Brew: local simplex side released the floor.
+    SendSimplexIdle { uuid: Uuid, grant: u8, permission: u8 },
 
     /// CMCE → Brew: release/terminate a circuit call
     SendCallRelease { uuid: Uuid, cause: u8 },
@@ -492,6 +504,22 @@ impl<T: NetworkTransport> BrewWorker<T> {
                             tracing::debug!("Brew: sent CONNECT_CONFIRM uuid={} grant={} perm={}", uuid, grant, permission);
                         }
                     }
+                    BrewCommand::SendSimplexGranted { uuid, grant, permission } => {
+                        let data = build_simplex_granted(&uuid, grant, permission);
+                        if let Err(e) = self.transport.send_reliable(&data) {
+                            tracing::error!("BrewWorker: failed to send SIMPLEX_GRANTED: {}", e);
+                        } else {
+                            tracing::debug!("Brew: sent SIMPLEX_GRANTED uuid={} grant={} perm={}", uuid, grant, permission);
+                        }
+                    }
+                    BrewCommand::SendSimplexIdle { uuid, grant, permission } => {
+                        let data = build_simplex_idle(&uuid, grant, permission);
+                        if let Err(e) = self.transport.send_reliable(&data) {
+                            tracing::error!("BrewWorker: failed to send SIMPLEX_IDLE: {}", e);
+                        } else {
+                            tracing::debug!("Brew: sent SIMPLEX_IDLE uuid={} grant={} perm={}", uuid, grant, permission);
+                        }
+                    }
                     BrewCommand::SendCallRelease { uuid, cause } => {
                         let data = build_call_release(&uuid, cause);
                         if let Err(e) = self.transport.send_reliable(&data) {
@@ -637,6 +665,28 @@ impl<T: NetworkTransport> BrewWorker<T> {
                 tracing::info!("BrewWorker: CONNECT_CONFIRM uuid={} grant={} perm={}", cc.identifier, grant, permission);
                 let _ = self.event_sender.send(BrewEvent::CircuitConnectConfirm {
                     uuid: cc.identifier, grant, permission,
+                });
+            }
+            CALL_STATE_SIMPLEX_GRANTED => {
+                let (grant, permission) = if let BrewCallPayload::CircularGrant(g) = cc.payload {
+                    (g.grant, g.permission)
+                } else { (0, 0) };
+                tracing::info!("BrewWorker: SIMPLEX_GRANTED uuid={} grant={} perm={}", cc.identifier, grant, permission);
+                let _ = self.event_sender.send(BrewEvent::CircuitSimplexGranted {
+                    uuid: cc.identifier,
+                    grant,
+                    permission,
+                });
+            }
+            CALL_STATE_SIMPLEX_IDLE => {
+                let (grant, permission) = if let BrewCallPayload::CircularGrant(g) = cc.payload {
+                    (g.grant, g.permission)
+                } else { (0, 0) };
+                tracing::info!("BrewWorker: SIMPLEX_IDLE uuid={} grant={} perm={}", cc.identifier, grant, permission);
+                let _ = self.event_sender.send(BrewEvent::CircuitSimplexIdle {
+                    uuid: cc.identifier,
+                    grant,
+                    permission,
                 });
             }
             CALL_STATE_CALL_RELEASE => {

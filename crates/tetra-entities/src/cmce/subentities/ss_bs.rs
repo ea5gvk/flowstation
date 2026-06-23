@@ -12,8 +12,7 @@ impl SsBsSubentity {
 
     pub fn route_re_deliver(&mut self, _queue: &mut MessageQueue, mut _message: SapMsg) {
         tracing::trace!("route_re_deliver");
-        // Supplementary Services (call hold, transfer, etc.) not implemented yet.
-        // Log and ignore instead of panicking when an MS sends an SS PDU.
-        unimplemented_log!("SsBsSubentity::route_re_deliver: Supplementary Services not implemented");
+
+        unimplemented_log!("CMCE SS-BS route_re_deliver");
     }
 }

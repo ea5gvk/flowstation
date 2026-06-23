@@ -1,4 +1,4 @@
-use tetra_core::{BitBuffer, EndpointId, TetraAddress, Todo, TxReporter};
+use tetra_core::{BitBuffer, EndpointId, LinkId, TetraAddress, Todo, TxReporter};
 
 use crate::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
 
@@ -54,6 +54,7 @@ pub struct TmaUnitdataReq {
     pub pdu: BitBuffer,
     pub main_address: TetraAddress,
     // pub scrambling_code: u32, // TODO FIXME : according to the spec, should be there, but why do we need to provide this?
+    pub link_id: LinkId,
     pub endpoint_id: EndpointId,
     // pub pdu_prio: Todo, // optional feature
     pub stealing_permission: bool,
@@ -78,6 +79,7 @@ pub struct TmaUnitdataInd {
     pub pdu: Option<BitBuffer>,
     pub main_address: TetraAddress,
     pub scrambling_code: u32,
+    pub link_id: LinkId,
     pub endpoint_id: EndpointId,
     pub new_endpoint_id: Option<EndpointId>,
     pub css_endpoint_id: Option<EndpointId>,

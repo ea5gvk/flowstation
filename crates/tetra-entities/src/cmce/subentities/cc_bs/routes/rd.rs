@@ -1,11 +1,11 @@
 use super::*;
 
 impl CcBsSubentity {
-    pub fn route_xx_deliver(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
-        tracing::trace!("route_xx_deliver");
+    pub fn route_rd_deliver(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
+        tracing::trace!("route_rd_deliver");
 
         let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut message.msg else {
-            tracing::error!("route_xx_deliver: expected LcmcMleUnitdataInd, got unexpected SAP message type");
+            tracing::warn!("CMCE CC ingress received non-LCMC unitdata indication: {:?}", message.msg);
             return;
         };
         let Some(bits) = prim.sdu.peek_bits(5) else {
@@ -26,66 +26,12 @@ impl CcBsSubentity {
             CmcePduTypeUl::UAlert => self.rx_u_alert(queue, message),
             CmcePduTypeUl::UConnect => self.rx_u_connect(queue, message),
             CmcePduTypeUl::UInfo => self.rx_u_info(queue, message),
-            CmcePduTypeUl::UStatus | CmcePduTypeUl::UCallRestore => {
-                unimplemented_log!("{}", pdu_type);
+            CmcePduTypeUl::UCallRestore => self.rx_u_call_restore(queue, message),
+            CmcePduTypeUl::UStatus => {
+                tracing::warn!("CMCE CC received U-STATUS on rd route; PC should route it to SDS");
             }
             _ => {
-                tracing::warn!("route_xx_deliver: unhandled PDU type {:?}, ignoring", pdu_type);
-            }
-        }
-    }
-
-    pub fn rx_call_control(&mut self, queue: &mut MessageQueue, message: SapMsg) {
-        let SapMsgInner::CmceCallControl(call_control) = message.msg else {
-            tracing::error!("rx_call_control: expected CmceCallControl, got unexpected SAP message type");
-            return;
-        };
-
-        match call_control {
-            CallControl::NetworkCallStart {
-                brew_uuid,
-                source_issi,
-                dest_gssi,
-                priority,
-            } => {
-                self.rx_network_call_start(queue, brew_uuid, source_issi, dest_gssi, priority);
-            }
-            CallControl::NetworkCallEnd { brew_uuid } => {
-                self.rx_network_call_end(queue, brew_uuid);
-            }
-            CallControl::NetworkCircuitSetupRequest { brew_uuid, call } => {
-                self.rx_network_circuit_setup_request(queue, brew_uuid, call);
-            }
-            CallControl::NetworkCircuitSetupAccept { brew_uuid } => {
-                self.rx_network_circuit_setup_accept(brew_uuid);
-            }
-            CallControl::NetworkCircuitSetupReject { brew_uuid, cause } => {
-                self.rx_network_circuit_setup_reject(queue, brew_uuid, cause);
-            }
-            CallControl::NetworkCircuitAlert { brew_uuid } => {
-                self.rx_network_circuit_alert(queue, brew_uuid);
-            }
-            CallControl::NetworkCircuitConnectRequest { brew_uuid, call } => {
-                self.rx_network_circuit_connect_request(queue, brew_uuid, call);
-            }
-            CallControl::NetworkCircuitConnectConfirm {
-                brew_uuid,
-                grant,
-                permission,
-            } => {
-                self.rx_network_circuit_connect_confirm(queue, brew_uuid, grant, permission);
-            }
-            CallControl::NetworkCircuitMediaReady { brew_uuid, .. } => {
-                tracing::trace!("CMCE: ignoring unexpected NetworkCircuitMediaReady uuid={}", brew_uuid);
-            }
-            CallControl::NetworkCircuitRelease { brew_uuid, cause } => {
-                self.rx_network_circuit_release(queue, brew_uuid, cause);
-            }
-            CallControl::UlInactivityTimeout { ts } => {
-                self.handle_ul_inactivity_timeout(queue, ts);
-            }
-            _ => {
-                tracing::warn!("Unexpected CallControl message: {:?}", call_control);
+                tracing::warn!("CMCE CC ingress received unsupported UL PDU type {}", pdu_type);
             }
         }
     }
@@ -93,7 +39,7 @@ impl CcBsSubentity {
     pub(super) fn rx_u_setup(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         tracing::trace!("rx_u_setup: {:?}", message);
         let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut message.msg else {
-            tracing::error!("rx_u_setup: expected LcmcMleUnitdataInd, got unexpected SAP message type");
+            tracing::warn!("CMCE CC rx_u_setup received non-LCMC unitdata indication");
             return;
         };
         let calling_party = prim.received_tetra_address;
@@ -114,7 +60,7 @@ impl CcBsSubentity {
 
     pub(super) fn rx_u_tx_ceased(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut message.msg else {
-            tracing::error!("rx_u_tx_ceased: expected LcmcMleUnitdataInd, got unexpected SAP message type");
+            tracing::warn!("CMCE CC rx_u_tx_ceased received non-LCMC unitdata indication");
             return;
         };
 
@@ -135,7 +81,7 @@ impl CcBsSubentity {
 
     pub(super) fn rx_u_tx_demand(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut message.msg else {
-            tracing::error!("rx_u_tx_demand: expected LcmcMleUnitdataInd, got unexpected SAP message type");
+            tracing::warn!("CMCE CC rx_u_tx_demand received non-LCMC unitdata indication");
             return;
         };
 
@@ -156,11 +102,14 @@ impl CcBsSubentity {
 
     pub(super) fn rx_u_release(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut message.msg else {
-            tracing::error!("rx_u_release: expected LcmcMleUnitdataInd, got unexpected SAP message type");
+            tracing::warn!("CMCE CC rx_u_release received non-LCMC unitdata indication");
             return;
         };
 
         let sender = prim.received_tetra_address;
+        let handle = prim.handle;
+        let link_id = prim.link_id;
+        let endpoint_id = prim.endpoint_id;
         let pdu = match URelease::from_bitbuf(&mut prim.sdu) {
             Ok(pdu) => {
                 tracing::debug!("<- U-RELEASE {:?}", pdu);
@@ -172,12 +121,12 @@ impl CcBsSubentity {
             }
         };
 
-        self.fsm_on_u_release(queue, sender, pdu);
+        self.fsm_on_u_release(queue, sender, handle, link_id, endpoint_id, pdu);
     }
 
     pub(super) fn rx_u_disconnect(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut message.msg else {
-            tracing::error!("rx_u_disconnect: expected LcmcMleUnitdataInd, got unexpected SAP message type");
+            tracing::warn!("CMCE CC rx_u_disconnect received non-LCMC unitdata indication");
             return;
         };
 
@@ -202,7 +151,7 @@ impl CcBsSubentity {
 
     pub(super) fn rx_u_alert(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut message.msg else {
-            tracing::error!("rx_u_alert: expected LcmcMleUnitdataInd, got unexpected SAP message type");
+            tracing::warn!("CMCE CC rx_u_alert received non-LCMC unitdata indication");
             return;
         };
 
@@ -223,7 +172,7 @@ impl CcBsSubentity {
     /// Handle U-CONNECT for an individual call.
     pub(super) fn rx_u_connect(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut message.msg else {
-            tracing::error!("rx_u_connect: expected LcmcMleUnitdataInd, got unexpected SAP message type");
+            tracing::warn!("CMCE CC rx_u_connect received non-LCMC unitdata indication");
             return;
         };
 
@@ -238,21 +187,19 @@ impl CcBsSubentity {
             }
         };
 
-        self.fsm_on_u_connect(
-            queue,
-            prim.received_tetra_address,
-            prim.handle,
-            prim.link_id,
-            prim.endpoint_id,
-            pdu,
-        );
+        self.fsm_on_u_connect(queue, prim.received_tetra_address, prim.handle, prim.link_id, prim.endpoint_id, pdu);
     }
 
     pub(super) fn rx_u_info(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut message.msg else {
-            tracing::error!("rx_u_info: expected LcmcMleUnitdataInd, got unexpected SAP message type");
+            tracing::warn!("CMCE CC rx_u_info received non-LCMC unitdata indication");
             return;
         };
+
+        let sender = prim.received_tetra_address;
+        let handle = prim.handle;
+        let link_id = prim.link_id;
+        let endpoint_id = prim.endpoint_id;
 
         let pdu = match UInfo::from_bitbuf(&mut prim.sdu) {
             Ok(pdu) => {
@@ -265,6 +212,31 @@ impl CcBsSubentity {
             }
         };
 
-        self.fsm_on_u_info(queue, pdu);
+        self.fsm_on_u_info(queue, sender, handle, link_id, endpoint_id, pdu);
+    }
+
+    pub(super) fn rx_u_call_restore(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
+        let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut message.msg else {
+            tracing::warn!("CMCE CC rx_u_call_restore received non-LCMC unitdata indication");
+            return;
+        };
+
+        let sender = prim.received_tetra_address;
+        let handle = prim.handle;
+        let link_id = prim.link_id;
+        let endpoint_id = prim.endpoint_id;
+
+        let pdu = match UCallRestore::from_bitbuf(&mut prim.sdu) {
+            Ok(pdu) => {
+                tracing::debug!("<- U-CALL RESTORE {:?}", pdu);
+                pdu
+            }
+            Err(e) => {
+                tracing::warn!("Failed parsing U-CALL RESTORE: {:?}", e);
+                return;
+            }
+        };
+
+        self.fsm_on_u_call_restore(queue, sender, handle, link_id, endpoint_id, pdu);
     }
 }

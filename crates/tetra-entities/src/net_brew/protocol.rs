@@ -534,6 +534,28 @@ pub fn build_connect_confirm(session_uuid: &Uuid, grant: u8, permission: u8) -> 
     buf
 }
 
+/// Build SIMPLEX_GRANTED with grant/permission.
+pub fn build_simplex_granted(session_uuid: &Uuid, grant: u8, permission: u8) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(20);
+    buf.push(BREW_CLASS_CALL_CONTROL);
+    buf.push(CALL_STATE_SIMPLEX_GRANTED);
+    buf.extend_from_slice(session_uuid.as_bytes());
+    buf.push(grant);
+    buf.push(permission);
+    buf
+}
+
+/// Build SIMPLEX_IDLE with grant/permission.
+pub fn build_simplex_idle(session_uuid: &Uuid, grant: u8, permission: u8) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(20);
+    buf.push(BREW_CLASS_CALL_CONTROL);
+    buf.push(CALL_STATE_SIMPLEX_IDLE);
+    buf.extend_from_slice(session_uuid.as_bytes());
+    buf.push(grant);
+    buf.push(permission);
+    buf
+}
+
 /// Build CALL_RELEASE with disconnect cause (ETSI 14.7.x both directions).
 pub fn build_call_release(session_uuid: &Uuid, cause: u8) -> Vec<u8> {
     let mut buf = Vec::with_capacity(19);

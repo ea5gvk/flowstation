@@ -1,4 +1,3 @@
-use tetra_core::unimplemented_log;
 use tetra_saps::SapMsg;
 
 use crate::MessageQueue;
@@ -13,7 +12,8 @@ impl SsMsSubentity {
 
     pub fn route_re_deliver(&mut self, _queue: &mut MessageQueue, mut _message: SapMsg) {
         tracing::trace!("route_re_deliver");
-        // Supplementary Services not implemented yet — log instead of panicking.
-        unimplemented_log!("SsMsSubentity::route_re_deliver: Supplementary Services not implemented");
+
+        // Handle the incoming unit data indication
+        unimplemented!();
     }
 }

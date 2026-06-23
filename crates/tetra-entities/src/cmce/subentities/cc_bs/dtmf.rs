@@ -44,13 +44,11 @@ fn decode_dtmf_digit(nibble: u8) -> Option<char> {
 
 #[inline]
 fn type3_read_bit(field: &Type3FieldGeneric, bit_idx: usize) -> Option<u8> {
-    // Type3FieldGeneric.data is a u128 holding up to 128 bits (MSB-first within field.len bits)
-    if bit_idx >= field.len || bit_idx >= 128 {
+    let len_bits = field.len.min(128);
+    if bit_idx >= len_bits {
         return None;
     }
-    // We use len-based indexing: bit 0 is at shift = field.len - 1, bit N at shift = field.len - 1 - N.
-    // This matches the encoding convention (MSB-first within used bits).
-    let shift = field.len - 1 - bit_idx;
+    let shift = len_bits - 1 - bit_idx;
     Some(((field.data >> shift) & 0x01) as u8)
 }
 
@@ -69,7 +67,7 @@ fn type3_read_bits(field: &Type3FieldGeneric, start_bit: usize, num_bits: usize)
 
 pub(super) fn decode_dtmf(field: &Type3FieldGeneric) -> DtmfDecoded {
     let full_len_bits = field.len;
-    let len_bits = full_len_bits.min(64usize); // data is u64, max 64 bits
+    let len_bits = full_len_bits.min(128);
     if len_bits == 0 {
         return DtmfDecoded {
             kind: DtmfKind::Invalid,
@@ -168,22 +166,17 @@ pub(super) fn decode_dtmf(field: &Type3FieldGeneric) -> DtmfDecoded {
 }
 
 pub(super) fn pack_type3_bits_to_bytes(field: &Type3FieldGeneric) -> (u16, Vec<u8>) {
-    let len_bits = field.len.min(64usize); // data is u64
+    let len_bits = field.len.min(128);
     if len_bits == 0 {
         return (0, Vec::new());
     }
 
-    let num_bytes = len_bits.div_ceil(8);
-    // Extract MSB-first bytes from the u64
-    let mut out = Vec::with_capacity(num_bytes);
-    for byte_idx in 0..num_bytes {
-        let shift = 56usize.saturating_sub(byte_idx * 8);
-        out.push((field.data >> shift) as u8);
-    }
-    // Mask last byte if len_bits isn't byte-aligned
-    if len_bits % 8 != 0 {
-        let last = out.last_mut().unwrap();
-        *last &= 0xffu8 << (8 - (len_bits % 8));
+    let mut out = vec![0u8; len_bits.div_ceil(8)];
+    for bit_idx in 0..len_bits {
+        let bit = type3_read_bit(field, bit_idx).unwrap_or(0);
+        let byte_idx = bit_idx / 8;
+        let bit_pos = 7 - (bit_idx % 8);
+        out[byte_idx] |= bit << bit_pos;
     }
     (len_bits as u16, out)
 }

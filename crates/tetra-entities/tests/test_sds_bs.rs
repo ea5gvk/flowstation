@@ -5,12 +5,12 @@ use std::time::Duration;
 use tetra_config::bluestation::{CfgBrew, CfgSdsCommandControl, CfgSdsCommandEntry, StackMode};
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Sap, SsiType, TdmaTime, TetraAddress, debug};
+use tetra_pdus::cmce::enums::disconnect_cause::DisconnectCause;
 use tetra_pdus::cmce::enums::party_type_identifier::PartyTypeIdentifier;
 use tetra_pdus::cmce::enums::pre_coded_status::PreCodedStatus;
 use tetra_pdus::cmce::fields::basic_service_information::BasicServiceInformation;
-use tetra_pdus::cmce::pdus::u_sds_data::USdsData;
-use tetra_pdus::cmce::enums::disconnect_cause::DisconnectCause;
 use tetra_pdus::cmce::pdus::u_disconnect::UDisconnect;
+use tetra_pdus::cmce::pdus::u_sds_data::USdsData;
 use tetra_pdus::cmce::pdus::u_setup::USetup;
 use tetra_pdus::cmce::pdus::u_status::UStatus;
 use tetra_saps::control::brew::{BrewSubscriberAction, MmSubscriberUpdate};
@@ -106,10 +106,11 @@ fn test_sds_local_delivery() {
     // Verify the address is ISSI
     for m in &sink_msgs {
         if m.dest == TetraEntity::Mle
-            && let SapMsgInner::LcmcMleUnitdataReq(ref prim) = m.msg {
-                assert_eq!(prim.main_address.ssi, 2000001);
-                assert_eq!(prim.main_address.ssi_type, SsiType::Issi);
-            }
+            && let SapMsgInner::LcmcMleUnitdataReq(ref prim) = m.msg
+        {
+            assert_eq!(prim.main_address.ssi, 2000001);
+            assert_eq!(prim.main_address.ssi_type, SsiType::Issi);
+        }
     }
 }
 
@@ -130,6 +131,7 @@ fn test_sds_brew_forward() {
         feature_sds_enabled: true,
         feature_rssi_export: false,
         whitelisted_ssis: None,
+        pbx_gateway_issis: None,
     });
     let mut test = ComponentTest::from_config(config, Some(dltime));
 
@@ -244,10 +246,11 @@ fn test_sds_group_delivery() {
     // Verify the address is GSSI
     for m in &sink_msgs {
         if m.dest == TetraEntity::Mle
-            && let SapMsgInner::LcmcMleUnitdataReq(ref prim) = m.msg {
-                assert_eq!(prim.main_address.ssi, gssi);
-                assert_eq!(prim.main_address.ssi_type, SsiType::Gssi);
-            }
+            && let SapMsgInner::LcmcMleUnitdataReq(ref prim) = m.msg
+        {
+            assert_eq!(prim.main_address.ssi, gssi);
+            assert_eq!(prim.main_address.ssi_type, SsiType::Gssi);
+        }
     }
 }
 
@@ -293,10 +296,11 @@ fn test_sds_from_brew_to_group() {
     );
     for m in &sink_msgs {
         if m.dest == TetraEntity::Mle
-            && let SapMsgInner::LcmcMleUnitdataReq(ref prim) = m.msg {
-                assert_eq!(prim.main_address.ssi, gssi);
-                assert_eq!(prim.main_address.ssi_type, SsiType::Gssi);
-            }
+            && let SapMsgInner::LcmcMleUnitdataReq(ref prim) = m.msg
+        {
+            assert_eq!(prim.main_address.ssi, gssi);
+            assert_eq!(prim.main_address.ssi_type, SsiType::Gssi);
+        }
     }
 }
 
@@ -320,17 +324,24 @@ fn test_brew_inbound_allowed_bypasses_whitelist_but_honors_local_ranges() {
         feature_sds_enabled: true,
         feature_rssi_export: false,
         whitelisted_ssis: Some(vec![91]), // only GSSI 91 is whitelisted for OUTBOUND forwarding
+        pbx_gateway_issis: None,
     });
     let test = ComponentTest::from_config(config, None);
 
     // Foreign GSSI 500: not local, not whitelisted.
     // Outbound stays blocked by the whitelist; inbound is now ADMITTED (the R3 fix).
-    assert!(!is_brew_gssi_routable(&test.config, 500), "outbound: non-whitelisted GSSI not routable");
+    assert!(
+        !is_brew_gssi_routable(&test.config, 500),
+        "outbound: non-whitelisted GSSI not routable"
+    );
     assert!(is_brew_inbound_allowed(&test.config, 500), "inbound: foreign GSSI must be admitted");
 
     // GSSI 50 inside local_ssi_ranges: rejected on BOTH directions.
     assert!(!is_brew_gssi_routable(&test.config, 50));
-    assert!(!is_brew_inbound_allowed(&test.config, 50), "inbound: local-only range must stay rejected");
+    assert!(
+        !is_brew_inbound_allowed(&test.config, 50),
+        "inbound: local-only range must stay rejected"
+    );
 
     // Whitelisted GSSI 91: allowed both ways.
     assert!(is_brew_gssi_routable(&test.config, 91));
@@ -418,6 +429,7 @@ fn test_u_status_brew_forward() {
         feature_sds_enabled: true,
         feature_rssi_export: false,
         whitelisted_ssis: None,
+        pbx_gateway_issis: None,
     });
     let mut test = ComponentTest::from_config(config, Some(dltime));
 
@@ -642,7 +654,11 @@ fn test_sds_to_in_call_ms_is_deferred_then_delivered_on_mcch() {
             sap: Sap::Control,
             src: TetraEntity::Mm,
             dest: TetraEntity::Cmce,
-            msg: SapMsgInner::MmSubscriberUpdate(MmSubscriberUpdate { issi: listener, groups: vec![gssi], action }),
+            msg: SapMsgInner::MmSubscriberUpdate(MmSubscriberUpdate {
+                issi: listener,
+                groups: vec![gssi],
+                action,
+            }),
         });
         test.run_stack(Some(1));
     }
@@ -706,7 +722,11 @@ fn test_sds_to_in_call_ee_ms_waits_for_window_after_call() {
             sap: Sap::Control,
             src: TetraEntity::Mm,
             dest: TetraEntity::Cmce,
-            msg: SapMsgInner::MmSubscriberUpdate(MmSubscriberUpdate { issi: listener, groups: vec![gssi], action }),
+            msg: SapMsgInner::MmSubscriberUpdate(MmSubscriberUpdate {
+                issi: listener,
+                groups: vec![gssi],
+                action,
+            }),
         });
         test.run_stack(Some(1));
     }
@@ -807,7 +827,10 @@ fn test_sds_to_ee_ms_defers_until_monitoring_window() {
             _ => None,
         })
         .collect();
-    assert!(!delivered.is_empty(), "deferred SDS must be delivered once the EE monitoring window opens");
+    assert!(
+        !delivered.is_empty(),
+        "deferred SDS must be delivered once the EE monitoring window opens"
+    );
     assert!(
         delivered.iter().all(|p| !p.stealing_permission && p.chan_alloc.is_none()),
         "EE-deferred SDS must be delivered on the MCCH"
@@ -854,7 +877,10 @@ fn test_u_status_command_ip_replies_to_authorized() {
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
     config.cell.sds_command_control = Some(CfgSdsCommandControl {
         authorized_issis: vec![1000001],
-        commands: vec![CfgSdsCommandEntry { status_code: 50, action: "ip".to_string() }],
+        commands: vec![CfgSdsCommandEntry {
+            status_code: 50,
+            action: "ip".to_string(),
+        }],
     });
     let mut test = ComponentTest::from_config(config, Some(dltime));
     test.populate_entities(vec![TetraEntity::Cmce], vec![TetraEntity::Mle, TetraEntity::Brew]);
@@ -879,7 +905,10 @@ fn test_u_status_command_unauthorized_no_reply() {
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
     config.cell.sds_command_control = Some(CfgSdsCommandControl {
         authorized_issis: vec![1000001], // 1000002 is NOT authorized
-        commands: vec![CfgSdsCommandEntry { status_code: 50, action: "ip".to_string() }],
+        commands: vec![CfgSdsCommandEntry {
+            status_code: 50,
+            action: "ip".to_string(),
+        }],
     });
     let mut test = ComponentTest::from_config(config, Some(dltime));
     test.populate_entities(vec![TetraEntity::Cmce], vec![TetraEntity::Mle, TetraEntity::Brew]);
@@ -912,6 +941,7 @@ fn brew_test_config() -> tetra_config::bluestation::StackConfig {
         feature_sds_enabled: true,
         feature_rssi_export: false,
         whitelisted_ssis: None,
+        pbx_gateway_issis: None,
     });
     config
 }
@@ -934,7 +964,8 @@ fn test_emergency_status_not_forwarded_to_brew_by_default() {
     test.run_stack(Some(1));
     let after_emergency = test.dump_sinks();
     assert_eq!(
-        count_brew_sds(&after_emergency), 0,
+        count_brew_sds(&after_emergency),
+        0,
         "emergency status must NOT be forwarded to Brew when forward_to_brew is false (LOCAL-only)"
     );
 

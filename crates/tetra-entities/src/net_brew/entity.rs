@@ -413,6 +413,38 @@ impl BrewEntity {
                         }),
                     });
                 }
+                BrewEvent::CircuitSimplexGranted { uuid, grant, permission } => {
+                    tracing::info!(
+                        "BrewEntity: CIRCUIT SIMPLEX GRANTED uuid={} grant={} permission={}",
+                        uuid, grant, permission
+                    );
+                    queue.push_back(SapMsg {
+                        sap: tetra_core::Sap::Control,
+                        src: TetraEntity::Brew,
+                        dest: TetraEntity::Cmce,
+                        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSimplexGranted {
+                            brew_uuid: uuid,
+                            grant,
+                            permission,
+                        }),
+                    });
+                }
+                BrewEvent::CircuitSimplexIdle { uuid, grant, permission } => {
+                    tracing::info!(
+                        "BrewEntity: CIRCUIT SIMPLEX IDLE uuid={} grant={} permission={}",
+                        uuid, grant, permission
+                    );
+                    queue.push_back(SapMsg {
+                        sap: tetra_core::Sap::Control,
+                        src: TetraEntity::Brew,
+                        dest: TetraEntity::Cmce,
+                        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSimplexIdle {
+                            brew_uuid: uuid,
+                            grant,
+                            permission,
+                        }),
+                    });
+                }
                 BrewEvent::CircuitCallRelease { uuid, cause } => {
                     tracing::info!("BrewEntity: CIRCUIT CALL RELEASE uuid={} cause={}", uuid, cause);
                     queue.push_back(SapMsg {
@@ -1168,6 +1200,16 @@ impl TetraEntityTrait for BrewEntity {
                     let _ = self.command_sender.send(BrewCommand::SendConnectConfirm { uuid: brew_uuid, grant, permission });
                 }
             }
+            SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSimplexGranted { brew_uuid, grant, permission }) => {
+                if self.connected {
+                    let _ = self.command_sender.send(BrewCommand::SendSimplexGranted { uuid: brew_uuid, grant, permission });
+                }
+            }
+            SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSimplexIdle { brew_uuid, grant, permission }) => {
+                if self.connected {
+                    let _ = self.command_sender.send(BrewCommand::SendSimplexIdle { uuid: brew_uuid, grant, permission });
+                }
+            }
             SapMsgInner::CmceCallControl(CallControl::NetworkCircuitMediaReady { brew_uuid, call_id, ts }) => {
                 tracing::info!("BrewEntity: circuit media ready uuid={} call_id={} ts={}", brew_uuid, call_id, ts);
                 // Register UL forwarding: voice on `ts` gets sent to TetraPack.
@@ -1370,15 +1412,22 @@ impl BrewEntity {
                     call_id
                 );
             }
-            tracing::info!(
-                "BrewEntity: local call transmission stopped, sending GROUP_IDLE to TetraPack: uuid={} frames={}",
-                fwd.uuid,
-                fwd.frame_count
-            );
-            let _ = self.command_sender.send(BrewCommand::SendGroupIdle {
-                uuid: fwd.uuid,
-                cause: 0, // Normal release
-            });
+            match fwd.kind {
+                UlForwardKind::Group => {
+                    tracing::info!(
+                        "BrewEntity: local call transmission stopped, sending GROUP_IDLE to TetraPack: uuid={} frames={}",
+                        fwd.uuid,
+                        fwd.frame_count
+                    );
+                    let _ = self.command_sender.send(BrewCommand::SendGroupIdle {
+                        uuid: fwd.uuid,
+                        cause: 0,
+                    });
+                }
+                UlForwardKind::Circuit => {
+                    self.ul_forwarded.insert(ts, fwd);
+                }
+            }
         }
     }
 
@@ -1393,11 +1442,18 @@ impl BrewEntity {
                     call_id
                 );
             }
-            tracing::debug!(
-                "BrewEntity: local call ended (already sent GROUP_IDLE during tx_stopped): uuid={} frames={}",
-                fwd.uuid,
-                fwd.frame_count
-            );
+            match fwd.kind {
+                UlForwardKind::Group => {
+                    tracing::debug!(
+                        "BrewEntity: local call ended (already sent GROUP_IDLE during tx_stopped): uuid={} frames={}",
+                        fwd.uuid,
+                        fwd.frame_count
+                    );
+                }
+                UlForwardKind::Circuit => {
+                    self.drop_network_circuit(fwd.uuid);
+                }
+            }
         } else {
             tracing::debug!("BrewEntity: local call ended on ts={} (already cleaned up during tx_stopped)", ts);
         }

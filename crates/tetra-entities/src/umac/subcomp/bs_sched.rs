@@ -1,4 +1,4 @@
-use tetra_core::{BitBuffer, Direction, PhyBlockNum, PhysicalChannel, TdmaTime, TetraAddress, Todo, TxReporter, unimplemented_log};
+use tetra_core::{BitBuffer, Direction, LinkId, PhyBlockNum, PhysicalChannel, SsiType, TdmaTime, TetraAddress, Todo, TxReporter, unimplemented_log};
 use tetra_saps::{
     control::call_control::{Circuit, CircuitDlMediaSource},
     tmv::{TmvUnitdataReq, TmvUnitdataReqSlot, enums::logical_chans::LogicalChannel},
@@ -214,12 +214,16 @@ impl BsChannelScheduler {
         !self.has_pending_stealing(ts)
     }
 
-    fn has_pending_stealing(&self, ts: u8) -> bool {
+    pub fn has_pending_stealing(&self, ts: u8) -> bool {
         let slot = ts as usize - 1;
         self.dltx_queues
             .get(slot)
             .map(|q| q.iter().any(|e| matches!(e, DlSchedElem::Stealing(..))))
             .unwrap_or(false)
+    }
+
+    pub fn can_deliver_stealing(&self, ts: u8) -> bool {
+        (2..=4).contains(&ts) && self.circuits.is_active(Direction::Dl, ts)
     }
 
     fn generate_hangtime_idle_schf(&self) -> BitBuffer {
@@ -541,12 +545,53 @@ impl BsChannelScheduler {
         self.dltx_queues[ts as usize - 1].push(elem);
     }
 
-    pub fn dl_enqueue_tma(&mut self, pdu: MacResource, sdu: BitBuffer, tx_reporter: Option<TxReporter>) {
-        // Get all timeslots on which a relevant MS is listening
-        // let timeslots: [u8; NUM_TIMESLOTS] = self.identify_timeslots_for_ssi(pdu.addr);
-        tracing::trace!("identify_timeslots_for_ssi not implemented yet, defaulting to ts1");
-        let timeslots: [u8; NUM_TIMESLOTS] = [1, 0, 0, 0];
+    fn identify_timeslots_for_ssi(&self, addr: Option<TetraAddress>, link_id: LinkId) -> [u8; NUM_TIMESLOTS] {
+        let Some(addr) = addr else {
+            tracing::warn!("identify_timeslots_for_ssi: MAC-RESOURCE has no address, defaulting to ts1");
+            return [1, 0, 0, 0];
+        };
 
+        if addr.ssi_type == SsiType::Gssi || link_id == 0 {
+            return [1, 0, 0, 0];
+        }
+
+        let Ok(link_ts) = u8::try_from(link_id) else {
+            tracing::warn!(
+                "identify_timeslots_for_ssi: invalid link_id {} for {}, defaulting to ts1",
+                link_id,
+                addr
+            );
+            return [1, 0, 0, 0];
+        };
+
+        if !(1..=NUM_TIMESLOTS as u8).contains(&link_ts) {
+            tracing::warn!(
+                "identify_timeslots_for_ssi: link_id {} is outside TS range for {}, defaulting to ts1",
+                link_id,
+                addr
+            );
+            return [1, 0, 0, 0];
+        }
+
+        if self.circuits.is_active(Direction::Dl, link_ts) {
+            tracing::debug!(
+                "identify_timeslots_for_ssi: link TS {} is active DL traffic for {}, routing normal signaling on ts1",
+                link_ts,
+                addr
+            );
+            return [1, 0, 0, 0];
+        }
+
+        [link_ts, 0, 0, 0]
+    }
+
+    fn dl_enqueue_tma_on_timeslots(
+        &mut self,
+        timeslots: [u8; NUM_TIMESLOTS],
+        pdu: MacResource,
+        sdu: BitBuffer,
+        tx_reporter: Option<TxReporter>,
+    ) {
         // Queue the message for all timeslots on which we should transmit this message.
         // The loop basically prevents cloning the last element.
         for i in 0..NUM_TIMESLOTS {
@@ -593,6 +638,16 @@ impl BsChannelScheduler {
                 break;
             }
         }
+    }
+
+    pub fn dl_enqueue_tma(&mut self, pdu: MacResource, sdu: BitBuffer, tx_reporter: Option<TxReporter>) {
+        let timeslots = self.identify_timeslots_for_ssi(pdu.addr, 0);
+        self.dl_enqueue_tma_on_timeslots(timeslots, pdu, sdu, tx_reporter);
+    }
+
+    pub fn dl_enqueue_tma_for_link(&mut self, link_id: LinkId, pdu: MacResource, sdu: BitBuffer, tx_reporter: Option<TxReporter>) {
+        let timeslots = self.identify_timeslots_for_ssi(pdu.addr, link_id);
+        self.dl_enqueue_tma_on_timeslots(timeslots, pdu, sdu, tx_reporter);
     }
 
     /// Consumes and returns true if a pending random access ack exists for the given SSI on
@@ -1662,6 +1717,19 @@ mod tests {
         sched
     }
 
+    fn test_circuit(direction: Direction, ts: u8) -> Circuit {
+        Circuit {
+            direction,
+            ts,
+            peer_ts: None,
+            usage: 4,
+            circuit_mode: tetra_saps::control::enums::circuit_mode_type::CircuitModeType::TchS,
+            speech_service: Some(0),
+            etee_encrypted: false,
+            dl_media_source: CircuitDlMediaSource::LocalLoopback,
+        }
+    }
+
     #[test]
     fn test_halfslot_grants() {
         let mut sched = get_testing_slotter();
@@ -1746,6 +1814,161 @@ mod tests {
 
         assert_eq!(grant2.capacity_allocation, BasicSlotgrantCapAlloc::Grant3Slots);
         assert_eq!(grant2.granting_delay, BasicSlotgrantGrantingDelay::DelayNOpportunities(1));
+    }
+
+    #[test]
+    fn test_dl_tma_gssi_routes_to_mcch() {
+        let mut sched = get_testing_slotter();
+        let addr = TetraAddress {
+            ssi_type: SsiType::Gssi,
+            ssi: 2200699,
+        };
+        let pdu = BsChannelScheduler::dl_make_minimal_resource(&addr, None, false);
+        let sdu = BitBuffer::new(0);
+
+        sched.dl_enqueue_tma_for_link(3, pdu, sdu, None);
+
+        assert_eq!(sched.dltx_queues[0].len(), 1);
+        assert_eq!(sched.dltx_queues[2].len(), 0);
+    }
+
+    #[test]
+    fn test_dl_tma_linkless_issi_routes_to_mcch() {
+        let mut sched = get_testing_slotter();
+        let addr = TetraAddress {
+            ssi_type: SsiType::Issi,
+            ssi: 2200699,
+        };
+        let pdu = BsChannelScheduler::dl_make_minimal_resource(&addr, None, false);
+        let sdu = BitBuffer::new(0);
+
+        sched.dl_enqueue_tma_for_link(0, pdu, sdu, None);
+
+        assert_eq!(sched.dltx_queues[0].len(), 1);
+        assert_eq!(sched.dltx_queues[2].len(), 0);
+    }
+
+    #[test]
+    fn test_dl_tma_issi_routes_by_link_timeslot() {
+        let mut sched = get_testing_slotter();
+        let addr = TetraAddress {
+            ssi_type: SsiType::Issi,
+            ssi: 2200699,
+        };
+        let pdu = BsChannelScheduler::dl_make_minimal_resource(&addr, None, false);
+        let sdu = BitBuffer::new(0);
+
+        sched.dl_enqueue_tma_for_link(3, pdu, sdu, None);
+
+        assert_eq!(sched.dltx_queues[0].len(), 0);
+        assert_eq!(sched.dltx_queues[2].len(), 1);
+    }
+
+    #[test]
+    fn test_dl_tma_issi_avoids_active_dl_traffic_slot() {
+        let mut sched = get_testing_slotter();
+        let addr = TetraAddress {
+            ssi_type: SsiType::Issi,
+            ssi: 2200699,
+        };
+        sched.create_circuit(Direction::Dl, test_circuit(Direction::Dl, 3));
+        let pdu = BsChannelScheduler::dl_make_minimal_resource(&addr, None, false);
+        let sdu = BitBuffer::new(0);
+
+        sched.dl_enqueue_tma_for_link(3, pdu, sdu, None);
+
+        assert_eq!(sched.dltx_queues[0].len(), 1);
+        assert_eq!(sched.dltx_queues[2].len(), 0);
+    }
+
+    #[test]
+    fn test_stealing_requires_active_dl_traffic_slot() {
+        let mut sched = get_testing_slotter();
+
+        assert!(!sched.can_deliver_stealing(2));
+
+        sched.create_circuit(Direction::Ul, test_circuit(Direction::Ul, 2));
+        assert!(!sched.can_deliver_stealing(2));
+
+        sched.create_circuit(Direction::Dl, test_circuit(Direction::Dl, 2));
+        assert!(sched.can_deliver_stealing(2));
+    }
+
+    #[test]
+    fn test_non_traffic_stealing_is_discarded() {
+        let mut sched = get_testing_slotter();
+
+        sched.dl_enqueue_stealing(2, BitBuffer::new(124), None);
+        assert!(sched.has_pending_stealing(2));
+
+        assert!(
+            sched
+                .dl_build_block_from_signalling_schedule(TdmaTime { t: 2, f: 1, m: 1, h: 0 })
+                .is_none()
+        );
+        assert!(!sched.has_pending_stealing(2));
+    }
+
+    #[test]
+    fn test_frame_18_keeps_stealing_queued() {
+        let mut sched = get_testing_slotter();
+
+        sched.dl_enqueue_stealing(2, BitBuffer::new(124), None);
+        assert!(sched.has_pending_stealing(2));
+
+        assert!(
+            sched
+                .dl_build_block_from_signalling_schedule(TdmaTime { t: 2, f: 18, m: 1, h: 0 })
+                .is_none()
+        );
+        assert!(sched.has_pending_stealing(2));
+    }
+
+    #[test]
+    fn test_frame_18_defers_signaling_on_same_timeslot_queue() {
+        let mut sched = get_testing_slotter();
+        let addr_ts2 = TetraAddress {
+            ssi_type: SsiType::Issi,
+            ssi: 2200002,
+        };
+        let addr_ts3 = TetraAddress {
+            ssi_type: SsiType::Issi,
+            ssi: 2200003,
+        };
+        let pdu_ts2 = BsChannelScheduler::dl_make_minimal_resource(&addr_ts2, None, false);
+        let pdu_ts3 = BsChannelScheduler::dl_make_minimal_resource(&addr_ts3, None, false);
+
+        sched.dl_enqueue_tma_for_link(2, pdu_ts2, BitBuffer::new(0), None);
+        sched.dl_enqueue_tma_for_link(3, pdu_ts3, BitBuffer::new(0), None);
+
+        assert_eq!(sched.dltx_queues[0].len(), 0);
+        assert_eq!(sched.dltx_queues[1].len(), 1);
+        assert_eq!(sched.dltx_queues[2].len(), 1);
+
+        assert!(
+            sched
+                .dl_build_block_from_signalling_schedule(TdmaTime { t: 2, f: 18, m: 1, h: 0 })
+                .is_none()
+        );
+        assert!(
+            sched
+                .dl_build_block_from_signalling_schedule(TdmaTime { t: 3, f: 18, m: 1, h: 0 })
+                .is_none()
+        );
+
+        assert_eq!(sched.dltx_queues[0].len(), 0);
+        assert_eq!(sched.dltx_queues[1].len(), 1);
+        assert_eq!(sched.dltx_queues[2].len(), 1);
+
+        assert!(
+            sched
+                .dl_build_block_from_signalling_schedule(TdmaTime { t: 1, f: 1, m: 2, h: 0 })
+                .is_none()
+        );
+
+        assert_eq!(sched.dltx_queues[0].len(), 0);
+        assert_eq!(sched.dltx_queues[1].len(), 1);
+        assert_eq!(sched.dltx_queues[2].len(), 1);
     }
 
     #[test]

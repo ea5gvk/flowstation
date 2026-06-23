@@ -379,6 +379,7 @@ impl UmacMs {
                         pdu: sdu,
                         main_address: pdu.addr.unwrap(),
                         scrambling_code: prim.scrambling_code,
+                        link_id: 0,
                         endpoint_id: 0,        // TODO FIXME
                         new_endpoint_id: None, // TODO FIXME
                         css_endpoint_id: None, // TODO FIXME
@@ -510,6 +511,7 @@ impl UmacMs {
                 pdu: Some(defragbuf.buffer),
                 main_address: defragbuf.addr,
                 scrambling_code: prim.scrambling_code,
+                link_id: 0,
                 endpoint_id: 0,              // TODO FIXME
                 new_endpoint_id: None,       // TODO FIXME
                 css_endpoint_id: None,       // TODO FIXME

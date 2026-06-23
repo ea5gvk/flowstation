@@ -1,6 +1,19 @@
 use super::*;
 
+/// Local bridge entry points for ISI-style interworking.
+///
+/// EN 300 392-3-2 models individual call interworking as ANF-ISIIC, while
+/// EN 300 392-3-3 models group call interworking as ANF-ISIGC. The current
+/// Brew transport is not PSS1/ROSE ISI, but these handlers keep the network
+/// side at the CC boundary instead of spreading it through CMCE PC routing.
 impl CcBsSubentity {
+    pub(in crate::cmce::subentities::cc_bs) fn find_brew_individual_call(&self, brew_uuid: uuid::Uuid) -> Option<(u16, IndividualCall)> {
+        self.individual_calls
+            .iter()
+            .find(|(_, c)| (c.called_over_brew || c.calling_over_brew) && c.brew_uuid == Some(brew_uuid))
+            .map(|(id, call)| (*id, call.clone()))
+    }
+
     pub(super) fn rx_network_circuit_setup_request(&mut self, queue: &mut MessageQueue, brew_uuid: uuid::Uuid, call: NetworkCircuitCall) {
         self.fsm_on_network_circuit_setup_request(queue, brew_uuid, call);
     }
@@ -77,12 +90,30 @@ impl CcBsSubentity {
         self.fsm_on_network_circuit_connect_confirm(queue, brew_uuid, grant, permission);
     }
 
+    pub(super) fn rx_network_circuit_simplex_granted(
+        &mut self,
+        queue: &mut MessageQueue,
+        brew_uuid: uuid::Uuid,
+        grant: u8,
+        permission: u8,
+    ) {
+        self.fsm_on_network_circuit_simplex_granted(queue, brew_uuid, grant, permission);
+    }
+
+    pub(super) fn rx_network_circuit_simplex_idle(&mut self, queue: &mut MessageQueue, brew_uuid: uuid::Uuid, grant: u8, permission: u8) {
+        self.fsm_on_network_circuit_simplex_idle(queue, brew_uuid, grant, permission);
+    }
+
     pub(super) fn rx_network_circuit_release(&mut self, queue: &mut MessageQueue, brew_uuid: uuid::Uuid, cause: u8) {
         let Some((call_id, _)) = self.find_brew_individual_call(brew_uuid) else {
             tracing::debug!("CMCE: Brew release for unknown uuid={} cause={}", brew_uuid, cause);
             return;
         };
-        let mapped = DisconnectCause::try_from(cause as u64).unwrap_or(DisconnectCause::SwmiRequestedDisconnection);
+        let mapped = if cause == 0 {
+            DisconnectCause::UserRequestedDisconnection
+        } else {
+            DisconnectCause::try_from(cause as u64).unwrap_or(DisconnectCause::SwmiRequestedDisconnection)
+        };
         tracing::info!(
             "CMCE: Brew release uuid={} call_id={} cause={} ({:?})",
             brew_uuid,

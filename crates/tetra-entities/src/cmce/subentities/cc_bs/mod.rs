@@ -3,36 +3,22 @@ use std::collections::{HashMap, HashSet};
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::typed_pdu_fields::Type3FieldGeneric;
 use tetra_core::{
-    BitBuffer, Direction, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress, TimeslotOwner,
-    TxReporter, tetra_entities::TetraEntity, unimplemented_log,
+    BitBuffer, Direction, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress, TimeslotOwner, TxReporter, tetra_entities::TetraEntity,
+    unimplemented_log,
 };
 use tetra_pdus::cmce::enums::disconnect_cause::DisconnectCause;
 use tetra_pdus::cmce::{
     enums::{
-        call_timeout::CallTimeout,
-        call_timeout_setup_phase::CallTimeoutSetupPhase,
-        cmce_pdu_type_ul::CmcePduTypeUl,
-        transmission_grant::TransmissionGrant,
+        call_status::CallStatus, call_timeout::CallTimeout, call_timeout_setup_phase::CallTimeoutSetupPhase,
+        cmce_pdu_type_ul::CmcePduTypeUl, party_type_identifier::PartyTypeIdentifier, transmission_grant::TransmissionGrant,
         type3_elem_id::CmceType3ElemId,
     },
     fields::basic_service_information::BasicServiceInformation,
     pdus::{
-        d_alert::DAlert,
-        d_call_proceeding::DCallProceeding,
-        d_connect::DConnect,
-        d_connect_acknowledge::DConnectAcknowledge,
-        d_release::DRelease,
-        d_setup::DSetup,
-        d_tx_ceased::DTxCeased,
-        d_tx_granted::DTxGranted,
-        u_alert::UAlert,
-        u_connect::UConnect,
-        u_disconnect::UDisconnect,
-        u_info::UInfo,
-        u_release::URelease,
-        u_setup::USetup,
-        u_tx_ceased::UTxCeased,
-        u_tx_demand::UTxDemand,
+        d_alert::DAlert, d_call_proceeding::DCallProceeding, d_call_restore::DCallRestore, d_connect::DConnect,
+        d_connect_acknowledge::DConnectAcknowledge, d_disconnect::DDisconnect, d_info::DInfo, d_release::DRelease, d_setup::DSetup,
+        d_tx_ceased::DTxCeased, d_tx_granted::DTxGranted, u_alert::UAlert, u_call_restore::UCallRestore, u_connect::UConnect,
+        u_disconnect::UDisconnect, u_info::UInfo, u_release::URelease, u_setup::USetup, u_tx_ceased::UTxCeased, u_tx_demand::UTxDemand,
     },
     structs::cmce_circuit::CmceCircuit,
 };
@@ -50,40 +36,28 @@ use tetra_saps::{
     },
 };
 
-use crate::net_brew;
+use crate::net_brew as brew;
 use crate::{
     MessageQueue,
     cmce::components::circuit_mgr::{CircuitMgr, CircuitMgrCmd},
 };
 
-mod call;
 mod dtmf;
-mod fsm;
-mod ingress;
-mod network;
-mod shared;
+mod lifecycle;
+mod pdu;
+mod procedures;
+mod routes;
+mod state;
 mod timers;
-mod echo;
-use echo::EchoSession;
 
-use call::{
-    ActiveCall, CallOrigin, EE_DSETUP_FALLBACK_TS, GroupCallState, IndividualCall,
-    IndividualCallState, TxDemandQueueResult, is_emergency_priority, is_preemptive_priority,
+use lifecycle::{BrewNotification, CallTimeslot, GroupFloorGrant};
+use procedures::{GroupTransitionError, IndividualTransitionError};
+use state::{
+    ActiveCall, CachedSetup, CallOrigin, CcFormalEvent, CcFormalState, GroupCallState, IndividualCall, IndividualCallState,
+    TxDemandQueueResult,
 };
-use fsm::{GroupTransitionError, IndividualTransitionError};
 
-struct CachedSetup {
-    pdu: DSetup,
-    dest_addr: TetraAddress,
-    resend: bool,
-    /// True for P2P individual calls where DSetup must be resent on MCCH (no chan_alloc).
-    /// False for group calls where DSetup is resent on the traffic channel with chan_alloc.
-    is_individual: bool,
-}
-
-/// Clause 14 Call Control CMCE sub-entity (ETSI EN 300 392-2)
-/// Supports group calls (simplex PTT), individual calls (full-duplex P2P),
-/// and circuit-switched calls bridged over Brew/TetraPack.
+/// Clause 11 Call Control CMCE sub-entity
 pub struct CcBsSubentity {
     config: SharedConfig,
     dltime: TdmaTime,
@@ -92,14 +66,10 @@ pub struct CcBsSubentity {
     circuits: CircuitMgr,
     /// Active group calls: call_id -> call info
     active_calls: HashMap<u16, ActiveCall>,
-    /// Active or pending individual calls (P2P / duplex)
+    /// Active or pending individual calls (P2P)
     individual_calls: HashMap<u16, IndividualCall>,
     /// Registered subscriber groups (ISSI -> set of GSSIs)
     subscriber_groups: HashMap<u32, HashSet<u32>>,
     /// Listener counts per GSSI
     group_listeners: HashMap<u32, usize>,
-    /// Telemetry sink for call events (optional)
-    telemetry: Option<crate::net_telemetry::channel::TelemetrySink>,
-    /// Active echo service session (ISSI 999), if any
-    echo_session: Option<EchoSession>,
 }

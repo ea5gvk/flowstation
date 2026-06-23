@@ -17,6 +17,7 @@ pub(in crate::cmce::subentities::cc_bs) enum IndividualTransitionError {
     InvalidTransition {
         call_id: u16,
         state: IndividualCallState,
+        formal_state: CcFormalState,
         event: IndividualEvent,
     },
     MissingBrewUuid(u16),
@@ -28,37 +29,31 @@ impl CcBsSubentity {
     fn validate_individual_transition(
         call_id: u16,
         state: IndividualCallState,
+        formal_state: CcFormalState,
         event: IndividualEvent,
     ) -> Result<(), IndividualTransitionError> {
-        let allowed = matches!(
-            (state, event),
-            (IndividualCallState::CallSetupPending, IndividualEvent::BindCalledContext)
-                | (IndividualCallState::IncomingSetupPending, IndividualEvent::BindCalledContext)
-                | (IndividualCallState::IncomingAlerting, IndividualEvent::BindCalledContext)
-                | (IndividualCallState::IncomingSetupWaitNetworkAck, IndividualEvent::BindCalledContext)
-                | (IndividualCallState::CallSetupPending, IndividualEvent::SetNetworkCall)
-                | (IndividualCallState::IncomingSetupPending, IndividualEvent::SetNetworkCall)
-                | (IndividualCallState::IncomingAlerting, IndividualEvent::SetNetworkCall)
-                | (IndividualCallState::IncomingSetupWaitNetworkAck, IndividualEvent::SetNetworkCall)
-                | (IndividualCallState::CallSetupPending, IndividualEvent::MarkConnectRequestSent)
-                | (IndividualCallState::IncomingSetupPending, IndividualEvent::MarkConnectRequestSent)
-                | (IndividualCallState::IncomingAlerting, IndividualEvent::MarkConnectRequestSent)
-                | (
-                    IndividualCallState::IncomingSetupWaitNetworkAck,
-                    IndividualEvent::MarkConnectRequestSent
+        let detail_matches_formal = state.formal_state() == formal_state;
+        let allowed = detail_matches_formal
+            && matches!(
+                (formal_state, event),
+                (
+                    CcFormalState::Setup,
+                    IndividualEvent::BindCalledContext
+                        | IndividualEvent::SetNetworkCall
+                        | IndividualEvent::MarkConnectRequestSent
+                        | IndividualEvent::Alert
+                        | IndividualEvent::Connect
                 )
-                | (IndividualCallState::CallSetupPending, IndividualEvent::Alert)
-                | (IndividualCallState::IncomingSetupPending, IndividualEvent::Alert)
-                | (IndividualCallState::IncomingAlerting, IndividualEvent::Alert)
-                | (IndividualCallState::CallSetupPending, IndividualEvent::Connect)
-                | (IndividualCallState::IncomingSetupPending, IndividualEvent::Connect)
-                | (IndividualCallState::IncomingAlerting, IndividualEvent::Connect)
-                | (IndividualCallState::IncomingSetupWaitNetworkAck, IndividualEvent::Connect)
-        );
+            );
         if allowed {
             Ok(())
         } else {
-            Err(IndividualTransitionError::InvalidTransition { call_id, state, event })
+            Err(IndividualTransitionError::InvalidTransition {
+                call_id,
+                state,
+                formal_state,
+                event,
+            })
         }
     }
 
@@ -74,10 +69,12 @@ impl CcBsSubentity {
         if !matches!(
             call.state,
             IndividualCallState::CallSetupPending | IndividualCallState::IncomingSetupPending
-        ) {
+        ) || call.formal_state != CcFormalState::Setup
+        {
             return Err(IndividualTransitionError::InvalidTransition {
                 call_id,
                 state: call.state,
+                formal_state: call.formal_state,
                 event: IndividualEvent::CreateSetup,
             });
         }
@@ -97,7 +94,12 @@ impl CcBsSubentity {
             return Err(IndividualTransitionError::UnknownCall(call_id));
         };
 
-        Self::validate_individual_transition(call_id, call_snapshot.state, IndividualEvent::BindCalledContext)?;
+        Self::validate_individual_transition(
+            call_id,
+            call_snapshot.state,
+            call_snapshot.formal_state,
+            IndividualEvent::BindCalledContext,
+        )?;
 
         if let Some(call) = self.individual_calls.get_mut(&call_id)
             && call.called_handle.is_none()
@@ -118,7 +120,12 @@ impl CcBsSubentity {
             return Err(IndividualTransitionError::UnknownCall(call_id));
         };
 
-        Self::validate_individual_transition(call_id, call_snapshot.state, IndividualEvent::SetNetworkCall)?;
+        Self::validate_individual_transition(
+            call_id,
+            call_snapshot.state,
+            call_snapshot.formal_state,
+            IndividualEvent::SetNetworkCall,
+        )?;
 
         if let Some(call) = self.individual_calls.get_mut(&call_id) {
             call.network_call = Some(network_call);
@@ -135,7 +142,12 @@ impl CcBsSubentity {
             return Err(IndividualTransitionError::UnknownCall(call_id));
         };
 
-        Self::validate_individual_transition(call_id, call_snapshot.state, IndividualEvent::MarkConnectRequestSent)?;
+        Self::validate_individual_transition(
+            call_id,
+            call_snapshot.state,
+            call_snapshot.formal_state,
+            IndividualEvent::MarkConnectRequestSent,
+        )?;
 
         if !call_snapshot.calling_over_brew {
             return Err(IndividualTransitionError::NotBrewOriginated(call_id));
@@ -163,7 +175,7 @@ impl CcBsSubentity {
             return Err(IndividualTransitionError::UnknownCall(call_id));
         };
 
-        Self::validate_individual_transition(call_id, call_snapshot.state, IndividualEvent::Alert)?;
+        Self::validate_individual_transition(call_id, call_snapshot.state, call_snapshot.formal_state, IndividualEvent::Alert)?;
 
         if let Some((handle, link_id, endpoint_id)) = called_handle_ctx {
             self.fsm_individual_bind_called_context(call_id, handle, link_id, endpoint_id)?;
@@ -183,6 +195,7 @@ impl CcBsSubentity {
         } else if !call_snapshot.is_alerted() {
             self.send_d_alert_individual(
                 queue,
+                self.dltime,
                 call_id,
                 call_snapshot.simplex_duplex,
                 call_snapshot.calling_addr,
@@ -208,7 +221,7 @@ impl CcBsSubentity {
             return Err(IndividualTransitionError::UnknownCall(call_id));
         };
 
-        Self::validate_individual_transition(call_id, call_snapshot.state, IndividualEvent::Connect)?;
+        Self::validate_individual_transition(call_id, call_snapshot.state, call_snapshot.formal_state, IndividualEvent::Connect)?;
 
         if let Some(call) = self.individual_calls.get_mut(&call_id) {
             call.activate(self.dltime);
@@ -270,7 +283,7 @@ impl CcBsSubentity {
         pdu: UConnect,
     ) {
         let call_id = pdu.call_identifier;
-        let Some(call_snapshot) = self.individual_calls.get(&call_id).cloned() as Option<IndividualCall> else {
+        let Some(call_snapshot) = self.individual_calls.get(&call_id).cloned() else {
             tracing::warn!("U-CONNECT for unknown call_id={}", call_id);
             return;
         };
@@ -330,7 +343,7 @@ impl CcBsSubentity {
                 communication: CommunicationType::P2p.into_raw() as u8,
                 grant: 0,
                 permission: 0,
-                timeout: CallTimeout::T5m.into_raw() as u8,
+                timeout: Self::p2p_call_timeout(call_snapshot.simplex_duplex).into_raw() as u8,
                 ownership: 0,
                 queued: 0,
             });
@@ -396,23 +409,19 @@ impl CcBsSubentity {
         let calling_usage = call_snapshot.calling_usage;
         let called_usage = call_snapshot.called_usage;
         let simplex_duplex = call_snapshot.simplex_duplex;
+        let is_simplex = !simplex_duplex;
 
         let Some(cached) = self.cached_setups.get(&call_id) else {
             tracing::error!("No cached D-SETUP for call_id={}", call_id);
             return;
         };
+        let calling_has_initial_floor = is_simplex && cached.pdu.transmission_grant == TransmissionGrant::GrantedToOtherUser;
+        let (calling_ul_dl, called_ul_dl) = (UlDlAssignment::Both, UlDlAssignment::Both);
 
         let mut calling_timeslots = [false; 4];
         calling_timeslots[calling_ts as usize - 1] = true;
         let mut called_timeslots = [false; 4];
         called_timeslots[called_ts as usize - 1] = true;
-
-        // For simplex P2P: both MS initially get Both so they can receive the D-CONNECT /
-        // D-CONNECT-ACK PDUs on the traffic channel. The floor (Ul/Dl restriction) is
-        // enforced later via D-TX-GRANTED when either MS presses PTT (U-TX-DEMAND).
-        // For duplex P2P: Both on both TS (cross-routed audio).
-        let (calling_ul_dl, called_ul_dl) = (UlDlAssignment::Both, UlDlAssignment::Both);
-
         let chan_alloc_calling = CmceChanAllocReq {
             usage: Some(calling_usage),
             alloc_type: ChanAllocType::Replace,
@@ -428,16 +437,17 @@ impl CcBsSubentity {
             ul_dl_assigned: called_ul_dl,
         };
         tracing::debug!(
-            "P2P chan_alloc: calling ts={} usage={} slots={:?}, called ts={} usage={} slots={:?}",
+            "P2P chan_alloc: calling ts={} usage={} slots={:?} ul_dl={}, called ts={} usage={} slots={:?} ul_dl={}",
             calling_ts,
             calling_usage,
             calling_timeslots,
+            chan_alloc_calling.ul_dl_assigned,
             called_ts,
             called_usage,
-            called_timeslots
+            called_timeslots,
+            chan_alloc_called.ul_dl_assigned
         );
 
-        // Open UMAC circuits FIRST so traffic channel is ready before MS arrives
         let circuit_calling = CmceCircuit {
             ts_created: self.dltime,
             direction: Direction::Both,
@@ -450,19 +460,14 @@ impl CcBsSubentity {
             speech_service: cached.pdu.basic_service_information.speech_service,
             etee_encrypted: cached.pdu.basic_service_information.encryption_flag,
         };
-
-        // For P2P calls (both simplex and duplex) on different timeslots:
-        // peer_ts must be set on BOTH circuits so UMAC cross-routes audio in BOTH directions.
-        //
-        // Simplex: only one MS transmits at a time (UL inactivity + floor control), but the
-        // cross-routing path must be ready on both sides. Without peer_ts on called_ts,
-        // when the called MS takes the floor (U-TX-DEMAND), its UL goes to LocalLoopback
-        // instead of being routed to calling_ts — calling MS hears nothing; called MS hears
-        // their own voice echoed back.
-        let cross_peer_calling = if calling_ts != called_ts { Some(called_ts) } else { None };
-        let cross_peer_called  = if calling_ts != called_ts { Some(calling_ts) } else { None };
-
-        Self::signal_umac_circuit_open(queue, &circuit_calling, cross_peer_calling, CircuitDlMediaSource::LocalLoopback);
+        let duplex_peer = if calling_ts != called_ts { Some(called_ts) } else { None };
+        Self::signal_umac_circuit_open(
+            queue,
+            &circuit_calling,
+            self.dltime,
+            duplex_peer,
+            CircuitDlMediaSource::LocalLoopback,
+        );
 
         if called_ts != calling_ts {
             let circuit_called = CmceCircuit {
@@ -477,25 +482,29 @@ impl CcBsSubentity {
                 speech_service: cached.pdu.basic_service_information.speech_service,
                 etee_encrypted: cached.pdu.basic_service_information.encryption_flag,
             };
-            Self::signal_umac_circuit_open(queue, &circuit_called, cross_peer_called, CircuitDlMediaSource::LocalLoopback);
+            Self::signal_umac_circuit_open(
+                queue,
+                &circuit_called,
+                self.dltime,
+                Some(calling_ts),
+                CircuitDlMediaSource::LocalLoopback,
+            );
         }
 
-        // D-CONNECT to calling MS:
-        //   - Simplex: GrantedToOtherUser - the called MS answers first and speaks first.
-        //     Caller must send U-TX-DEMAND to get the floor.
-        //   - Duplex: Granted - both MS may speak simultaneously.
-        // transmission_request_permission=false = 0 = ALLOWED to request transmission (ETSI 14.8.43).
-        let calling_grant = if simplex_duplex {
-            TransmissionGrant::Granted
-        } else {
-            TransmissionGrant::GrantedToOtherUser
-        };
         let d_connect = DConnect {
             call_identifier: call_id,
-            call_time_out: if simplex_duplex { CallTimeout::Infinite } else { self.config_call_timeout() },
+            call_time_out: Self::p2p_call_timeout(simplex_duplex),
             hook_method_selection: cached.pdu.hook_method_selection,
             simplex_duplex_selection: simplex_duplex,
-            transmission_grant: calling_grant,
+            transmission_grant: if is_simplex {
+                if calling_has_initial_floor {
+                    TransmissionGrant::Granted
+                } else {
+                    TransmissionGrant::GrantedToOtherUser
+                }
+            } else {
+                TransmissionGrant::Granted
+            },
             transmission_request_permission: false,
             call_ownership: true,
             call_priority: None,
@@ -510,9 +519,7 @@ impl CcBsSubentity {
         let mut connect_sdu = BitBuffer::new_autoexpand(30);
         d_connect.to_bitbuf(&mut connect_sdu).expect("Failed to serialize DConnect");
         connect_sdu.seek(0);
-
-        // --- STEP 1: DConnect via FACCH stealing (terminal already on TCH) ---
-        let connect_msg = SapMsg {
+        let connect_msg_stealing = SapMsg {
             sap: Sap::LcmcSap,
             src: TetraEntity::Cmce,
             dest: TetraEntity::Mle,
@@ -521,7 +528,7 @@ impl CcBsSubentity {
                 handle: calling_handle,
                 endpoint_id: calling_endpoint_id,
                 link_id: calling_link_id,
-                layer2service: Layer2Service::Unacknowledged,
+                layer2service: Layer2Service::Todo,
                 pdu_prio: 0,
                 layer2_qos: 0,
                 stealing_permission: true,
@@ -531,24 +538,21 @@ impl CcBsSubentity {
                 tx_reporter: None,
             }),
         };
-        queue.push_back(connect_msg);
+        queue.push_back(connect_msg_stealing);
 
-        // --- STEP 2: DConnect via MCCH as fallback (terminal still on control channel) ---
-        let mut connect_sdu2 = BitBuffer::new_autoexpand(30);
-        d_connect
-            .to_bitbuf(&mut connect_sdu2)
-            .expect("Failed to serialize DConnect (fallback)");
-        connect_sdu2.seek(0);
-        let connect_msg2 = SapMsg {
+        let mut connect_sdu = BitBuffer::new_autoexpand(30);
+        d_connect.to_bitbuf(&mut connect_sdu).expect("Failed to serialize DConnect");
+        connect_sdu.seek(0);
+        let connect_msg_fallback = SapMsg {
             sap: Sap::LcmcSap,
             src: TetraEntity::Cmce,
             dest: TetraEntity::Mle,
             msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
-                sdu: connect_sdu2,
+                sdu: connect_sdu,
                 handle: calling_handle,
                 endpoint_id: calling_endpoint_id,
                 link_id: calling_link_id,
-                layer2service: Layer2Service::Unacknowledged,
+                layer2service: Layer2Service::Todo,
                 pdu_prio: 0,
                 layer2_qos: 0,
                 stealing_permission: false,
@@ -558,16 +562,16 @@ impl CcBsSubentity {
                 tx_reporter: None,
             }),
         };
-        queue.push_back(connect_msg2);
+        queue.push_back(connect_msg_fallback);
 
-        // D-CONNECT-ACKNOWLEDGE to called MS:
-        //   - Simplex: Granted - the called MS answered, it speaks first.
-        //   - Duplex: Granted - both MS may speak simultaneously.
-        // transmission_request_permission=false = 0 = ALLOWED to request transmission (ETSI 14.8.43).
         let d_connect_ack = DConnectAcknowledge {
             call_identifier: call_id,
-            call_time_out: if simplex_duplex { CallTimeout::Infinite } else { self.config_call_timeout() }.into_raw() as u8,
-            transmission_grant: TransmissionGrant::Granted.into_raw() as u8,
+            call_time_out: Self::p2p_call_timeout(simplex_duplex).into_raw() as u8,
+            transmission_grant: if is_simplex && calling_has_initial_floor {
+                TransmissionGrant::GrantedToOtherUser.into_raw() as u8
+            } else {
+                TransmissionGrant::Granted.into_raw() as u8
+            },
             transmission_request_permission: false,
             notification_indicator: None,
             facility: None,
@@ -581,8 +585,7 @@ impl CcBsSubentity {
             .expect("Failed to serialize DConnectAcknowledge");
         ack_sdu.seek(0);
 
-        // --- STEP 1: DConnectAcknowledge via FACCH stealing (terminal already on TCH) ---
-        let ack_msg = SapMsg {
+        let ack_msg_stealing = SapMsg {
             sap: Sap::LcmcSap,
             src: TetraEntity::Cmce,
             dest: TetraEntity::Mle,
@@ -591,7 +594,7 @@ impl CcBsSubentity {
                 handle,
                 endpoint_id,
                 link_id,
-                layer2service: Layer2Service::Unacknowledged,
+                layer2service: Layer2Service::Todo,
                 pdu_prio: 0,
                 layer2_qos: 0,
                 stealing_permission: true,
@@ -601,24 +604,23 @@ impl CcBsSubentity {
                 tx_reporter: None,
             }),
         };
-        queue.push_back(ack_msg);
+        queue.push_back(ack_msg_stealing);
 
-        // --- STEP 2: DConnectAcknowledge via MCCH as fallback (terminal still on control channel) ---
-        let mut ack_sdu2 = BitBuffer::new_autoexpand(28);
+        let mut ack_sdu = BitBuffer::new_autoexpand(28);
         d_connect_ack
-            .to_bitbuf(&mut ack_sdu2)
-            .expect("Failed to serialize DConnectAcknowledge (fallback)");
-        ack_sdu2.seek(0);
-        let ack_msg2 = SapMsg {
+            .to_bitbuf(&mut ack_sdu)
+            .expect("Failed to serialize DConnectAcknowledge");
+        ack_sdu.seek(0);
+        let ack_msg_fallback = SapMsg {
             sap: Sap::LcmcSap,
             src: TetraEntity::Cmce,
             dest: TetraEntity::Mle,
             msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
-                sdu: ack_sdu2,
+                sdu: ack_sdu,
                 handle,
                 endpoint_id,
                 link_id,
-                layer2service: Layer2Service::Unacknowledged,
+                layer2service: Layer2Service::Todo,
                 pdu_prio: 0,
                 layer2_qos: 0,
                 stealing_permission: false,
@@ -628,34 +630,47 @@ impl CcBsSubentity {
                 tx_reporter: None,
             }),
         };
-        queue.push_back(ack_msg2);
+        queue.push_back(ack_msg_fallback);
 
-        if let Err(err) = self.fsm_individual_transition_to_active(call_id) {
-            match err {
-                IndividualTransitionError::UnknownCall(_) => {
-                    tracing::warn!("U-CONNECT activation failed, unknown call_id={}", call_id);
+        let activated = match self.fsm_individual_transition_to_active(call_id) {
+            Ok(()) => true,
+            Err(err) => {
+                match err {
+                    IndividualTransitionError::UnknownCall(_) => {
+                        tracing::warn!("U-CONNECT activation failed, unknown call_id={}", call_id);
+                    }
+                    IndividualTransitionError::InvalidTransition { state, .. } => {
+                        tracing::warn!("U-CONNECT activation rejected for call_id={} from state {:?}", call_id, state);
+                    }
+                    IndividualTransitionError::MissingBrewUuid(_)
+                    | IndividualTransitionError::DuplicateCall(_)
+                    | IndividualTransitionError::NotBrewOriginated(_)
+                    | IndividualTransitionError::ConnectRequestAlreadySent(_) => {}
                 }
-                IndividualTransitionError::InvalidTransition { state, .. } => {
-                    tracing::warn!("U-CONNECT activation rejected for call_id={} from state {:?}", call_id, state);
-                }
-                IndividualTransitionError::MissingBrewUuid(_)
-                | IndividualTransitionError::DuplicateCall(_)
-                | IndividualTransitionError::NotBrewOriginated(_)
-                | IndividualTransitionError::ConnectRequestAlreadySent(_) => {}
+                false
             }
-        }
+        };
 
-        // Set initial floor_holder for simplex P2P:
-        // The CALLED MS gets TransmissionGrant::Granted in D-CONNECT-ACK (it answered, it speaks first).
-        // The CALLING MS gets TransmissionGrant::GrantedToOtherUser in D-CONNECT (must press PTT to speak).
-        // Without this, UL inactivity timeout on the called MS's TS would not match the floor_holder
-        // check in handle_ul_inactivity_timeout, leading to ignored timeouts and stuck calls.
-        // Duplex: floor_holder stays None — both MS can transmit anytime.
-        if !simplex_duplex {
-            if let Some(c) = self.individual_calls.get_mut(&call_id) {
-                c.floor_holder = Some(called_addr.ssi);
-                tracing::info!("Simplex P2P call_id={} initial floor_holder = called ISSI {}", call_id, called_addr.ssi);
+        if activated && is_simplex {
+            let (speaker_addr, listener_addr, speaker_ts) = if calling_has_initial_floor {
+                (calling_addr, called_addr, calling_ts)
+            } else {
+                (called_addr, calling_addr, called_ts)
+            };
+            if let Some(call) = self.individual_calls.get_mut(&call_id) {
+                call.grant_floor(speaker_addr);
             }
+            self.notify_floor_granted(
+                queue,
+                GroupFloorGrant {
+                    call_id,
+                    source_issi: speaker_addr.ssi,
+                    dest_gssi: listener_addr.ssi,
+                    ts: speaker_ts,
+                },
+                true,
+                BrewNotification::Never,
+            );
         }
     }
 }

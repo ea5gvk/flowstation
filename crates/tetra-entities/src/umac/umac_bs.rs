@@ -59,6 +59,17 @@ pub struct UmacBs {
     /// Timestamp of last received UL voice frame per timeslot (0-indexed: ts1..ts4).
     /// Used to detect UL inactivity when a radio disappears mid-transmission.
     last_ul_voice: [Option<TdmaTime>; 4],
+    /// Local floor owner per traffic timeslot, used to attribute MAC-U-SIGNAL
+    /// uplink signalling that does not carry an address field.
+    ul_signal_owner: [Option<u32>; 4],
+    /// Delay traffic-slot circuit closes until queued FACCH/STCH release signalling drains.
+    pending_circuit_closes: [PendingCircuitClose; 4],
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PendingCircuitClose {
+    dl: bool,
+    ul: bool,
 }
 
 struct PendingStch {
@@ -86,6 +97,8 @@ impl UmacBs {
             // event_label_store: EventLabelStore::new(),
             channel_scheduler: BsChannelScheduler::new(scrambling_code, precomps),
             last_ul_voice: [None; 4],
+            ul_signal_owner: [None; 4],
+            pending_circuit_closes: [PendingCircuitClose::default(); 4],
         }
     }
 
@@ -593,6 +606,7 @@ impl UmacBs {
                         pdu: sdu,
                         main_address: addr,
                         scrambling_code: prim.scrambling_code,
+                        link_id: msg_dltime.t as u32,
                         endpoint_id: 0,        // TODO FIXME
                         new_endpoint_id: None, // TODO FIXME
                         css_endpoint_id: None, // TODO FIXME
@@ -695,10 +709,21 @@ impl UmacBs {
             return;
         }
 
-        // Schedule acknowledgement of this message
-        // let ul_time = message.dltime.add_timeslots(-2);
-        let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago. 
-        self.channel_scheduler.dl_enqueue_random_access_ack(msg_dltime.t, addr);
+        // Schedule random-access acknowledgement only on signalling slots. A MAC-ACCESS
+        // received on an already active traffic timeslot is ordinary in-call signalling
+        // (FACCH/STCH LLC ACKs, short control PDUs), not a fresh random-access attempt.
+        // Marking those as RA causes the next stolen downlink MAC-RESOURCE to carry
+        // random_access_flag=true, which some radios reject during call setup.
+        let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago.
+        if !self.channel_scheduler.circuit_is_active(Direction::Dl, msg_dltime.t) {
+            self.channel_scheduler.dl_enqueue_random_access_ack(msg_dltime.t, addr);
+        } else {
+            tracing::trace!(
+                "rx_mac_access: suppressing random-access ack on active DL traffic ts {} for {}",
+                msg_dltime.t,
+                addr
+            );
+        }
 
         // Notify MM of RSSI for this MS so it can be stored per-subscriber.
         // Only sent when RSSI is a finite value (i.e. demodulator calculated it).
@@ -762,6 +787,7 @@ impl UmacBs {
                         pdu: sdu,
                         main_address: addr,
                         scrambling_code: prim.scrambling_code,
+                        link_id: msg_dltime.t as u32,
                         endpoint_id: 0,        // TODO FIXME
                         new_endpoint_id: None, // TODO FIXME
                         css_endpoint_id: None, // TODO FIXME
@@ -926,6 +952,7 @@ impl UmacBs {
                 pdu: Some(defragbuf.buffer),
                 main_address: defragbuf.addr,
                 scrambling_code: prim.scrambling_code,
+                link_id: msg_dltime.t as u32,
                 endpoint_id: 0,              // TODO FIXME
                 new_endpoint_id: None,       // TODO FIXME
                 css_endpoint_id: None,       // TODO FIXME
@@ -1043,6 +1070,7 @@ impl UmacBs {
                 pdu: Some(defragbuf.buffer),
                 main_address: defragbuf.addr,
                 scrambling_code: prim.scrambling_code,
+                link_id: msg_dltime.t as u32,
                 endpoint_id: 0,              // TODO FIXME
                 new_endpoint_id: None,       // TODO FIXME
                 css_endpoint_id: None,       // TODO FIXME
@@ -1097,17 +1125,24 @@ impl UmacBs {
         let sdu = BitBuffer::from_bitbuffer_pos(&prim.pdu);
         tracing::debug!("rx_ul_mac_u_signal: forwarding {} bit TM-SDU to LLC", sdu.get_len());
 
+        let msg_dltime = self.dltime.add_timeslots(-2);
+        let ts_idx = msg_dltime.t.saturating_sub(1) as usize;
+        let owner_issi = self
+            .channel_scheduler
+            .ul_get_slot_owner(msg_dltime, prim.block_num)
+            .or_else(|| self.ul_signal_owner.get(ts_idx).copied().flatten())
+            .unwrap_or(0);
+
         // Forward to LLC via TMA-SAP, same path as MAC-DATA.
-        // Address is not known from MAC-U-SIGNAL (no address field); use a placeholder.
-        // The CMCE layer identifies the call by call_identifier in the PDU, not by address.
         let m = SapMsg {
             sap: Sap::TmaSap,
             src: TetraEntity::Umac,
             dest: TetraEntity::Llc,
             msg: SapMsgInner::TmaUnitdataInd(TmaUnitdataInd {
                 pdu: Some(sdu),
-                main_address: TetraAddress::issi(0), // Address unknown from MAC-U-SIGNAL
+                main_address: TetraAddress::issi(owner_issi),
                 scrambling_code: prim.scrambling_code,
+                link_id: msg_dltime.t as u32,
                 endpoint_id: 0,
                 new_endpoint_id: None,
                 css_endpoint_id: None,
@@ -1179,9 +1214,11 @@ impl UmacBs {
                     // Build MAC-RESOURCE PDU for the STCH half-slot (124 type1 bits).
                     const STCH_CAP: usize = 124;
 
-                    let usage_marker = prim.chan_alloc.as_ref().and_then(|ca| ca.usage);
                     let has_pending_ra = self.channel_scheduler.take_pending_ra_ack(ts, prim.main_address.ssi);
-                    let is_random_access_response = has_pending_ra || prim.main_address.ssi_type == SsiType::Issi;
+                    // FACCH/STCH on an already allocated traffic slot is not a random-access
+                    // response by default. Only propagate the flag when we are actually
+                    // carrying a pending RA acknowledgement on this same timeslot.
+                    let is_random_access_response = has_pending_ra;
                     let mac_pdu = MacResource {
                         fill_bits: false,
                         pos_of_grant: 0,
@@ -1190,7 +1227,10 @@ impl UmacBs {
                         length_ind: 0,
                         addr: Some(prim.main_address),
                         event_label: None,
-                        usage_marker,
+                        // The CMCE chan_alloc on this path is only an internal hint for
+                        // selecting the traffic timeslot. Do not encode it as a usage marker
+                        // on FACCH/STCH MAC-RESOURCE.
+                        usage_marker: None,
                         power_control_element: None,
                         slot_granting_element: None,
                         chan_alloc_element: None,
@@ -1204,12 +1244,13 @@ impl UmacBs {
                         // Fits in a single stolen half-slot — one STCH block (unchanged path,
                         // used by small control PDUs and short status/SDS messages).
                         let mut mac_pdu = mac_pdu;
-                        mac_pdu.update_len_and_fill_ind(sdu_len);
+                        let num_fill_bits = mac_pdu.update_len_and_fill_ind(sdu_len);
 
                         let mut stch_block = BitBuffer::new(STCH_CAP);
                         mac_pdu.to_bitbuf(&mut stch_block);
                         sdu.seek(0);
                         stch_block.copy_bits(&mut sdu, sdu_len);
+                        fillbits::addition::write(&mut stch_block, Some(num_fill_bits));
 
                         tracing::info!(
                             "rx_ul_tma_unitdata_req: FACCH stealing on ts {} (MAC-RESOURCE + {} SDU bits → {} STCH bits)",
@@ -1258,10 +1299,11 @@ impl UmacBs {
         };
 
         // Build MAC-RESOURCE optimistically (as if it would always fit in one slot)
-        // random_access_flag: true for SSI-addressed (responses to random access requests),
-        // false for GSSI-addressed (unsolicited group signaling like D-SETUP).
-        // A radio will reject a random-access-flagged message if it didn't initiate one.
-        let is_random_access_response = prim.main_address.ssi_type != SsiType::Gssi;
+        // random_access_flag: true for SSI-addressed responses to random access requests,
+        // false for GSSI-addressed unsolicited group signaling. When link_id == 0,
+        // there is no LLC link context, so treat the message as unsolicited too.
+        let is_random_access_response =
+            prim.main_address.ssi_type != SsiType::Gssi && prim.link_id != 0;
         let mut pdu = MacResource {
             fill_bits: false, // Updated later
             pos_of_grant: 0,
@@ -1277,18 +1319,11 @@ impl UmacBs {
         };
         pdu.update_len_and_fill_ind(sdu.get_len());
 
-        // // Per ETSI EN 300 392-2 Clause 23.3.1.1.2: idle MSes monitor the MCCH (slot 1)
-        // // for signaling. Without common SCCHs, all MSes listen on slot 1.
-        // // All signaling on the normal path (non-FACCH) must go to the MCCH.
-        // if message.dltime.t != 1 {
-        //     tracing::warn!("rx_ul_tma_unitdata_req: signaling scheduled for non-MCCH {}", message.dltime.t);
-        // }
-        // self.channel_scheduler.dl_enqueue_tma(message.dltime.t, pdu, sdu, prim.tx_reporter);
-
-        self.channel_scheduler.dl_enqueue_tma(pdu, sdu, prim.tx_reporter);
-
-        // let enqueue_ts = 1;
-        // self.channel_scheduler.dl_enqueue_tma(enqueue_ts, pdu, sdu, prim.tx_reporter);
+        // Let the scheduler choose MCCH versus linked signalling timeslot from
+        // the LLC link context. FACCH/traffic-slot signalling uses the explicit
+        // stealing path above.
+        self.channel_scheduler
+            .dl_enqueue_tma_for_link(prim.link_id, pdu, sdu, prim.tx_reporter);
     }
 
     fn rx_tma_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
@@ -1525,12 +1560,32 @@ impl UmacBs {
     fn rx_control_circuit_close(&mut self, _queue: &mut MessageQueue, prim: CallControl) {
         let CallControl::Close(dir, ts) = prim else { tracing::error!("BUG: unexpected message or state -- routing error"); return; };
 
-        // Direction::Both needs to be split into separate DL and UL close operations
+        if (2..=4).contains(&ts) {
+            match dir {
+                Direction::Both => {
+                    self.pending_circuit_closes[ts as usize - 1].dl = true;
+                    self.pending_circuit_closes[ts as usize - 1].ul = true;
+                }
+                Direction::Dl => self.pending_circuit_closes[ts as usize - 1].dl = true,
+                Direction::Ul => self.pending_circuit_closes[ts as usize - 1].ul = true,
+                Direction::None => {
+                    tracing::warn!("rx_control_circuit_close: Direction::None, ignoring");
+                    return;
+                }
+            }
+            tracing::info!("  rx_control_circuit_close: Deferred {:?} circuit close for ts {}", dir, ts);
+            return;
+        }
+
+        self.close_circuit_now(dir, ts);
+    }
+
+    fn close_circuit_now(&mut self, dir: Direction, ts: u8) {
         let dirs: Vec<Direction> = match dir {
             Direction::Both => vec![Direction::Dl, Direction::Ul],
             d @ (Direction::Dl | Direction::Ul) => vec![d],
             Direction::None => {
-                tracing::warn!("rx_control_circuit_close: Direction::None, ignoring");
+                tracing::warn!("close_circuit_now: Direction::None, ignoring");
                 return;
             }
         };
@@ -1538,7 +1593,6 @@ impl UmacBs {
         for d in dirs {
             match self.channel_scheduler.close_circuit(d, ts) {
                 Some(_) => {
-                    // Clear UL inactivity timer when closing a UL circuit
                     if d == Direction::Ul && (1..=4).contains(&ts) {
                         self.last_ul_voice[ts as usize - 1] = None;
                     }
@@ -1547,6 +1601,29 @@ impl UmacBs {
                 None => {
                     tracing::warn!("  rx_control_circuit_close: No {:?} circuit to close for ts {}", d, ts);
                 }
+            }
+        }
+    }
+
+    fn process_pending_circuit_closes(&mut self) {
+        for ts in 2..=4u8 {
+            let idx = ts as usize - 1;
+            let pending = self.pending_circuit_closes[idx];
+            if !pending.dl && !pending.ul {
+                continue;
+            }
+
+            if self.channel_scheduler.has_pending_stealing(ts) {
+                tracing::debug!("process_pending_circuit_closes: waiting for FACCH/STCH drain on ts {}", ts);
+                continue;
+            }
+
+            self.pending_circuit_closes[idx] = PendingCircuitClose::default();
+            if pending.dl {
+                self.close_circuit_now(Direction::Dl, ts);
+            }
+            if pending.ul {
+                self.close_circuit_now(Direction::Ul, ts);
             }
         }
     }
@@ -1565,6 +1642,10 @@ impl UmacBs {
 
             // Only check timeslots with an active UL circuit
             if !self.channel_scheduler.circuit_is_active(Direction::Ul, ts) {
+                continue;
+            }
+
+            if self.pending_circuit_closes[idx].ul {
                 continue;
             }
 
@@ -1612,19 +1693,29 @@ impl UmacBs {
                 // Stop checking UL inactivity during hangtime
                 if (1..=4).contains(&ts) {
                     self.last_ul_voice[ts as usize - 1] = None;
+                    self.ul_signal_owner[ts as usize - 1] = None;
                 }
             }
-            CallControl::FloorGranted { ts, .. } => {
+            CallControl::FloorGranted { ts, source_issi, .. } => {
                 self.channel_scheduler.set_hangtime(ts, false);
                 // Restart UL inactivity timer when new speaker gets floor
                 if (1..=4).contains(&ts) {
                     self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
+                    self.ul_signal_owner[ts as usize - 1] = Some(source_issi);
+                }
+            }
+            CallControl::RemoteFloorGranted { ts, .. } => {
+                self.channel_scheduler.set_hangtime(ts, false);
+                if (1..=4).contains(&ts) {
+                    self.last_ul_voice[ts as usize - 1] = None;
+                    self.ul_signal_owner[ts as usize - 1] = None;
                 }
             }
             CallControl::CallEnded { ts, .. } => {
                 self.channel_scheduler.set_hangtime(ts, false);
                 if (1..=4).contains(&ts) {
                     self.last_ul_voice[ts as usize - 1] = None;
+                    self.ul_signal_owner[ts as usize - 1] = None;
                 }
             }
 
@@ -1641,6 +1732,8 @@ impl UmacBs {
             | CallControl::NetworkCircuitAlert { .. }
             | CallControl::NetworkCircuitConnectRequest { .. }
             | CallControl::NetworkCircuitConnectConfirm { .. }
+            | CallControl::NetworkCircuitSimplexGranted { .. }
+            | CallControl::NetworkCircuitSimplexIdle { .. }
             | CallControl::NetworkCircuitMediaReady { .. }
             | CallControl::NetworkCircuitDtmf { .. }
             | CallControl::NetworkCircuitRelease { .. } => {
@@ -1717,6 +1810,8 @@ impl TetraEntityTrait for UmacBs {
         };
         tracing::trace!("UmacBs tick: Pushing finalized timeslot to LMAC: {:?}", s);
         queue.push_back(s);
+
+        self.process_pending_circuit_closes();
     }
 }
 

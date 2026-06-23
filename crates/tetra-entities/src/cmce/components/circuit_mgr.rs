@@ -73,9 +73,7 @@ impl CircuitMgr {
             Direction::Dl => self.dl[ts as usize - 1].is_some(),
             Direction::Ul => {
                 let dl_is_both = if let Some(dl) = &self.dl[ts as usize - 1] {
-                    if self.ul_only[ts as usize - 1].is_some() {
-                        tracing::warn!("CMCE: circuit_mgr ts={} has both dl and ul_only set simultaneously (invariant violation)", ts);
-                    }
+                    assert!(self.ul_only[ts as usize - 1].is_none());
                     dl.direction == Direction::Both
                 } else {
                     false
@@ -83,10 +81,7 @@ impl CircuitMgr {
                 self.ul_only[ts as usize - 1].is_some() || dl_is_both
             }
 
-            _ => {
-                tracing::error!("CMCE: is_active_dir called with non-specific direction {:?}, returning false", dir);
-                false
-            }
+            _ => panic!("can only use with specific ul/dl direction"),
         }
     }
 
@@ -148,11 +143,7 @@ impl CircuitMgr {
         Err(CircuitErr::NoCircuitFree)
     }
 
-    pub fn allocate_circuit(&mut self, dir: Direction, comm_type: CommunicationType) -> Result<&CmceCircuit, CircuitErr> {
-        self.allocate_circuit_duplex(dir, comm_type, false)
-    }
-
-    pub fn allocate_circuit_duplex(
+    pub fn allocate_circuit(
         &mut self,
         dir: Direction,
         comm_type: CommunicationType,
@@ -170,11 +161,12 @@ impl CircuitMgr {
             ts,
             call_id,
             usage,
-            circuit_mode: CircuitModeType::TchS,
+            circuit_mode: CircuitModeType::TchS, // TODO: only speech supported for now
+            // endpoint_id: 0, // TODO, we don't use endpoints as of yet
             comm_type,
             simplex_duplex,
-            speech_service: Some(0),
-            etee_encrypted: false,
+            speech_service: Some(0), // TODO, only TETRA encoded speech for now
+            etee_encrypted: false,   // TODO, no encryption for now
         };
 
         // Register circuit and return
@@ -183,17 +175,6 @@ impl CircuitMgr {
 
     /// Allocate circuit using centralized timeslot allocator
     pub fn allocate_circuit_with_allocator(
-        &mut self,
-        dir: Direction,
-        comm_type: CommunicationType,
-        timeslot_alloc: &mut TimeslotAllocator,
-        owner: TimeslotOwner,
-    ) -> Result<&CmceCircuit, CircuitErr> {
-        self.allocate_circuit_with_allocator_duplex(dir, comm_type, false, timeslot_alloc, owner)
-    }
-
-    /// Allocate circuit using centralized timeslot allocator with explicit duplex flag.
-    pub fn allocate_circuit_with_allocator_duplex(
         &mut self,
         dir: Direction,
         comm_type: CommunicationType,
@@ -225,11 +206,10 @@ impl CircuitMgr {
         Ok(self.open_circuit(dir, circuit)?)
     }
 
-    /// Allocate an additional circuit for an existing call_id using the centralized allocator.
-    /// Used for duplex P2P calls where calling and called MS need separate timeslots.
+    /// Allocate an additional circuit for an existing call id using the centralized allocator.
     pub fn allocate_circuit_for_call_with_allocator(
         &mut self,
-        call_id: u16,
+        call_id: CallId,
         dir: Direction,
         comm_type: CommunicationType,
         simplex_duplex: bool,
@@ -272,7 +252,7 @@ impl CircuitMgr {
                 let circuit = self.ul_only[ts as usize - 1].take();
                 circuit.ok_or(CircuitErr::CircuitNotActive)
             }
-            _ => unreachable!("BUG: unhandled match variant -- should never be reached")
+            _ => panic!(),
         }
     }
 
@@ -303,7 +283,7 @@ impl CircuitMgr {
                 self.ul_only[ts as usize - 1] = Some(circuit);
                 Ok(self.ul_only[ts as usize - 1].as_ref().unwrap())
             }
-            _ => unreachable!("BUG: unhandled match variant -- should never be reached")
+            _ => panic!(),
         }
     }
 
@@ -327,19 +307,15 @@ impl CircuitMgr {
     }
 
     /// Closes any circuits that have expired.
-    /// Safety timeout for simplex (HDX/PTT) circuits: 6 minutes (beyond T5m).
-    /// Full-duplex (FDX) circuits — normal voice calls — have no timeout here;
-    /// they are released by normal call signalling (U-DISCONNECT / CALL_RELEASE).
-    /// ETSI EN 300 392-2 §14.9: call timeout does not apply to FDX individual calls.
+    /// Safety timeout: 6 minutes (beyond the 5-minute call timeout T5m).
+    /// Active calls are cleaned up earlier by CMCE hangtime/release logic.
     fn close_expired_circuits(&mut self, mut tasks: Option<Vec<CircuitMgrCmd>>) -> Option<Vec<CircuitMgrCmd>> {
-        const CIRCUIT_EXPIRY_TIMESLOTS: i32 = 6 * 60 * 18 * 4; // 6 minutes for simplex
+        const CIRCUIT_EXPIRY_TIMESLOTS: i32 = 6 * 60 * 18 * 4; // 6 minutes
 
         let mut to_close: Vec<_> = self
             .dl
             .iter()
             .filter_map(|circuit| circuit.as_ref())
-            // FDX circuits (simplex_duplex=true) have no safety timeout — skip them.
-            .filter(|circuit| !circuit.simplex_duplex)
             .filter(|circuit| circuit.ts_created.age(self.dltime) > CIRCUIT_EXPIRY_TIMESLOTS)
             .map(|circuit| (circuit.direction, circuit.ts, circuit.call_id))
             .collect();
@@ -347,23 +323,12 @@ impl CircuitMgr {
             self.ul_only
                 .iter()
                 .filter_map(|circuit| circuit.as_ref())
-                .filter(|circuit| !circuit.simplex_duplex)
                 .filter(|circuit| circuit.ts_created.age(self.dltime) > CIRCUIT_EXPIRY_TIMESLOTS)
                 .map(|circuit| (circuit.direction, circuit.ts, circuit.call_id)),
         );
         for (dir, ts, call_id) in to_close {
-            match self.close_circuit(dir, ts) {
-                Ok(circuit) => {
-                    tasks.get_or_insert_with(Vec::new).push(CircuitMgrCmd::SendClose(call_id, circuit));
-                }
-                Err(_) => {
-                    // Already closed by normal release path racing with the expiry timer — safe to ignore.
-                    tracing::debug!(
-                        "circuit_mgr: expiry close skipped for call_id={} ts={} dir={:?} (already closed)",
-                        call_id, ts, dir
-                    );
-                }
-            }
+            let circuit = self.close_circuit(dir, ts).unwrap(); // TODO FIXME not so sure about this one
+            tasks.get_or_insert_with(Vec::new).push(CircuitMgrCmd::SendClose(call_id, circuit));
         }
         tasks
     }

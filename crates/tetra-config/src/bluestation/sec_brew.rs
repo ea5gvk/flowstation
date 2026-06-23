@@ -30,6 +30,9 @@ pub struct CfgBrew {
     pub feature_rssi_export: bool,
     /// If present, restrict Brew call to these remote SSIs
     pub whitelisted_ssis: Option<Vec<u32>>,
+    /// Optional PBX gateway ISSIs that should be routable over Brew even if they don't match
+    /// normal Tetrapack subscriber ISSI constraints.
+    pub pbx_gateway_issis: Option<Vec<u32>>,
 }
 
 #[derive(Default, Deserialize)]
@@ -63,6 +66,11 @@ pub struct CfgBrewDto {
     #[serde(default)]
     pub feature_rssi_export: bool,
 
+    /// Optional PBX gateway ISSIs that should be routable over Brew even if they don't match
+    /// normal Tetrapack subscriber ISSI constraints.
+    #[serde(alias = "pbx_gateway_issi")]
+    pub pbx_gateway_issis: Option<Vec<u32>>,
+
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
 }
@@ -92,5 +100,6 @@ pub fn apply_brew_patch(src: CfgBrewDto) -> CfgBrew {
         feature_sds_enabled: src.feature_sds_enabled,
         feature_rssi_export: src.feature_rssi_export,
         whitelisted_ssis: src.whitelisted_ssis,
+        pbx_gateway_issis: src.pbx_gateway_issis,
     }
 }
