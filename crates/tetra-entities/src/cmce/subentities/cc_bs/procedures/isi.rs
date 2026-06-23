@@ -7,17 +7,19 @@ use super::*;
 /// group-call interworking belongs beside CC procedures, while PC remains the
 /// CMCE route discriminator.
 impl CcBsSubentity {
-    /// Handle network-initiated circuit setup request (Brew -> local called MS).
+    /// Handle network-initiated circuit setup request (Brew/Asterisk -> local called MS).
     pub(in crate::cmce::subentities::cc_bs) fn fsm_on_network_circuit_setup_request(
         &mut self,
         queue: &mut MessageQueue,
+        network_entity: TetraEntity,
         brew_uuid: uuid::Uuid,
         call: NetworkCircuitCall,
     ) {
         let called_addr = TetraAddress::new(call.destination, SsiType::Issi);
         if call.destination == 0 {
             tracing::info!(
-                "CMCE: rejecting Brew setup request uuid={} src={} dst=0 number='{}' (missing called ISSI)",
+                "CMCE: rejecting {:?} setup request uuid={} src={} dst=0 number='{}' (missing called ISSI)",
+                network_entity,
                 brew_uuid,
                 call.source_issi,
                 call.number
@@ -25,7 +27,7 @@ impl CcBsSubentity {
             queue.push_back(SapMsg {
                 sap: Sap::Control,
                 src: TetraEntity::Cmce,
-                dest: TetraEntity::Brew,
+                dest: network_entity,
                 msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupReject {
                     brew_uuid,
                     cause: DisconnectCause::CalledPartyNotReachable.into_raw() as u8,
@@ -46,7 +48,7 @@ impl CcBsSubentity {
             queue.push_back(SapMsg {
                 sap: Sap::Control,
                 src: TetraEntity::Cmce,
-                dest: TetraEntity::Brew,
+                dest: network_entity,
                 msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupReject {
                     brew_uuid,
                     cause: DisconnectCause::CalledPartyNotReachable.into_raw() as u8,
@@ -68,7 +70,7 @@ impl CcBsSubentity {
             queue.push_back(SapMsg {
                 sap: Sap::Control,
                 src: TetraEntity::Cmce,
-                dest: TetraEntity::Brew,
+                dest: network_entity,
                 msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupReject {
                     brew_uuid,
                     cause: DisconnectCause::CalledPartyBusy.into_raw() as u8,
@@ -102,7 +104,7 @@ impl CcBsSubentity {
                     queue.push_back(SapMsg {
                         sap: Sap::Control,
                         src: TetraEntity::Cmce,
-                        dest: TetraEntity::Brew,
+                        dest: network_entity,
                         msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupReject {
                             brew_uuid,
                             cause: DisconnectCause::CongestionInInfrastructure.into_raw() as u8,
@@ -121,8 +123,20 @@ impl CcBsSubentity {
         let external_subscriber_number = Self::encode_external_subscriber_number(&call.number);
         let calling_party_extension = call.number.trim().parse::<u32>().ok().filter(|value| *value <= 0x00ff_ffff);
 
+        // Asterisk SIP callers often have no real TETRA ISSI; derive a display SSI from the
+        // dialled external number so the local MS sees a sensible calling party. Brew keeps its
+        // original behaviour (always uses source_issi, even when 0).
+        let calling_party_address_ssi = if call.source_issi != 0 {
+            Some(call.source_issi)
+        } else if network_entity == TetraEntity::Asterisk {
+            Self::external_number_as_ssi(&call.number)
+        } else {
+            Some(call.source_issi)
+        };
+
         tracing::info!(
-            "CMCE: accepting Brew setup request uuid={} call_id={} src={} dst={} ts={} duplex={} number='{}'",
+            "CMCE: accepting {:?} setup request uuid={} call_id={} src={} dst={} ts={} duplex={} number='{}'",
+            network_entity,
             brew_uuid,
             call_id,
             call.source_issi,
@@ -132,11 +146,12 @@ impl CcBsSubentity {
             call.number
         );
 
-        // Acknowledge setup to Brew first so network call state progresses while local MS is alerted.
+        // Acknowledge setup to the originating network entity first so network call state
+        // progresses while the local MS is alerted.
         queue.push_back(SapMsg {
             sap: Sap::Control,
             src: TetraEntity::Cmce,
-            dest: TetraEntity::Brew,
+            dest: network_entity,
             msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupAccept { brew_uuid }),
         });
 
@@ -163,7 +178,7 @@ impl CcBsSubentity {
             call_priority: call.priority,
             notification_indicator: None,
             temporary_address: None,
-            calling_party_address_ssi: Some(call.source_issi),
+            calling_party_address_ssi,
             calling_party_extension,
             external_subscriber_number,
             facility: None,
@@ -214,6 +229,7 @@ impl CcBsSubentity {
                 call_timeout,
                 called_over_brew: false,
                 calling_over_brew: true,
+                network_entity,
                 brew_uuid: Some(brew_uuid),
                 network_call: Some(call),
                 connect_request_sent: false,
@@ -413,7 +429,7 @@ impl CcBsSubentity {
         queue.push_back(SapMsg {
             sap: Sap::Control,
             src: TetraEntity::Cmce,
-            dest: TetraEntity::Brew,
+            dest: call.network_entity,
             msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitConnectConfirm {
                 brew_uuid,
                 grant: remote_grant.into_raw() as u8,
@@ -424,7 +440,7 @@ impl CcBsSubentity {
         queue.push_back(SapMsg {
             sap: Sap::Control,
             src: TetraEntity::Cmce,
-            dest: TetraEntity::Brew,
+            dest: call.network_entity,
             msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitMediaReady {
                 brew_uuid,
                 call_id,
@@ -633,7 +649,7 @@ impl CcBsSubentity {
         queue.push_back(SapMsg {
             sap: Sap::Control,
             src: TetraEntity::Cmce,
-            dest: TetraEntity::Brew,
+            dest: call.network_entity,
             msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitMediaReady {
                 brew_uuid,
                 call_id,

@@ -148,8 +148,19 @@ pub enum TelemetryEvent {
     /// Calls table via the call's `priority`, not through this event.)
     EmergencyAlarm { source_issi: u32, dest_ssi: u32 },
     /// A radio's emergency was CLEARED (non-emergency status, clear-timeout, or operator clear).
-    /// Appended last for bitcode wire-stability.
     EmergencyCancel { source_issi: u32 },
+    /// DAPNET message activity for the dashboard DAPNET tab. `direction` is "rx" for messages
+    /// received from the RWTH core feed and "tx" for messages sent through the Hampager API.
+    /// Appended last for bitcode wire-stability.
+    DapnetLog {
+        direction: String,
+        id: String,
+        callsign: String,
+        recipient: String,
+        text: String,
+        priority: Option<u8>,
+        paths: Vec<String>,
+    },
 }
 
 /// A single host-system sensor reading. Kept flat for easy JSON serialisation

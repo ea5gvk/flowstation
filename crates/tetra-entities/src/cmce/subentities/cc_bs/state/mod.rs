@@ -402,6 +402,11 @@ pub(super) struct IndividualCall {
     pub(super) called_over_brew: bool,
     /// True when the calling party lives behind Brew/TetraPack.
     pub(super) calling_over_brew: bool,
+    /// Network entity bridging this call (Brew or Asterisk). Call-control messages and
+    /// floor/DTMF signalling for the network leg are routed to this entity rather than
+    /// hardcoding `TetraEntity::Brew`, so Brew calls reach Brew and Asterisk calls reach
+    /// the SIP/RTP bridge.
+    pub(super) network_entity: TetraEntity,
     /// Brew UUID when this call is bridged to TetraPack.
     pub(super) brew_uuid: Option<uuid::Uuid>,
     /// Cached network call metadata for Brew bridged legs.

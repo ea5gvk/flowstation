@@ -695,6 +695,7 @@ input[type="radio"]{accent-color:var(--accent);}
    except the full-bleed code editor, which stays edge-to-edge. */
 #page-telegram .card-body,
 #page-config .card-body,
+#page-dapnet .card-body,
 #page-wifi .card-body{padding:16px 18px;}
 #page-config .card-body:has(#config-editor){padding:0;}
 
@@ -1544,6 +1545,8 @@ tbody tr:hover td{background:color-mix(in srgb,var(--bg3) 70%, transparent);}
 #page-sdslog .sds-time{ white-space:nowrap; color:var(--text2); font-variant-numeric:tabular-nums; }
 #page-sdslog .sds-msg{ word-break:break-word; max-width:560px; }
 .sds-empty{ color:var(--text3); font-style:italic; }
+.sds-map-link{ color:var(--accent2); font-weight:700; text-decoration:none; }
+.sds-map-link:hover{ text-decoration:underline; }
 /* Signal cell: centre the bar+value as a unit, and keep the dBFS reading on one line
    (it was wrapping to two, which read as "toy-like"). */
 #page-stations .rssi-bar{ justify-content:center; }
@@ -1782,6 +1785,18 @@ tbody tr:hover td{background:color-mix(in srgb,var(--bg3) 70%, transparent);}
     </div>
 
     <div class="nav-section-label" data-i18n-section="manage">MANAGE</div>
+    <div class="nav-item" onclick="showPage('asterisk',this)" id="nav-asterisk">
+      <span class="nav-icon">☎</span>
+      <span class="nav-label" data-i18n="asterisk">Asterisk SIP</span>
+    </div>
+    <div class="nav-item" onclick="showPage('dapnet',this)" id="nav-dapnet">
+      <span class="nav-icon">📟</span>
+      <span class="nav-label" data-i18n="dapnet">DAPNET</span>
+    </div>
+    <div class="nav-item" onclick="showPage('geoalarm',this)" id="nav-geoalarm">
+      <span class="nav-icon">◎</span>
+      <span class="nav-label" data-i18n="geoalarm">GeoAlarm</span>
+    </div>
     <div class="nav-item" onclick="showPage('config',this)" id="nav-config">
       <span class="nav-icon">⚙</span>
       <span class="nav-label" data-i18n="config">CONFIG</span>
@@ -2207,6 +2222,8 @@ tbody tr:hover td{background:color-mix(in srgb,var(--bg3) 70%, transparent);}
           <div class="card-title" data-i18n="sdslog">SDS Log</div>
           <div class="card-actions">
             <button class="btn btn-sm" onclick="loadSdsLog()" data-i18n="sds_refresh">⟳ Refresh</button>
+            <button class="btn btn-sm" onclick="exportSdsLog()" data-i18n="export">⤓ Export</button>
+            <button class="btn btn-sm btn-danger" onclick="clearSdsLog()" data-i18n="clear">Clear</button>
           </div>
         </div>
         <div class="card-body">
@@ -2221,6 +2238,11 @@ tbody tr:hover td{background:color-mix(in srgb,var(--bg3) 70%, transparent);}
               </tr></thead>
               <tbody id="sdslog-tbody"></tbody>
             </table>
+          </div>
+          <div class="log-controls">
+            <button class="btn btn-sm" onclick="sdsLogPrevPage()">‹ Prev</button>
+            <span class="sds-empty" id="sdslog-page">Page 1 / 1</span>
+            <button class="btn btn-sm" onclick="sdsLogNextPage()">Next ›</button>
           </div>
         </div>
       </div>
@@ -2336,6 +2358,422 @@ tbody tr:hover td{background:color-mix(in srgb,var(--bg3) 70%, transparent);}
         </div>
       </div>
 
+    </div>
+
+    <!-- ── ASTERISK SIP ── -->
+    <div class="page" id="page-asterisk">
+      <div class="card">
+        <div class="card-head">
+          <div class="card-title" data-i18n="asterisk_title">Asterisk SIP</div>
+          <div class="card-actions">
+            <button class="btn btn-sm" onclick="loadAsteriskStatus()" data-i18n="refresh">⟳ Refresh</button>
+          </div>
+        </div>
+        <div class="card-body">
+          <div class="stat-grid" style="margin-bottom:14px">
+            <div class="stat-card">
+              <div class="stat-label" data-i18n="ast_configured">Configured</div>
+              <div class="stat-value" id="ast-configured">—</div>
+              <div class="stat-sub" id="ast-enabled">—</div>
+            </div>
+            <div class="stat-card blue">
+              <div class="stat-label" data-i18n="ast_register">REGISTER</div>
+              <div class="stat-value blue" id="ast-register">—</div>
+              <div class="stat-sub" id="ast-dialogs">—</div>
+            </div>
+          </div>
+          <div class="info-grid">
+            <div class="info-row"><div class="info-key" data-i18n="ast_sip_listen">SIP listen</div><div class="info-val" id="ast-sip-listen">—</div></div>
+            <div class="info-row"><div class="info-key" data-i18n="ast_remote">Remote Asterisk</div><div class="info-val" id="ast-remote">—</div></div>
+            <div class="info-row"><div class="info-key" data-i18n="ast_rtp">RTP ports</div><div class="info-val" id="ast-rtp">—</div></div>
+            <div class="info-row"><div class="info-key" data-i18n="ast_codec">Codec</div><div class="info-val" id="ast-codec">—</div></div>
+            <div class="info-row"><div class="info-key" data-i18n="ast_last_rx">Last RX</div><div class="info-val" id="ast-last-rx">—</div></div>
+            <div class="info-row"><div class="info-key" data-i18n="ast_last_tx">Last TX</div><div class="info-val" id="ast-last-tx">—</div></div>
+            <div class="info-row"><div class="info-key" data-i18n="ast_last_error">Last error</div><div class="info-val" id="ast-last-error">—</div></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div class="card-title">Snom SIP NOTIFY</div>
+          <div class="card-actions">
+            <button class="btn btn-sm" onclick="loadSnomNotify()" data-i18n="refresh">⟳ Refresh</button>
+            <button class="btn btn-primary" onclick="saveSnomNotify()" data-i18n="save">Save</button>
+          </div>
+        </div>
+        <div class="card-body">
+          <label class="sw-row">
+            <span class="sw-text">Enable SnomIPPhoneText notifications</span>
+            <span class="sw"><input type="checkbox" id="snom-enabled"><i></i></span>
+          </label>
+
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;align-items:center;margin-top:14px">
+            <label style="color:var(--muted);font-size:13px">AMI host</label>
+            <input type="text" id="snom-ami-host" class="form-input" placeholder="127.0.0.1">
+            <label style="color:var(--muted);font-size:13px">AMI port</label>
+            <input type="number" id="snom-ami-port" class="form-input" min="1" max="65535" placeholder="5038">
+            <label style="color:var(--muted);font-size:13px">AMI user</label>
+            <input type="text" id="snom-ami-user" class="form-input" autocomplete="off" spellcheck="false" placeholder="flowstation">
+            <label style="color:var(--muted);font-size:13px">AMI password</label>
+            <input type="password" id="snom-ami-password" class="form-input" autocomplete="new-password" spellcheck="false" oninput="snomPasswordDirty=true">
+            <label style="color:var(--muted);font-size:13px;align-self:flex-start;padding-top:8px">PJSIP endpoints</label>
+            <textarea id="snom-endpoints" class="form-input" rows="3" placeholder="385&#10;386"></textarea>
+          </div>
+
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px;margin-top:16px">
+            <div>
+              <label class="sw-row"><span class="sw-text">Notify TETRA SDS</span><span class="sw"><input type="checkbox" id="snom-notify-sds"><i></i></span></label>
+              <div style="display:flex;gap:14px;flex-wrap:wrap;margin:8px 0 10px;color:var(--muted);font-size:13px">
+                <label><input type="checkbox" id="snom-dir-rx"> RX</label>
+                <label><input type="checkbox" id="snom-dir-net"> NET</label>
+                <label><input type="checkbox" id="snom-dir-tx"> TX</label>
+              </div>
+              <label style="color:var(--muted);font-size:13px">SDS ISSI whitelist</label>
+              <textarea id="snom-sds-issis" class="form-input" rows="4" placeholder="2632585&#10;9999"></textarea>
+              <div class="help-text">Empty = every SDS. A match on source or destination ISSI is enough.</div>
+            </div>
+            <div>
+              <label class="sw-row"><span class="sw-text">Notify DAPNET</span><span class="sw"><input type="checkbox" id="snom-notify-dapnet"><i></i></span></label>
+              <label style="color:var(--muted);font-size:13px">DAPNET RIC whitelist</label>
+              <textarea id="snom-dapnet-rics" class="form-input" rows="4" placeholder="0632585&#10;0000200"></textarea>
+              <div class="help-text">Empty = every DAPNET message. Leading zeros are preserved in config.</div>
+            </div>
+            <div>
+              <label class="sw-row"><span class="sw-text">Notify Telegram</span><span class="sw"><input type="checkbox" id="snom-notify-telegram"><i></i></span></label>
+              <div style="display:grid;grid-template-columns:130px 1fr;gap:10px;align-items:center;margin-top:10px">
+                <label style="color:var(--muted);font-size:13px">Title prefix</label>
+                <input type="text" id="snom-title-prefix" class="form-input" placeholder="FlowStation">
+                <label style="color:var(--muted);font-size:13px">Max text chars</label>
+                <input type="number" id="snom-max-text" class="form-input" min="40" max="2000" placeholder="240">
+                <label style="color:var(--muted);font-size:13px">Timeout (s)</label>
+                <input type="number" id="snom-timeout" class="form-input" min="1" max="30" placeholder="3">
+              </div>
+            </div>
+          </div>
+          <div class="config-msg" id="snom-msg"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── DAPNET ── -->
+    <div class="page" id="page-dapnet">
+      <div class="card">
+        <div class="card-head">
+          <div class="card-title" data-i18n="dapnet_log">DAPNET Log</div>
+          <div class="card-actions">
+            <button class="btn btn-sm" onclick="loadDapnetLog()" data-i18n="refresh">⟳ Refresh</button>
+            <button class="btn btn-sm" onclick="exportDapnetLog()" data-i18n="export">⤓ Export</button>
+            <button class="btn btn-sm btn-danger" onclick="clearDapnetLog()" data-i18n="clear">Clear</button>
+          </div>
+        </div>
+        <div class="card-body">
+          <div class="table-wrap">
+            <table>
+              <thead><tr>
+                <th data-i18n="th_time">Time</th>
+                <th data-i18n="th_dir">Dir</th>
+                <th>Callsign</th>
+                <th>Recipient</th>
+                <th>Paths</th>
+                <th data-i18n="th_message">Message</th>
+              </tr></thead>
+              <tbody id="dapnetlog-tbody"></tbody>
+            </table>
+          </div>
+          <div class="log-controls">
+            <button class="btn btn-sm" onclick="dapnetLogPrevPage()">‹ Prev</button>
+            <span class="sds-empty" id="dapnetlog-page">Page 1 / 1</span>
+            <button class="btn btn-sm" onclick="dapnetLogNextPage()">Next ›</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div class="card-title" data-i18n="dapnet_title">DAPNET</div>
+          <div class="card-actions">
+            <button class="btn btn-primary" onclick="saveDapnet()" data-i18n="save">Save</button>
+          </div>
+        </div>
+        <div class="card-body">
+          <label class="sw-row">
+            <span class="sw-text">Enable DAPNET integration</span>
+            <span class="sw"><input type="checkbox" id="dap-enabled"><i></i></span>
+          </label>
+          <label class="sw-row">
+            <span class="sw-text">Enable RWTH core receive feed</span>
+            <span class="sw"><input type="checkbox" id="dap-rwth-enabled"><i></i></span>
+          </label>
+
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;align-items:center;margin-top:14px">
+            <label style="color:var(--muted);font-size:13px">Poll interval (s)</label>
+            <input type="number" id="dap-poll" class="form-input" min="1" placeholder="30">
+            <label style="color:var(--muted);font-size:13px">Messages limit</label>
+            <input type="number" id="dap-limit" class="form-input" min="1" placeholder="100">
+
+            <label style="color:var(--muted);font-size:13px">Hampager API URL</label>
+            <input type="text" id="dap-api-url" class="form-input" placeholder="https://hampager.de/api/calls" style="grid-column:1 / -1;min-width:0">
+
+            <label style="color:var(--muted);font-size:13px">API username</label>
+            <input type="text" id="dap-username" class="form-input" autocomplete="off" spellcheck="false">
+            <label style="color:var(--muted);font-size:13px">API password</label>
+            <input type="password" id="dap-password" class="form-input" autocomplete="new-password" spellcheck="false" oninput="dapPasswordDirty=true">
+
+            <label style="color:var(--muted);font-size:13px">RWTH host</label>
+            <input type="text" id="dap-rwth-host" class="form-input" placeholder="dapnet.afu.rwth-aachen.de">
+            <label style="color:var(--muted);font-size:13px">RWTH port</label>
+            <input type="number" id="dap-rwth-port" class="form-input" min="1" max="65535" placeholder="43434">
+
+            <label style="color:var(--muted);font-size:13px">Device</label>
+            <input type="text" id="dap-rwth-device" class="form-input" placeholder="FlowStation">
+            <label style="color:var(--muted);font-size:13px">Version</label>
+            <input type="text" id="dap-rwth-version" class="form-input" placeholder="1.0">
+
+            <label style="color:var(--muted);font-size:13px">RWTH callsign</label>
+            <input type="text" id="dap-rwth-callsign" class="form-input" autocomplete="off" spellcheck="false" style="text-transform:uppercase">
+            <label style="color:var(--muted);font-size:13px">RWTH authkey</label>
+            <input type="password" id="dap-rwth-authkey" class="form-input" autocomplete="new-password" spellcheck="false" oninput="dapAuthDirty=true">
+          </div>
+          <div class="config-msg" id="dap-msg"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div class="card-title" data-i18n="dapnet_routing">Routing</div>
+          <div class="card-actions">
+            <button class="btn btn-primary" onclick="saveDapnet()" data-i18n="save">Save</button>
+          </div>
+        </div>
+        <div class="card-body">
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px">
+            <div>
+              <label class="sw-row"><span class="sw-text">Forward to SDS</span><span class="sw"><input type="checkbox" id="dap-forward-sds"><i></i></span></label>
+              <div style="display:grid;grid-template-columns:130px 1fr;gap:10px;align-items:center;margin-top:10px">
+                <label style="color:var(--muted);font-size:13px">Source ISSI</label>
+                <input type="number" id="dap-sds-source" class="form-input" min="1" max="16777215" placeholder="9999">
+                <label style="color:var(--muted);font-size:13px">Destination</label>
+                <input type="number" id="dap-sds-dest" class="form-input" min="0" max="16777215" placeholder="ISSI or GSSI">
+                <label style="color:var(--muted);font-size:13px">Destination is group</label>
+                <label style="display:flex;align-items:center;gap:10px"><span class="sw"><input type="checkbox" id="dap-sds-group"><i></i></span><span style="color:var(--muted);font-size:12px">GSSI</span></label>
+                <label style="color:var(--muted);font-size:13px;align-self:flex-start;padding-top:8px">RIC → ISSI</label>
+                <textarea id="dap-ric-routes" class="form-input" rows="3" placeholder="0632585=2632585"></textarea>
+                <label style="color:var(--muted);font-size:13px;align-self:flex-start;padding-top:8px">RIC → GSSI</label>
+                <textarea id="dap-ric-group-routes" class="form-input" rows="3" placeholder="0004520=80"></textarea>
+                <label style="color:var(--muted);font-size:13px;align-self:flex-start;padding-top:8px">SDS RIC filter</label>
+                <textarea id="dap-sds-rics" class="form-input" rows="3" placeholder="0004520&#10;0000200"></textarea>
+              </div>
+            </div>
+
+            <div>
+              <label class="sw-row"><span class="sw-text">Forward to TPG2200 Call-Out</span><span class="sw"><input type="checkbox" id="dap-forward-callout"><i></i></span></label>
+              <div style="display:grid;grid-template-columns:130px 1fr;gap:10px;align-items:center;margin-top:10px">
+                <label style="color:var(--muted);font-size:13px">Source ISSI</label>
+                <input type="number" id="dap-callout-source" class="form-input" min="1" max="16777215" placeholder="9999">
+                <label style="color:var(--muted);font-size:13px">Destination</label>
+                <input type="number" id="dap-callout-dest" class="form-input" min="0" max="16777215" placeholder="TPG2200 ISSI">
+                <label style="color:var(--muted);font-size:13px">Incident base</label>
+                <input type="number" id="dap-callout-incident" class="form-input" min="1" max="256" placeholder="2">
+                <label style="color:var(--muted);font-size:13px">Text prefix</label>
+                <input type="text" id="dap-callout-prefix" class="form-input" placeholder="DAPNET">
+                <label style="color:var(--muted);font-size:13px;align-self:flex-start;padding-top:8px">Call-Out RIC filter</label>
+                <textarea id="dap-callout-rics" class="form-input" rows="3" placeholder="0004520"></textarea>
+              </div>
+            </div>
+
+            <div>
+              <label class="sw-row"><span class="sw-text">Forward to Telegram</span><span class="sw"><input type="checkbox" id="dap-forward-telegram"><i></i></span></label>
+              <div style="display:grid;grid-template-columns:130px 1fr;gap:10px;align-items:center;margin-top:10px">
+                <label style="color:var(--muted);font-size:13px">Telegram prefix</label>
+                <input type="text" id="dap-telegram-prefix" class="form-input" placeholder="DAPNET">
+                <label style="color:var(--muted);font-size:13px;align-self:flex-start;padding-top:8px">Telegram RIC filter</label>
+                <textarea id="dap-telegram-rics" class="form-input" rows="3" placeholder="0004520"></textarea>
+              </div>
+              <div class="help-text" style="margin-top:10px">Uses the existing Telegram alert configuration and recipients.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div class="card-title" data-i18n="dapnet_send">Send DAPNET Message</div>
+          <div class="card-actions">
+            <button class="btn btn-primary" onclick="sendDapnetMessage()">Send</button>
+          </div>
+        </div>
+        <div class="card-body">
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;align-items:center">
+            <label style="color:var(--muted);font-size:13px">Callsign recipients</label>
+            <input type="text" id="dap-out-callsigns" class="form-input" placeholder="DJ2TH, DB0ABC">
+            <label style="color:var(--muted);font-size:13px">Transmitter groups</label>
+            <input type="text" id="dap-out-groups" class="form-input" placeholder="dl-all, regional">
+            <label style="color:var(--muted);font-size:13px">Emergency</label>
+            <label style="display:flex;align-items:center;gap:10px"><span class="sw"><input type="checkbox" id="dap-out-emergency"><i></i></span><span style="color:var(--muted);font-size:12px">Set emergency flag</span></label>
+            <label style="color:var(--muted);font-size:13px;align-self:flex-start;padding-top:8px">Message</label>
+            <textarea id="dap-out-text" class="form-input" rows="3" maxlength="80" placeholder="Message text"></textarea>
+          </div>
+          <div class="config-msg" id="dap-send-msg"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── GEOALARM ── -->
+    <div class="page" id="page-geoalarm">
+      <div class="card">
+        <div class="card-head">
+          <div class="card-title" data-i18n="geoalarm_title">GeoAlarm</div>
+          <div class="card-actions">
+            <button class="btn btn-sm" onclick="loadGeoalarm()" data-i18n="refresh">⟳ Refresh</button>
+            <button class="btn btn-primary" onclick="saveGeoalarm()" data-i18n="save">Save</button>
+          </div>
+        </div>
+        <div class="card-body">
+          <div class="stat-grid" style="margin-bottom:14px">
+            <div class="stat-card">
+              <div class="stat-label">Positions</div>
+              <div class="stat-value" id="geo-seen">0</div>
+              <div class="stat-sub" id="geo-center">—</div>
+            </div>
+            <div class="stat-card blue">
+              <div class="stat-label">Alarms</div>
+              <div class="stat-value blue" id="geo-alarms">0</div>
+              <div class="stat-sub" id="geo-radius">—</div>
+            </div>
+          </div>
+          <div class="info-grid" style="margin-bottom:14px">
+            <div class="info-row"><div class="info-key">Last position</div><div class="info-val" id="geo-last-position">—</div></div>
+            <div class="info-row"><div class="info-key">Last alarm</div><div class="info-val" id="geo-last-alarm">—</div></div>
+            <div class="info-row"><div class="info-key">Last error</div><div class="info-val" id="geo-last-error">—</div></div>
+          </div>
+
+          <label class="sw-row">
+            <span class="sw-text">Enable GeoAlarm</span>
+            <span class="sw"><input type="checkbox" id="geo-enabled"><i></i></span>
+          </label>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;align-items:center;margin-top:14px">
+            <label style="color:var(--muted);font-size:13px">FlowStation latitude</label>
+            <input type="number" id="geo-lat" class="form-input" step="0.000001" min="-90" max="90" placeholder="50.775346">
+            <label style="color:var(--muted);font-size:13px">FlowStation longitude</label>
+            <input type="number" id="geo-lon" class="form-input" step="0.000001" min="-180" max="180" placeholder="6.083887">
+            <label style="color:var(--muted);font-size:13px">Radius / cooldown</label>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+              <input type="number" id="geo-radius-m" class="form-input" min="1" step="1" placeholder="500">
+              <input type="number" id="geo-cooldown" class="form-input" min="1" max="86400" placeholder="300">
+            </div>
+            <label style="color:var(--muted);font-size:13px">Input sources</label>
+            <div style="display:flex;gap:14px;flex-wrap:wrap">
+              <label style="display:flex;align-items:center;gap:8px"><span class="sw"><input type="checkbox" id="geo-trigger-tetra"><i></i></span><span style="color:var(--muted);font-size:12px">TETRA LIP</span></label>
+              <label style="display:flex;align-items:center;gap:8px"><span class="sw"><input type="checkbox" id="geo-trigger-meshcom"><i></i></span><span style="color:var(--muted);font-size:12px">MeshCom</span></label>
+            </div>
+          </div>
+          <div class="help-text" style="margin-top:10px">GeoAlarm fires when an allowed device enters the radius, then suppresses repeated alarms for the cooldown time.</div>
+          <div class="config-msg" id="geo-msg"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div class="card-title">GeoAlarm Routing</div>
+        </div>
+        <div class="card-body">
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px">
+            <div>
+              <label class="sw-row">
+                <span class="sw-text">Alarm → TPG2200</span>
+                <span class="sw"><input type="checkbox" id="geo-forward-tpg"><i></i></span>
+              </label>
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px">
+                <input type="number" id="geo-tpg-source" class="form-input" min="1" max="16777215" placeholder="Source ISSI">
+                <input type="number" id="geo-tpg-dest" class="form-input" min="0" max="16777215" placeholder="TPG ISSI">
+              </div>
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px">
+                <input type="number" id="geo-tpg-incident" class="form-input" min="1" max="256" placeholder="Incident base">
+                <input type="number" id="geo-tpg-max" class="form-input" min="8" max="160" placeholder="Max chars">
+              </div>
+              <input type="text" id="geo-tpg-prefix" class="form-input" placeholder="TPG text prefix" style="margin-top:10px">
+            </div>
+            <div>
+              <label class="sw-row">
+                <span class="sw-text">Alarm → SDS</span>
+                <span class="sw"><input type="checkbox" id="geo-forward-sds"><i></i></span>
+              </label>
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px">
+                <input type="number" id="geo-sds-source" class="form-input" min="1" max="16777215" placeholder="Source ISSI">
+                <input type="number" id="geo-sds-dest" class="form-input" min="0" max="16777215" placeholder="Destination ISSI/GSSI">
+              </div>
+              <label style="display:flex;align-items:center;gap:10px;margin-top:10px"><span class="sw"><input type="checkbox" id="geo-sds-group"><i></i></span><span style="color:var(--muted);font-size:12px">Destination is group/GSSI</span></label>
+            </div>
+            <div>
+              <label class="sw-row">
+                <span class="sw-text">Alarm → SIP/Snom</span>
+                <span class="sw"><input type="checkbox" id="geo-forward-sip"><i></i></span>
+              </label>
+              <input type="text" id="geo-sip-prefix" class="form-input" placeholder="Snom title prefix" style="margin-top:10px">
+              <label class="sw-row" style="margin-top:14px">
+                <span class="sw-text">Alarm → Telegram</span>
+                <span class="sw"><input type="checkbox" id="geo-forward-telegram"><i></i></span>
+              </label>
+              <input type="text" id="geo-telegram-prefix" class="form-input" placeholder="Telegram prefix" style="margin-top:10px">
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div class="card-title">GeoAlarm Filters</div>
+        </div>
+        <div class="card-body">
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px">
+            <div>
+              <label style="color:var(--muted);font-size:13px">TETRA ISSI whitelist</label>
+              <textarea id="geo-tetra-white" class="form-input" rows="4" placeholder="empty = all TETRA ISSIs"></textarea>
+            </div>
+            <div>
+              <label style="color:var(--muted);font-size:13px">TETRA ISSI blacklist</label>
+              <textarea id="geo-tetra-black" class="form-input" rows="4" placeholder="blocked ISSIs"></textarea>
+            </div>
+            <div>
+              <label style="color:var(--muted);font-size:13px">MeshCom source whitelist</label>
+              <textarea id="geo-mesh-white" class="form-input" rows="4" placeholder="empty = all MeshCom sources"></textarea>
+            </div>
+            <div>
+              <label style="color:var(--muted);font-size:13px">MeshCom source blacklist</label>
+              <textarea id="geo-mesh-black" class="form-input" rows="4" placeholder="blocked MeshCom sources"></textarea>
+            </div>
+          </div>
+          <div class="help-text" style="margin-top:10px">Whitelist empty means allow all. Blacklists always win. MeshCom source matching is case-insensitive.</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div class="card-title">GeoAlarm Events</div>
+        </div>
+        <div class="card-body">
+          <div class="table-wrap">
+            <table>
+              <thead><tr>
+                <th data-i18n="th_time">Time</th>
+                <th>Source</th>
+                <th>Device</th>
+                <th>Distance</th>
+                <th>Position</th>
+                <th>Status</th>
+                <th>Paths</th>
+              </tr></thead>
+              <tbody id="geo-events-tbody"></tbody>
+            </table>
+          </div>
+          <div class="log-controls">
+            <button class="btn btn-sm" onclick="geoPrevPage()">‹ Prev</button>
+            <span class="sds-empty" id="geo-events-page">Page 1 / 1</span>
+            <button class="btn btn-sm" onclick="geoNextPage()">Next ›</button>
+          </div>
+        </div>
+      </div>
     </div>
 
     <!-- ── CONFIG ── -->
@@ -2636,6 +3074,10 @@ tbody tr:hover td{background:color-mix(in srgb,var(--bg3) 70%, transparent);}
           </div>
         </div>
         <div id="health-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:14px"></div>
+        <div style="margin-top:18px;font-size:13px;font-weight:700;color:var(--text);letter-spacing:.04em;text-transform:uppercase">Integrations</div>
+        <div id="health-integrations-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:14px;margin-top:10px">
+          <div class="sds-empty" style="padding:12px 0">Loading integration health…</div>
+        </div>
         <div style="margin-top:16px;font-size:12px;color:var(--text2,#9aa4b2);line-height:1.6">
           Auto-refreshes every few seconds. Levels:
           <b style="color:#3fb950">OK</b> · <b style="color:var(--warn)">DEGRADED</b> · <b style="color:var(--danger)">CRITICAL</b>.
@@ -2824,6 +3266,33 @@ tbody tr:hover td{background:color-mix(in srgb,var(--bg3) 70%, transparent);}
       <label class="form-label" data-i18n="sds_msg_label">Message</label>
       <input type="text" id="sds-msg" class="form-input" placeholder="..." maxlength="160">
     </div>
+    <div class="form-row">
+      <label class="form-label" style="display:flex;align-items:center;gap:8px">
+        <input type="checkbox" id="sds-callout" onchange="toggleSdsCallout()">
+        <span data-i18n="sds_callout_enable">TPG2200 Call-Out / Alarm senden</span>
+      </label>
+    </div>
+    <div id="sds-callout-fields" style="display:none">
+      <div class="form-row">
+        <label class="form-label" data-i18n="sds_callout_source">Source ISSI</label>
+        <input type="number" id="sds-callout-source" class="form-input" value="9999" min="1">
+      </div>
+      <div class="form-row">
+        <label class="form-label" data-i18n="sds_callout_incident">Vorfallnummer</label>
+        <input type="number" id="sds-callout-incident" class="form-input" value="1" min="1" max="256">
+      </div>
+      <div class="form-row">
+        <label class="form-label" data-i18n="sds_callout_text">Alarmtext</label>
+        <input type="text" id="sds-callout-text" class="form-input" value="ALARM" maxlength="120">
+      </div>
+      <div class="form-row">
+        <label class="form-label" data-i18n="sds_callout_raw">Raw Hex Payload optional</label>
+        <input type="text" id="sds-callout-raw" class="form-input" placeholder="C3 00 09 0D 10 11 27 0F 02 30 8D 41 4C 41 52 4D">
+      </div>
+      <div class="form-row" style="font-size:12px;color:var(--muted);line-height:1.45" data-i18n="sds_callout_help">
+        Vorfall 1-15 use the confirmed byte formula (N &lt;&lt; 4) | 0x01: 1=11, 2=21, 3=31, 4=41. Vorfall 16-256 use the extended one-byte selector. Raw Hex overrides automatic payload generation.
+      </div>
+    </div>
     <div class="modal-actions">
       <button class="btn" onclick="closeSdsModal()" data-i18n="cancel">Cancel</button>
       <button class="btn btn-primary" onclick="sendSds()" data-i18n="send">Send</button>
@@ -2873,7 +3342,7 @@ const LANGS={
   en:{
     bts_ip:'BTS IP',offline:'OFFLINE',online:'ONLINE',
     brew_online:'ONLINE',brew_offline:'OFFLINE',
-    stations:'Radios',calls:'Calls',lastheard:'Last Heard',log:'Log',rf:'RF',config:'Config',
+    stations:'Radios',calls:'Calls',lastheard:'Last Heard',log:'Log',rf:'RF',health:'Health',asterisk:'Asterisk SIP',dapnet:'DAPNET',echolink:'EchoLink',echolink_title:'EchoLink',meshcom:'MeshCom',meshcom_title:'MeshCom',geoalarm:'GeoAlarm',geoalarm_title:'GeoAlarm',config:'Config',
     sdslog:'SDS Log',th_dir:'Dir',th_from:'From',th_to:'To',th_message:'Message',no_sds:'No SDS messages yet',sds_refresh:'⟳ Refresh',
     rf_freq:'Center freq',rf_rate:'Sample rate',rf_rms:'RMS',rf_peak:'Peak',rf_age:'Snapshot',
     rf_waiting:'waiting…',rf_live:'live',rf_stale:'stale',
@@ -2888,6 +3357,10 @@ const LANGS={
     rf_temp_cold:'cold',rf_temp_nominal:'nominal',rf_temp_warm:'warm',rf_temp_hot:'hot',rf_temp_na:'no sensor',
     rf_no_gains:'unavailable',rf_just_now:'just now',
 
+    asterisk_title:'Asterisk SIP',ast_configured:'Configured',ast_register:'REGISTER',ast_sip_listen:'SIP listen',
+    ast_remote:'Remote Asterisk',ast_rtp:'RTP ports',ast_codec:'Codec',ast_last_rx:'Last RX',
+    ast_last_tx:'Last TX',ast_last_error:'Last error',
+    dapnet_title:'DAPNET',dapnet_log:'DAPNET Log',dapnet_routing:'Routing',dapnet_send:'Send DAPNET Message',dapnet_saved:'✓ Saved',
     terminals:'Radios',registered:'registered',
     active_calls:'Active Calls',circuits:'circuits in use',
     registered_terminals:'Registered Radios',
@@ -2906,6 +3379,12 @@ const LANGS={
     wx_periodic_icao:'Station ICAO',wx_periodic_dest:'Destination',wx_periodic_isgroup:'Destination is group',wx_periodic_isgroup_hint:'(GSSI instead of individual ISSI)',
     wx_periodic_interval:'Interval (seconds)',wx_interval_hint:'Minimum 300 s (5 min) to avoid hammering the weather API.',wx_periodic_incomplete:'Set both station ICAO and destination for periodic mode.',
     sds_title:'⬡ Send SDS Message',sds_dest:'Destination ISSI',
+    sds_callout_enable:'TPG2200 Call-Out / Send alarm',
+    sds_callout_source:'Source ISSI',
+    sds_callout_incident:'Incident number',
+    sds_callout_text:'Alarm text',
+    sds_callout_raw:'Raw Hex Payload optional',
+    sds_callout_help:'Incidents 1-15 use the confirmed byte formula (N << 4) | 0x01: 1=11, 2=21, 3=31, 4=41. Incidents 16-256 use the extended one-byte selector. Raw Hex overrides automatic payload generation.',
     live_sds_desc:'Broadcast a text message to all radios on the cell, repeating at the Home Mode Display interval. Repeats until deleted or the repeat count is reached.',
     live_sds_text:'Message text (max 251 chars)',live_sds_repeat:'Repeat (0=∞)',live_sds_send:'📢 Broadcast',
     live_sds_clear_all:'Clear All',live_sds_empty:'No active broadcasts.',
@@ -2973,7 +3452,7 @@ const LANGS={
   ro:{
     bts_ip:'IP BTS',offline:'DECONECTAT',online:'CONECTAT',
     brew_online:'ONLINE',brew_offline:'OFFLINE',
-    stations:'Radiouri',calls:'Apeluri',lastheard:'Ultima Activitate',log:'Log',rf:'RF',config:'Config',
+    stations:'Radiouri',calls:'Apeluri',lastheard:'Ultima Activitate',log:'Log',rf:'RF',health:'Health',echolink:'EchoLink',echolink_title:'EchoLink',config:'Config',
     sdslog:'Jurnal SDS',th_dir:'Dir',th_from:'De la',th_to:'Către',th_message:'Mesaj',no_sds:'Niciun mesaj SDS încă',sds_refresh:'⟳ Reîmprospătează',
     rf_freq:'Frecvență centru',rf_rate:'Rată eșantion',rf_rms:'RMS',rf_peak:'Vârf',rf_age:'Captură',
     rf_waiting:'în așteptare…',rf_live:'live',rf_stale:'expirat',
@@ -3072,7 +3551,7 @@ const LANGS={
   de:{
     bts_ip:'BTS-IP',offline:'OFFLINE',online:'ONLINE',
     brew_online:'ONLINE',brew_offline:'OFFLINE',
-    stations:'Radios',calls:'Anrufe',lastheard:'Zuletzt Gehört',log:'Log',rf:'RF',config:'Config',
+    stations:'Radios',calls:'Anrufe',lastheard:'Zuletzt Gehört',log:'Log',rf:'RF',health:'Health',asterisk:'Asterisk SIP',dapnet:'DAPNET',echolink:'EchoLink',echolink_title:'EchoLink',meshcom:'MeshCom',meshcom_title:'MeshCom',geoalarm:'GeoAlarm',geoalarm_title:'GeoAlarm',config:'Config',
     sdslog:'SDS-Log',th_dir:'Ri.',th_from:'Von',th_to:'An',th_message:'Nachricht',no_sds:'Noch keine SDS-Nachrichten',sds_refresh:'⟳ Aktualisieren',
     rf_freq:'Mittenfrequenz',rf_rate:'Abtastrate',rf_rms:'RMS',rf_peak:'Spitze',rf_age:'Aufnahme',
     rf_waiting:'wartet…',rf_live:'live',rf_stale:'veraltet',
@@ -3087,6 +3566,10 @@ const LANGS={
     rf_temp_cold:'kalt',rf_temp_nominal:'nominal',rf_temp_warm:'warm',rf_temp_hot:'heiß',rf_temp_na:'kein Sensor',
     rf_no_gains:'nicht verfügbar',rf_just_now:'gerade eben',
 
+    asterisk_title:'Asterisk SIP',ast_configured:'Konfiguriert',ast_register:'REGISTER',ast_sip_listen:'SIP hört auf',
+    ast_remote:'Remote Asterisk',ast_rtp:'RTP-Ports',ast_codec:'Codec',ast_last_rx:'Letztes RX',
+    ast_last_tx:'Letztes TX',ast_last_error:'Letzter Fehler',
+    dapnet_title:'DAPNET',dapnet_log:'DAPNET-Log',dapnet_routing:'Routing',dapnet_send:'DAPNET-Nachricht senden',dapnet_saved:'✓ Gespeichert',
     terminals:'Radios',registered:'registriert',
     active_calls:'Aktive Anrufe',circuits:'Schaltkreise aktiv',
     registered_terminals:'Registrierte Radios',
@@ -3106,6 +3589,12 @@ const LANGS={
     live_sds_sent:'gesendet',live_sds_times:'×',live_sds_forever:'∞',live_sds_delete:'✕',
     fallback_title:'⚠ FALLBACK-KONFIGURATION AKTIV — Primäre Konfiguration konnte nicht geladen werden',
     sds_title:'⬡ SDS-Nachricht senden',sds_dest:'Ziel-ISSI',
+    sds_callout_enable:'TPG2200 Call-Out / Alarm senden',
+    sds_callout_source:'Source ISSI',
+    sds_callout_incident:'Vorfallnummer',
+    sds_callout_text:'Alarmtext',
+    sds_callout_raw:'Raw Hex Payload optional',
+    sds_callout_help:'Vorfall 1-15 nutzen die bestätigte Byte-Formel (N << 4) | 0x01: 1=11, 2=21, 3=31, 4=41. Vorfall 16-256 nutzen den erweiterten Ein-Byte-Selector. Raw Hex überschreibt die automatische Payload.',
     sds_msg_label:'Nachricht',cancel:'Abbrechen',send:'Senden',
     th_issi:'ISSI',th_groups:'Gruppen',th_ee:'Energiesparen',th_signal:'Signal',
     th_status:'Status',th_last_seen:'Zuletzt',th_actions:'Aktionen',
@@ -3143,7 +3632,7 @@ const LANGS={
   es:{
     bts_ip:'IP BTS',offline:'SIN CONEXIÓN',online:'EN LÍNEA',
     brew_online:'EN LÍNEA',brew_offline:'SIN CONEXIÓN',
-    stations:'Radios',calls:'Llamadas',lastheard:'Última Actividad',log:'Log',rf:'RF',config:'Config',
+    stations:'Radios',calls:'Llamadas',lastheard:'Última Actividad',log:'Log',rf:'RF',health:'Health',echolink:'EchoLink',echolink_title:'EchoLink',config:'Config',
     sdslog:'Registro SDS',th_dir:'Dir',th_from:'De',th_to:'Para',th_message:'Mensaje',no_sds:'Aún no hay mensajes SDS',sds_refresh:'⟳ Actualizar',
     rf_freq:'Frecuencia central',rf_rate:'Tasa de muestreo',rf_rms:'RMS',rf_peak:'Pico',rf_age:'Captura',
     rf_waiting:'esperando…',rf_live:'en vivo',rf_stale:'obsoleto',
@@ -3214,7 +3703,7 @@ const LANGS={
   hu:{
     bts_ip:'BTS IP',offline:'OFFLINE',online:'ONLINE',
     brew_online:'ONLINE',brew_offline:'OFFLINE',
-    stations:'Rádiók',calls:'Hívások',lastheard:'Utoljára Hallott',log:'Napló',rf:'RF',config:'Konfig',
+    stations:'Rádiók',calls:'Hívások',lastheard:'Utoljára Hallott',log:'Napló',rf:'RF',health:'Health',echolink:'EchoLink',echolink_title:'EchoLink',config:'Konfig',
     sdslog:'SDS Napló',th_dir:'Irány',th_from:'Feladó',th_to:'Címzett',th_message:'Üzenet',no_sds:'Még nincs SDS üzenet',sds_refresh:'⟳ Frissítés',
     rf_freq:'Központi frekvencia',rf_rate:'Mintavételezési ráta',rf_rms:'RMS',rf_peak:'Csúcs',rf_age:'Pillanatkép',
     rf_waiting:'várakozás…',rf_live:'élő',rf_stale:'elavult',
@@ -3277,7 +3766,7 @@ const LANGS={
   zh:{
     bts_ip:'BTS IP',offline:'离线',online:'在线',
     brew_online:'在线',brew_offline:'离线',
-    stations:'终端',calls:'通话',lastheard:'最近通话',log:'日志',rf:'RF',config:'配置',
+    stations:'终端',calls:'通话',lastheard:'最近通话',log:'日志',rf:'RF',health:'Health',echolink:'EchoLink',echolink_title:'EchoLink',config:'配置',
     sdslog:'SDS日志',th_dir:'方向',th_from:'发件',th_to:'收件',th_message:'消息',no_sds:'暂无SDS消息',sds_refresh:'⟳ 刷新',
     rf_freq:'中心频率',rf_rate:'采样率',rf_rms:'RMS',rf_peak:'峰值',rf_age:'快照',
     rf_waiting:'等待中…',rf_live:'实时',rf_stale:'已过期',
@@ -3442,7 +3931,7 @@ function closeMobileSidebar(){
 }
 
 // ── Page navigation ───────────────────────────────────────────────────────
-const PAGE_TITLES={stations:'stations',calls:'calls',lastheard:'lastheard',log:'log',sdslog:'sdslog',rf:'rf',config:'config',system:'system'};
+const PAGE_TITLES={stations:'stations',calls:'calls',lastheard:'lastheard',log:'log',sdslog:'sdslog',rf:'rf',health:'health',asterisk:'asterisk',dapnet:'dapnet',echolink:'echolink',meshcom:'meshcom',geoalarm:'geoalarm',config:'config',system:'system'};
 function showPage(name,el){
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
@@ -3452,6 +3941,10 @@ function showPage(name,el){
   document.getElementById('topbar-title').textContent=t(name)||name;
   if(name==='stations'){loadBtsInfo();}
   if(name==='sdslog'){loadSdsLog();}
+  if(name==='health'){loadHealthIntegrations();}
+  if(name==='asterisk'){loadAsteriskStatus();loadSnomNotify();}
+  if(name==='dapnet'){loadDapnet();loadDapnetLog();}
+  if(name==='geoalarm'){loadGeoalarm();}
   if(name==='config'){loadConfig();loadWhitelist();loadWx();}
   if(name==='telegram'){loadTelegram();}
   if(name==='system'){loadSystemInfo();loadConfigProfiles();loadLiveSds();loadBrightness();}
@@ -3772,7 +4265,7 @@ async function wifiCall(url, body){
 function escAttr(s){ return String(s).replace(/&/g,'&amp;').replace(/'/g,"&#39;").replace(/"/g,'&quot;'); }
 
 // ── State + WS ────────────────────────────────────────────────────────────
-let ws=null,state={ms:{},calls:{},emergencies:{},lastHeard:[],sdsLog:[],brewOnline:false,brewVer:0},sdsDest=0;
+let ws=null,state={ms:{},calls:{},emergencies:{},lastHeard:[],sdsLog:[],dapnetLog:[],geoalarmEvents:[],brewOnline:false,brewVer:0},sdsDest=0;
 
 // ── RadioID callsigns (indicativ) ──────────────────────────────────────────────
 // issi -> {cs:"CALLSIGN", fl:"🇷🇴"} (found; fl is the country flag emoji from the prefix, or "")
@@ -3977,6 +4470,11 @@ function handleMsg(msg){
       state.sdsLog.unshift({ts:nowStamp(),direction:msg.direction,source_issi:msg.source_issi,dest_issi:msg.dest_issi,is_group:msg.is_group,protocol_id:msg.protocol_id,text:msg.text});
       if(state.sdsLog.length>500)state.sdsLog.pop();
       renderSdsLog();refreshCallsigns();break;
+    case 'dapnet_log':
+      if(!state.dapnetLog)state.dapnetLog=[];
+      state.dapnetLog.unshift({ts:nowStamp(),direction:msg.direction,id:msg.id,callsign:msg.callsign,recipient:msg.recipient,text:msg.text,priority:msg.priority,paths:msg.paths||[]});
+      if(state.dapnetLog.length>500)state.dapnetLog.pop();
+      renderDapnetLog();break;
     case 'tx_visual':handleTxVisual(msg);break;
     case 'tx_quality':handleTxQuality(msg);break;
     case 'sdr_health':handleSdrHealth(msg);break;
@@ -4259,25 +4757,457 @@ function _p2(n){return String(n).padStart(2,'0');}
 // Local "YYYY-MM-DD HH:MM:SS" stamp matching the server's persisted format. Used only for
 // live rows arriving over the WS; rows fetched from /api/sds-log already carry a server stamp.
 function nowStamp(){const d=new Date();return `${d.getFullYear()}-${_p2(d.getMonth()+1)}-${_p2(d.getDate())} ${_p2(d.getHours())}:${_p2(d.getMinutes())}:${_p2(d.getSeconds())}`;}
+const LOG_PAGE_SIZE=50;
+let sdsLogPageIndex=0,dapnetLogPageIndex=0,geoalarmPageIndex=0;
+function setLogPager(id,page,total){
+  const el=document.getElementById(id);if(!el)return;
+  if(!total){el.textContent='Page 0 / 0 · 0';return;}
+  const pages=Math.max(1,Math.ceil(total/LOG_PAGE_SIZE));
+  el.textContent=`Page ${page+1} / ${pages} · ${total}`;
+}
+function clampLogPage(page,total){
+  const pages=Math.max(1,Math.ceil(total/LOG_PAGE_SIZE));
+  return Math.max(0,Math.min(page,pages-1));
+}
+function logExportStamp(){
+  const d=new Date();
+  return `${d.getFullYear()}${_p2(d.getMonth()+1)}${_p2(d.getDate())}-${_p2(d.getHours())}${_p2(d.getMinutes())}${_p2(d.getSeconds())}`;
+}
+function logExportCell(v){
+  return String(v??'').replace(/\r?\n/g,' ').replace(/\t/g,' ').trim();
+}
+function downloadTextFile(filename,text){
+  const blob=new Blob([text],{type:'text/plain;charset=utf-8'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download=filename;
+  document.body.appendChild(a);a.click();
+  setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove();},0);
+}
 // Human label for known SDS protocol-identifier bytes so binary payloads (no decoded text)
 // still read meaningfully. 0x02/0x09/0x82/0x89 = text; 0x0A = LIP position; 0xDC = Home Mode Display.
 function pidLabel(pid){const m={2:'text',9:'text',10:'LIP position',12:'concat',128:'text',130:'text',137:'text',218:'status',220:'home-display'};return m[pid]||('PID '+pid);}
 const SDS_DIR={rx:['badge-green','RX'],net:['badge-blue','NET'],tx:['badge-yellow','TX']};
 function dirBadge(dir){const x=SDS_DIR[dir]||['badge-dim',(dir||'?').toUpperCase()];return `<span class="badge ${x[0]}">${x[1]}</span>`;}
+function lipPositionFromText(text){
+  const m=String(text||'').match(/^LIP position:\s*(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)/);
+  if(!m)return null;
+  const lat=Number(m[1]),lon=Number(m[2]);
+  if(!Number.isFinite(lat)||!Number.isFinite(lon)||lat<-90||lat>90||lon<-180||lon>180)return null;
+  return {lat,lon};
+}
+function sdsMessageBody(e){
+  if(e.text&&e.text.length){
+    const lip=lipPositionFromText(e.text);
+    if(lip){
+      const label=`LIP position: ${lip.lat.toFixed(6)}, ${lip.lon.toFixed(6)}`;
+      const url=`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${lip.lat.toFixed(6)},${lip.lon.toFixed(6)}`)}`;
+      return `<a class="sds-map-link" href="${url}" target="_blank" rel="noopener noreferrer">${escHtml(label)}</a>`;
+    }
+    return escHtml(e.text);
+  }
+  return `<span class="sds-empty">[${escHtml(pidLabel(e.protocol_id))}]</span>`;
+}
 function sdsRow(e){
   const to=e.is_group?`<code>${e.dest_issi}</code> <span class="sds-empty">grp</span>`:idCell(e.dest_issi);
-  const body=(e.text&&e.text.length)?escHtml(e.text):`<span class="sds-empty">[${escHtml(pidLabel(e.protocol_id))}]</span>`;
+  const body=sdsMessageBody(e);
   return `<tr><td class="sds-time">${escHtml(e.ts||'')}</td><td>${dirBadge(e.direction)}</td><td>${idCell(e.source_issi)}</td><td>${to}</td><td class="sds-msg">${body}</td></tr>`;
 }
 function renderSdsLog(){
   const tb=document.getElementById('sdslog-tbody');if(!tb)return;
   const rows=state.sdsLog||[];
+  sdsLogPageIndex=clampLogPage(sdsLogPageIndex,rows.length);
+  setLogPager('sdslog-page',sdsLogPageIndex,rows.length);
   if(!rows.length){tb.innerHTML=`<tr><td colspan="5" class="sds-empty" style="text-align:center;padding:24px">${t('no_sds')}</td></tr>`;return;}
-  tb.innerHTML=rows.map(sdsRow).join('');
+  const start=sdsLogPageIndex*LOG_PAGE_SIZE;
+  tb.innerHTML=rows.slice(start,start+LOG_PAGE_SIZE).map(sdsRow).join('');
 }
 async function loadSdsLog(){
-  try{const r=await fetch('/api/sds-log');if(!r.ok)return;state.sdsLog=await r.json();renderSdsLog();refreshCallsigns();}catch{}
+  try{const r=await fetch('/api/sds-log');if(!r.ok)return;state.sdsLog=await r.json();sdsLogPageIndex=0;renderSdsLog();refreshCallsigns();}catch{}
 }
+function sdsLogPrevPage(){sdsLogPageIndex--;renderSdsLog();}
+function sdsLogNextPage(){sdsLogPageIndex++;renderSdsLog();}
+async function clearSdsLog(){
+  if(!confirm('Clear SDS Log?'))return;
+  try{const r=await fetch('/api/sds-log',{method:'DELETE'});if(!r.ok)return;state.sdsLog=[];sdsLogPageIndex=0;renderSdsLog();}catch{}
+}
+function exportSdsLog(){
+  const rows=state.sdsLog||[];
+  if(!rows.length)return;
+  const lines=['TIME\tDIR\tFROM\tTO\tGROUP\tPID\tMESSAGE'];
+  for(const e of rows){
+    lines.push([
+      e.ts||'',
+      (e.direction||'').toUpperCase(),
+      e.source_issi||'',
+      e.dest_issi||'',
+      e.is_group?'yes':'no',
+      e.protocol_id??'',
+      logExportCell(e.text||pidLabel(e.protocol_id))
+    ].map(logExportCell).join('\t'));
+  }
+  downloadTextFile(`flowstation-sds-log-${logExportStamp()}.txt`,lines.join('\n')+'\n');
+}
+
+// ── DAPNET ────────────────────────────────────────────────────────────────
+let dapPasswordDirty=false,dapAuthDirty=false;
+function dapSet(id,v){
+  const el=document.getElementById(id);if(!el)return;
+  const value=(v===null||v===undefined)?'':v;
+  if('value' in el)el.value=value;
+  else el.textContent=value;
+}
+function dapCheck(id,v){const el=document.getElementById(id);if(el)el.checked=!!v;}
+function dapVal(id){const el=document.getElementById(id);return el?(el.value||'').trim():'';}
+function dapNum(id,def,min,max){
+  const n=parseInt(dapVal(id),10);
+  if(!Number.isFinite(n))return def;
+  return Math.max(min,Math.min(max,n));
+}
+function dapList(id){return dapVal(id).split(/[\s,]+/).map(s=>s.trim()).filter(Boolean);}
+function dapRicRoutesText(routes){
+  return Object.keys(routes||{}).sort().map(k=>`${k}=${routes[k]}`).join('\n');
+}
+function dapRicRoutesBody(id,label){
+  const raw=dapVal(id);
+  const out={};
+  if(!raw)return out;
+  for(const lineRaw of raw.split(/\n+/)){
+    const line=lineRaw.trim();
+    if(!line||line.startsWith('#'))continue;
+    const m=line.match(/^([0-9A-Fa-fxX]+)\s*=\s*([0-9]+)$/);
+    if(!m){setDapMsg(`Invalid ${label} route: ${line}`,false);return null;}
+    const issi=parseInt(m[2],10);
+    if(!Number.isFinite(issi)||issi<1||issi>16777215){setDapMsg(`Invalid SSI in ${label} route: ${line}`,false);return null;}
+    out[m[1]]=issi;
+  }
+  return out;
+}
+function dapRicListText(rics){
+  if(!rics)return '';
+  if(Array.isArray(rics))return rics.join('\n');
+  return Object.keys(rics).sort().join('\n');
+}
+function dapRicListBody(id,label){
+  const raw=dapVal(id);
+  const out=[];
+  if(!raw)return out;
+  const seen=new Set();
+  for(const lineRaw of raw.split(/\n+/)){
+    const line=lineRaw.split('#')[0].trim();
+    if(!line)continue;
+    for(const partRaw of line.split(/[\s,]+/)){
+      const part=partRaw.trim();
+      if(!part)continue;
+      if(!/^(?:0x[0-9a-f]+|[0-9]+)$/i.test(part)){setDapMsg(`Invalid ${label} RIC: ${part}`,false);return null;}
+      if(!seen.has(part)){seen.add(part);out.push(part);}
+    }
+  }
+  return out;
+}
+function dapPaths(paths){
+  const p=paths||[];
+  if(!p.length)return '<span class="sds-empty">—</span>';
+  return p.map(x=>`<span class="badge badge-blue" style="font-size:10px">${escHtml(x)}</span>`).join(' ');
+}
+function dapnetRow(e){
+  return `<tr><td class="sds-time">${escHtml(e.ts||'')}</td><td>${dirBadge(e.direction)}</td><td>${escHtml(e.callsign||'')}</td><td>${escHtml(e.recipient||'')}</td><td>${dapPaths(e.paths)}</td><td class="sds-msg">${escHtml(e.text||'')}</td></tr>`;
+}
+function renderDapnetLog(){
+  const tb=document.getElementById('dapnetlog-tbody');if(!tb)return;
+  const rows=state.dapnetLog||[];
+  dapnetLogPageIndex=clampLogPage(dapnetLogPageIndex,rows.length);
+  setLogPager('dapnetlog-page',dapnetLogPageIndex,rows.length);
+  if(!rows.length){tb.innerHTML=`<tr><td colspan="6" class="sds-empty" style="text-align:center;padding:24px">No DAPNET messages yet</td></tr>`;return;}
+  const start=dapnetLogPageIndex*LOG_PAGE_SIZE;
+  tb.innerHTML=rows.slice(start,start+LOG_PAGE_SIZE).map(dapnetRow).join('');
+}
+async function loadDapnetLog(){
+  try{const r=await fetch('/api/dapnet-log');if(!r.ok)return;state.dapnetLog=await r.json();dapnetLogPageIndex=0;renderDapnetLog();}catch{}
+}
+function dapnetLogPrevPage(){dapnetLogPageIndex--;renderDapnetLog();}
+function dapnetLogNextPage(){dapnetLogPageIndex++;renderDapnetLog();}
+async function clearDapnetLog(){
+  if(!confirm('Clear DAPNET Log?'))return;
+  try{const r=await fetch('/api/dapnet-log',{method:'DELETE'});if(!r.ok)return;state.dapnetLog=[];dapnetLogPageIndex=0;renderDapnetLog();}catch{}
+}
+function exportDapnetLog(){
+  const rows=state.dapnetLog||[];
+  if(!rows.length)return;
+  const lines=['TIME\tDIR\tCALLSIGN\tRECIPIENT\tPATHS\tMESSAGE'];
+  for(const e of rows){
+    lines.push([
+      e.ts||'',
+      (e.direction||'').toUpperCase(),
+      e.callsign||'',
+      e.recipient||'',
+      (e.paths||[]).join(','),
+      e.text||''
+    ].map(logExportCell).join('\t'));
+  }
+  downloadTextFile(`flowstation-dapnet-log-${logExportStamp()}.txt`,lines.join('\n')+'\n');
+}
+async function loadDapnet(){
+  try{
+    const r=await fetch('/api/dapnet');
+    if(!r.ok){setDapMsg(t('conn_error'),false);return;}
+    const d=await r.json();
+    dapCheck('dap-enabled',d.enabled);
+    dapCheck('dap-rwth-enabled',d.rwth_core_enabled);
+    dapSet('dap-poll',d.poll_interval_secs||30);
+    dapSet('dap-limit',d.rwth_messages_limit||100);
+    dapSet('dap-api-url',d.api_url||'');
+    dapSet('dap-username',d.username||'');
+    dapSet('dap-password',d.password_set?(d.password_masked||''):'');
+    dapPasswordDirty=false;
+    dapSet('dap-rwth-host',d.rwth_core_host||'');
+    dapSet('dap-rwth-port',d.rwth_core_port||43434);
+    dapSet('dap-rwth-device',d.rwth_core_device||'FlowStation');
+    dapSet('dap-rwth-version',d.rwth_core_version||'1.0');
+    dapSet('dap-rwth-callsign',d.rwth_core_callsign||'');
+    dapSet('dap-rwth-authkey',d.rwth_core_authkey_set?(d.rwth_core_authkey_masked||''):'');
+    dapAuthDirty=false;
+    dapCheck('dap-forward-sds',d.forward_sds);
+    dapCheck('dap-forward-callout',d.forward_callout);
+    dapCheck('dap-forward-telegram',d.forward_telegram);
+    dapSet('dap-sds-source',d.sds_source_issi||9999);
+    dapSet('dap-sds-dest',d.sds_dest_issi||0);
+    dapCheck('dap-sds-group',d.sds_dest_is_group);
+    dapSet('dap-ric-routes',dapRicRoutesText(d.ric_issi_routes));
+    dapSet('dap-ric-group-routes',dapRicRoutesText(d.ric_gssi_routes));
+    dapSet('dap-sds-rics',dapRicListText(d.sds_allowed_rics));
+    dapSet('dap-callout-source',d.callout_source_issi||9999);
+    dapSet('dap-callout-dest',d.callout_dest_issi||0);
+    dapSet('dap-callout-incident',d.callout_incident_base||2);
+    dapSet('dap-callout-prefix',d.callout_text_prefix||'DAPNET');
+    dapSet('dap-callout-rics',dapRicListText(d.callout_allowed_rics));
+    dapSet('dap-telegram-prefix',d.telegram_prefix||'DAPNET');
+    dapSet('dap-telegram-rics',dapRicListText(d.telegram_allowed_rics));
+    setDapMsg('',true);
+  }catch{setDapMsg(t('conn_error'),false);}
+}
+async function saveDapnet(){
+  const ricRoutes=dapRicRoutesBody('dap-ric-routes','RIC to ISSI');
+  if(ricRoutes===null)return;
+  const ricGroupRoutes=dapRicRoutesBody('dap-ric-group-routes','RIC to GSSI');
+  if(ricGroupRoutes===null)return;
+  const sdsRics=dapRicListBody('dap-sds-rics','SDS');
+  if(sdsRics===null)return;
+  const calloutRics=dapRicListBody('dap-callout-rics','Call-Out');
+  if(calloutRics===null)return;
+  const telegramRics=dapRicListBody('dap-telegram-rics','Telegram');
+  if(telegramRics===null)return;
+  const body={
+    enabled:document.getElementById('dap-enabled').checked,
+    rwth_core_enabled:document.getElementById('dap-rwth-enabled').checked,
+    poll_interval_secs:dapNum('dap-poll',30,1,86400),
+    rwth_messages_limit:dapNum('dap-limit',100,1,10000),
+    api_url:dapVal('dap-api-url'),
+    username:dapVal('dap-username'),
+    rwth_core_host:dapVal('dap-rwth-host'),
+    rwth_core_port:dapNum('dap-rwth-port',43434,1,65535),
+    rwth_core_device:dapVal('dap-rwth-device')||'FlowStation',
+    rwth_core_version:dapVal('dap-rwth-version')||'1.0',
+    rwth_core_callsign:dapVal('dap-rwth-callsign').toUpperCase(),
+    forward_sds:document.getElementById('dap-forward-sds').checked,
+    forward_callout:document.getElementById('dap-forward-callout').checked,
+    forward_telegram:document.getElementById('dap-forward-telegram').checked,
+    sds_source_issi:dapNum('dap-sds-source',9999,1,16777215),
+    sds_dest_issi:dapNum('dap-sds-dest',0,0,16777215),
+    sds_dest_is_group:document.getElementById('dap-sds-group').checked,
+    ric_issi_routes:ricRoutes,
+    ric_gssi_routes:ricGroupRoutes,
+    sds_allowed_rics:sdsRics,
+    callout_source_issi:dapNum('dap-callout-source',9999,1,16777215),
+    callout_dest_issi:dapNum('dap-callout-dest',0,0,16777215),
+    callout_incident_base:dapNum('dap-callout-incident',2,1,256),
+    callout_text_prefix:dapVal('dap-callout-prefix')||'DAPNET',
+    callout_allowed_rics:calloutRics,
+    telegram_prefix:dapVal('dap-telegram-prefix')||'DAPNET',
+    telegram_allowed_rics:telegramRics
+  };
+  if(dapPasswordDirty)body.password=dapVal('dap-password');
+  if(dapAuthDirty)body.rwth_core_authkey=dapVal('dap-rwth-authkey');
+  try{
+    const r=await fetch('/api/dapnet',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(r.ok){setDapMsg(t('dapnet_saved'),true);loadDapnet();}
+    else setDapMsg(t('save_fail')+': '+await r.text(),false);
+  }catch{setDapMsg(t('conn_error'),false);}
+}
+async function sendDapnetMessage(){
+  const body={
+    callSignNames:dapList('dap-out-callsigns'),
+    transmitterGroupNames:dapList('dap-out-groups'),
+    emergency:document.getElementById('dap-out-emergency').checked,
+    text:document.getElementById('dap-out-text').value.trim()
+  };
+  if(!body.text){setDapSendMsg('Message text is empty',false);return;}
+  if(!body.callSignNames.length&&!body.transmitterGroupNames.length){setDapSendMsg('Set callsign or transmitter group',false);return;}
+  setDapSendMsg('Sending…',true);
+  try{
+    const r=await fetch('/api/dapnet/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const d=await r.json();
+    if(d.ok){setDapSendMsg('✓ Sent',true);document.getElementById('dap-out-text').value='';loadDapnetLog();}
+    else setDapSendMsg('✗ '+(d.error||'Send failed'),false);
+  }catch{setDapSendMsg(t('conn_error'),false);}
+}
+
+// ── Shared map-link + paths helpers (also used by GeoAlarm) ────────────────
+function meshMapLink(lat,lon,label){
+  if(lat===null||lat===undefined||lon===null||lon===undefined)return '—';
+  const la=Number(lat),lo=Number(lon);
+  if(!Number.isFinite(la)||!Number.isFinite(lo))return '—';
+  const url=`https://maps.google.com/?q=${encodeURIComponent(la+','+lo)}`;
+  return `<a class="sds-map-link" href="${url}" target="_blank" rel="noopener noreferrer">${escHtml(label||`${la.toFixed(5)}, ${lo.toFixed(5)}`)}</a>`;
+}
+function meshRfText(row){
+  const parts=[];
+  if(row.rssi!==null&&row.rssi!==undefined)parts.push(`RSSI ${row.rssi}`);
+  if(row.snr!==null&&row.snr!==undefined)parts.push(`SNR ${row.snr}`);
+  return parts.join(' · ')||'—';
+}
+function meshSourceListText(values){
+  return Array.isArray(values)?values.join('\n'):'';
+}
+function meshSourceListBody(id){
+  const raw=dapVal(id);
+  if(!raw)return [];
+  return raw.split(/[\s,]+/).map(v=>v.trim()).filter(Boolean);
+}
+function meshPaths(paths){
+  if(!Array.isArray(paths)||!paths.length)return '<span class="sds-empty">—</span>';
+  return paths.map(p=>`<span class="badge badge-blue" style="font-size:10px">${escHtml(p)}</span>`).join(' ');
+}
+
+// ── GeoAlarm ──────────────────────────────────────────────────────────────
+function geoFloat(id,def,min,max){
+  const n=parseFloat(dapVal(id));
+  if(!Number.isFinite(n))return def;
+  return Math.max(min,Math.min(max,n));
+}
+function geoIssiListText(values){
+  return Array.isArray(values)?values.join('\n'):'';
+}
+function geoIssiListBody(id,label){
+  const raw=dapVal(id);
+  if(!raw)return [];
+  const out=[],seen=new Set();
+  for(const part of raw.split(/[\s,]+/).map(v=>v.trim()).filter(Boolean)){
+    const n=Number(part);
+    if(!Number.isInteger(n)||n<0||n>16777215){setGeoMsg(`Invalid ${label} ISSI: ${part}`,false);return null;}
+    if(!seen.has(n)){seen.add(n);out.push(n);}
+  }
+  return out;
+}
+function geoEventRow(e){
+  const status=e.alarmed
+    ? '<span class="badge badge-green" style="font-size:10px">ALARM</span>'
+    : (e.inside_radius?'<span class="badge badge-blue" style="font-size:10px">inside</span>':'<span class="badge" style="font-size:10px">outside</span>');
+  return `<tr>
+    <td class="sds-time">${escHtml(e.ts||'')}</td>
+    <td>${escHtml(e.source||'—')}</td>
+    <td>${escHtml(e.device||'—')}</td>
+    <td class="sds-time">${Number(e.distance_m||0).toFixed(0)} m</td>
+    <td>${meshMapLink(e.lat,e.lon,'map')}</td>
+    <td>${status}</td>
+    <td>${meshPaths(e.paths)}</td>
+  </tr>`;
+}
+function renderGeoalarmEvents(){
+  const tb=document.getElementById('geo-events-tbody');if(!tb)return;
+  const rows=state.geoalarmEvents||[];
+  geoalarmPageIndex=clampLogPage(geoalarmPageIndex,rows.length);
+  setLogPager('geo-events-page',geoalarmPageIndex,rows.length);
+  if(!rows.length){tb.innerHTML=`<tr><td colspan="7" class="sds-empty" style="text-align:center;padding:24px">No GeoAlarm events yet</td></tr>`;return;}
+  const start=geoalarmPageIndex*LOG_PAGE_SIZE;
+  tb.innerHTML=rows.slice(start,start+LOG_PAGE_SIZE).map(geoEventRow).join('');
+}
+function geoPrevPage(){geoalarmPageIndex--;renderGeoalarmEvents();}
+function geoNextPage(){geoalarmPageIndex++;renderGeoalarmEvents();}
+async function loadGeoalarm(){
+  try{
+    const r=await fetch('/api/geoalarm');
+    if(!r.ok){setGeoMsg(t('conn_error'),false);return;}
+    const d=await r.json(),rt=d.runtime||{};
+    dapCheck('geo-enabled',d.enabled);
+    dapSet('geo-lat',d.flowstation_lat??0);
+    dapSet('geo-lon',d.flowstation_lon??0);
+    dapSet('geo-radius-m',d.radius_m||500);
+    dapSet('geo-cooldown',d.cooldown_secs||300);
+    dapCheck('geo-trigger-tetra',d.trigger_tetra);
+    dapCheck('geo-trigger-meshcom',d.trigger_meshcom);
+    dapCheck('geo-forward-tpg',d.forward_tpg2200);
+    dapCheck('geo-forward-sds',d.forward_sds);
+    dapCheck('geo-forward-sip',d.forward_sip);
+    dapCheck('geo-forward-telegram',d.forward_telegram);
+    dapSet('geo-tetra-white',geoIssiListText(d.tetra_issi_whitelist));
+    dapSet('geo-tetra-black',geoIssiListText(d.tetra_issi_blacklist));
+    dapSet('geo-mesh-white',meshSourceListText(d.meshcom_source_whitelist));
+    dapSet('geo-mesh-black',meshSourceListText(d.meshcom_source_blacklist));
+    dapSet('geo-sds-source',d.sds_source_issi||9999);
+    dapSet('geo-sds-dest',d.sds_dest_issi||0);
+    dapCheck('geo-sds-group',d.sds_dest_is_group);
+    dapSet('geo-tpg-source',d.tpg2200_source_issi||9999);
+    dapSet('geo-tpg-dest',d.tpg2200_dest_issi||0);
+    dapSet('geo-tpg-incident',d.tpg2200_incident_base||1);
+    dapSet('geo-tpg-prefix',d.tpg2200_text_prefix||'GeoAlarm');
+    dapSet('geo-tpg-max',d.tpg2200_max_text_chars||80);
+    dapSet('geo-sip-prefix',d.sip_title_prefix||'GeoAlarm');
+    dapSet('geo-telegram-prefix',d.telegram_prefix||'GeoAlarm');
+    dapSet('geo-seen',rt.seen_positions??0);
+    dapSet('geo-alarms',rt.alarm_count??0);
+    dapSet('geo-center',rt.center||`${d.flowstation_lat??0},${d.flowstation_lon??0}`);
+    dapSet('geo-radius',`${Number(rt.radius_m||d.radius_m||0).toFixed(0)} m`);
+    dapSet('geo-last-position',rt.last_position||'—');
+    dapSet('geo-last-alarm',rt.last_alarm||'—');
+    dapSet('geo-last-error',rt.last_error||'—');
+    state.geoalarmEvents=d.events||[];
+    geoalarmPageIndex=0;
+    renderGeoalarmEvents();
+    setGeoMsg('',true);
+  }catch{setGeoMsg(t('conn_error'),false);}
+}
+async function saveGeoalarm(){
+  const tetraWhite=geoIssiListBody('geo-tetra-white','whitelist');
+  if(tetraWhite===null)return;
+  const tetraBlack=geoIssiListBody('geo-tetra-black','blacklist');
+  if(tetraBlack===null)return;
+  const body={
+    enabled:document.getElementById('geo-enabled').checked,
+    flowstation_lat:geoFloat('geo-lat',0,-90,90),
+    flowstation_lon:geoFloat('geo-lon',0,-180,180),
+    radius_m:dapNum('geo-radius-m',500,1,1000000),
+    cooldown_secs:dapNum('geo-cooldown',300,1,86400),
+    trigger_tetra:document.getElementById('geo-trigger-tetra').checked,
+    trigger_meshcom:document.getElementById('geo-trigger-meshcom').checked,
+    forward_tpg2200:document.getElementById('geo-forward-tpg').checked,
+    forward_sds:document.getElementById('geo-forward-sds').checked,
+    forward_sip:document.getElementById('geo-forward-sip').checked,
+    forward_telegram:document.getElementById('geo-forward-telegram').checked,
+    tetra_issi_whitelist:tetraWhite,
+    tetra_issi_blacklist:tetraBlack,
+    meshcom_source_whitelist:meshSourceListBody('geo-mesh-white'),
+    meshcom_source_blacklist:meshSourceListBody('geo-mesh-black'),
+    sds_source_issi:dapNum('geo-sds-source',9999,1,16777215),
+    sds_dest_issi:dapNum('geo-sds-dest',0,0,16777215),
+    sds_dest_is_group:document.getElementById('geo-sds-group').checked,
+    tpg2200_source_issi:dapNum('geo-tpg-source',9999,1,16777215),
+    tpg2200_dest_issi:dapNum('geo-tpg-dest',0,0,16777215),
+    tpg2200_incident_base:dapNum('geo-tpg-incident',1,1,256),
+    tpg2200_text_prefix:dapVal('geo-tpg-prefix')||'GeoAlarm',
+    tpg2200_max_text_chars:dapNum('geo-tpg-max',80,8,160),
+    sip_title_prefix:dapVal('geo-sip-prefix')||'GeoAlarm',
+    telegram_prefix:dapVal('geo-telegram-prefix')||'GeoAlarm'
+  };
+  try{
+    const r=await fetch('/api/geoalarm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(r.ok){setGeoMsg('✓ Saved',true);setTimeout(loadGeoalarm,500);}
+    else setGeoMsg(t('save_fail')+': '+await r.text(),false);
+  }catch{setGeoMsg(t('conn_error'),false);}
+}
+function setGeoMsg(txt,ok){const el=document.getElementById('geo-msg');if(!el)return;el.textContent=txt;el.style.color=ok?'var(--accent)':'var(--danger)';if(txt)setTimeout(()=>{if(el.textContent===txt)el.textContent='';},5000);}
+function setDapMsg(txt,ok){const el=document.getElementById('dap-msg');if(!el)return;el.textContent=txt;el.style.color=ok?'var(--accent)':'var(--danger)';if(txt)setTimeout(()=>{if(el.textContent===txt)el.textContent='';},5000);}
+function setDapSendMsg(txt,ok){const el=document.getElementById('dap-send-msg');if(!el)return;el.textContent=txt;el.style.color=ok?'var(--accent)':'var(--danger)';if(txt)setTimeout(()=>{if(el.textContent===txt)el.textContent='';},5000);}
 
 function appendLog(msg){
   const f=logFilter(),lv={'':0,DEBUG:0,INFO:1,WARN:2,ERROR:3};
@@ -4311,6 +5241,134 @@ function exportLog(){
   a.download=`flowstation-log-${stamp}.log`;
   document.body.appendChild(a);a.click();
   setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove();},0);
+}
+
+// ── Asterisk SIP ───────────────────────────────────────────────────────────
+async function loadAsteriskStatus(){
+  const set=(id,v)=>{const el=document.getElementById(id);if(el)el.textContent=(v===null||v===undefined||v==='')?'—':v;};
+  try{
+    const r=await fetch('/api/asterisk/status');
+    if(!r.ok)throw new Error('http '+r.status);
+    const d=await r.json();
+    const c=d.config||{}, rt=d.runtime||{};
+    set('ast-configured', (c.configured||rt.configured)?'YES':'NO');
+    set('ast-enabled', (c.enabled||rt.enabled)?'enabled':'disabled');
+    set('ast-register', rt.register_status||'—');
+    set('ast-dialogs', (rt.active_dialogs??0)+' active dialogs');
+    set('ast-sip-listen', rt.sip_listen||c.sip_listen);
+    set('ast-remote', rt.remote||c.remote);
+    set('ast-rtp', rt.rtp_port_range||c.rtp_port_range);
+    set('ast-codec', rt.codec||c.codec);
+    set('ast-last-rx', rt.last_rx);
+    set('ast-last-tx', rt.last_tx);
+    set('ast-last-error', rt.last_error);
+  }catch(e){
+    set('ast-configured','—');set('ast-enabled','status unavailable');set('ast-register','—');
+    set('ast-last-error',t('conn_error'));
+  }
+}
+
+let snomPasswordDirty=false;
+function setSnomMsg(txt,ok){
+  const el=document.getElementById('snom-msg');
+  if(!el)return;
+  el.textContent=txt||'';
+  el.style.color=ok?'var(--accent)':'var(--danger)';
+}
+function snomListText(values){return (values||[]).join('\n');}
+function snomListBody(id){
+  return (document.getElementById(id)?.value||'')
+    .split(/[\s,]+/)
+    .map(v=>v.trim())
+    .filter(Boolean);
+}
+function snomRicListBody(id,label){
+  const out=[],seen=new Set();
+  for(const rawLine of (document.getElementById(id)?.value||'').split(/\r?\n/)){
+    const line=rawLine.split('#')[0].trim();
+    if(!line)continue;
+    for(const raw of line.split(/[\s,]+/)){
+      const part=raw.trim();
+      if(!part)continue;
+      if(!/^(?:0x[0-9a-f]+|[0-9]+)$/i.test(part)){setSnomMsg(`Invalid ${label} RIC: ${part}`,false);return null;}
+      if(!seen.has(part)){seen.add(part);out.push(part);}
+    }
+  }
+  return out;
+}
+function snomIssiListBody(id,label){
+  const out=[],seen=new Set();
+  for(const raw of snomListBody(id)){
+    const n=Number(raw);
+    if(!Number.isInteger(n)||n<0||n>16777215){setSnomMsg(`Invalid ${label} ISSI: ${raw}`,false);return null;}
+    if(!seen.has(n)){seen.add(n);out.push(n);}
+  }
+  return out;
+}
+function snomSetDirections(values){
+  const dirs=new Set((values&&values.length?values:['rx','net','tx']).map(v=>String(v).toLowerCase()));
+  dapCheck('snom-dir-rx',dirs.has('rx'));
+  dapCheck('snom-dir-net',dirs.has('net'));
+  dapCheck('snom-dir-tx',dirs.has('tx'));
+}
+function snomDirectionsBody(){
+  const dirs=[];
+  if(document.getElementById('snom-dir-rx')?.checked)dirs.push('rx');
+  if(document.getElementById('snom-dir-net')?.checked)dirs.push('net');
+  if(document.getElementById('snom-dir-tx')?.checked)dirs.push('tx');
+  return dirs;
+}
+async function loadSnomNotify(){
+  try{
+    const r=await fetch('/api/snom-notify');
+    if(!r.ok){setSnomMsg(t('conn_error'),false);return;}
+    const d=await r.json();
+    dapCheck('snom-enabled',d.enabled);
+    dapSet('snom-ami-host',d.ami_host||'127.0.0.1');
+    dapSet('snom-ami-port',d.ami_port||5038);
+    dapSet('snom-ami-user',d.ami_username||'');
+    dapSet('snom-ami-password',d.ami_password_set?(d.ami_password_masked||''):'');
+    snomPasswordDirty=false;
+    dapSet('snom-endpoints',snomListText(d.endpoints));
+    dapCheck('snom-notify-sds',d.notify_sds);
+    dapCheck('snom-notify-dapnet',d.notify_dapnet);
+    dapCheck('snom-notify-telegram',d.notify_telegram);
+    snomSetDirections(d.sds_directions);
+    dapSet('snom-dapnet-rics',dapRicListText(d.dapnet_allowed_rics));
+    dapSet('snom-sds-issis',snomListText(d.sds_allowed_issis));
+    dapSet('snom-title-prefix',d.title_prefix||'FlowStation');
+    dapSet('snom-max-text',d.max_text_chars||240);
+    dapSet('snom-timeout',d.connect_timeout_secs||3);
+    setSnomMsg('',true);
+  }catch{setSnomMsg(t('conn_error'),false);}
+}
+async function saveSnomNotify(){
+  const dapnetRics=snomRicListBody('snom-dapnet-rics','DAPNET');
+  if(dapnetRics===null)return;
+  const sdsIssis=snomIssiListBody('snom-sds-issis','SDS');
+  if(sdsIssis===null)return;
+  const body={
+    enabled:document.getElementById('snom-enabled').checked,
+    ami_host:dapVal('snom-ami-host')||'127.0.0.1',
+    ami_port:dapNum('snom-ami-port',5038,1,65535),
+    ami_username:dapVal('snom-ami-user'),
+    endpoints:snomListBody('snom-endpoints'),
+    notify_sds:document.getElementById('snom-notify-sds').checked,
+    notify_dapnet:document.getElementById('snom-notify-dapnet').checked,
+    notify_telegram:document.getElementById('snom-notify-telegram').checked,
+    sds_directions:snomDirectionsBody(),
+    dapnet_allowed_rics:dapnetRics,
+    sds_allowed_issis:sdsIssis,
+    title_prefix:dapVal('snom-title-prefix')||'FlowStation',
+    max_text_chars:dapNum('snom-max-text',240,40,2000),
+    connect_timeout_secs:dapNum('snom-timeout',3,1,30)
+  };
+  if(snomPasswordDirty)body.ami_password=dapVal('snom-ami-password');
+  try{
+    const r=await fetch('/api/snom-notify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(r.ok){setSnomMsg('✓ Saved',true);loadSnomNotify();}
+    else setSnomMsg(t('save_fail')+': '+await r.text(),false);
+  }catch{setSnomMsg(t('conn_error'),false);}
 }
 
 // ── Config ────────────────────────────────────────────────────────────────
@@ -4518,9 +5576,11 @@ function wsSend(msg){if(ws&&ws.readyState===WebSocket.OPEN){ws.send(JSON.stringi
 async function restartService(){if(!confirm(t('confirm_restart')))return;wsSend({type:'restart'});}
 async function shutdownService(){if(!confirm(t('confirm_shutdown')))return;wsSend({type:'shutdown'});}
 function kickMs(issi){if(!confirm(t('confirm_kick',{issi})))return;wsSend({type:'kick',issi});}
-function openSds(issi){sdsDest=issi;document.getElementById('sds-dest').value=issi;document.getElementById('sds-msg').value='';document.getElementById('sds-modal').classList.add('open');}
+function toggleSdsCallout(){const on=document.getElementById('sds-callout').checked;document.getElementById('sds-callout-fields').style.display=on?'block':'none';}
+function resetSdsCallout(){document.getElementById('sds-callout').checked=false;document.getElementById('sds-callout-source').value='9999';document.getElementById('sds-callout-incident').value='1';document.getElementById('sds-callout-text').value='ALARM';document.getElementById('sds-callout-raw').value='';toggleSdsCallout();}
+function openSds(issi){sdsDest=issi;document.getElementById('sds-dest').value=issi;document.getElementById('sds-msg').value='';resetSdsCallout();document.getElementById('sds-modal').classList.add('open');}
 function closeSdsModal(){document.getElementById('sds-modal').classList.remove('open');}
-function sendSds(){const dest=parseInt(document.getElementById('sds-dest').value),msg=document.getElementById('sds-msg').value.trim();if(!dest||!msg)return;wsSend({type:'sds',dest_issi:dest,message:msg});closeSdsModal();}
+function sendSds(){const dest=parseInt(document.getElementById('sds-dest').value);if(!dest)return;if(document.getElementById('sds-callout').checked){const source=parseInt(document.getElementById('sds-callout-source').value)||9999;const incident=Math.max(1,Math.min(256,parseInt(document.getElementById('sds-callout-incident').value)||1));const alarmText=document.getElementById('sds-callout-text').value.trim()||'ALARM';const rawhex=document.getElementById('sds-callout-raw').value.trim();wsSend({type:'sds_callout',dest_issi:dest,source_issi:source,incident,message:alarmText,raw_hex:rawhex});closeSdsModal();return;}const msg=document.getElementById('sds-msg').value.trim();if(!msg)return;wsSend({type:'sds',dest_issi:dest,message:msg});closeSdsModal();}
 function openDgna(issi){document.getElementById('dgna-issi').value=issi;document.getElementById('dgna-gssi').value='';const cur=document.getElementById('dgna-current');const gl=(state.ms[issi]&&state.ms[issi].groups)||[];cur.innerHTML=gl.length?gl.slice().sort((a,b)=>a-b).map(g=>`<span class="badge badge-blue" style="font-size:10px">${g}</span>`).join(''):'<span class="badge badge-dim">—</span>';document.getElementById('dgna-modal').classList.add('open');}
 function closeDgnaModal(){document.getElementById('dgna-modal').classList.remove('open');}
 function sendDgna(attach){const issi=parseInt(document.getElementById('dgna-issi').value),gssi=parseInt(document.getElementById('dgna-gssi').value);if(!issi||!gssi)return;wsSend({type:'dgna',issi,gssi,attach});closeDgnaModal();}
@@ -5174,6 +6234,117 @@ function renderHealthTab(h){
   });
 }
 
+let healthIntegrationState={asterisk:null,dapnet:null,geoalarm:null,lastLoad:0};
+function integrationHealthCard(title,icon,level,detail,extra){
+  const col=healthColor(level);
+  const card=document.createElement('div');
+  card.style.cssText='border:1px solid var(--border,#2a2f3a);border-left:4px solid '+col+';border-radius:12px;padding:14px 16px;background:var(--bg2,#161a22)';
+  card.innerHTML=
+    '<div style="display:flex;align-items:center;gap:8px">'
+      + '<span style="font-size:18px">'+icon+'</span>'
+      + '<span style="font-weight:700;color:var(--text);flex:1">'+escHtml(title)+'</span>'
+      + '<span style="font-size:11px;font-weight:700;letter-spacing:.5px;color:'+col+';border:1px solid '+col+';border-radius:6px;padding:2px 8px">'+level.toUpperCase()+'</span>'
+    + '</div>'
+    + '<div style="margin-top:8px;font-size:13px;color:var(--text2,#9aa4b2)"><span style="opacity:.6">Status:</span> '+escHtml(detail||'')+'</div>'
+    + (extra?'<div style="margin-top:6px;font-size:13px;color:var(--text2,#9aa4b2);line-height:1.5">'+escHtml(extra)+'</div>':'');
+  return card;
+}
+function classifyAsteriskHealth(data){
+  const c=(data&&data.config)||{},rt=(data&&data.runtime)||{};
+  const enabled=!!(c.enabled||rt.enabled);
+  if(!enabled)return {level:'ok',detail:'disabled',extra:'SIP bridge is configured but not active.'};
+  const reg=String(rt.register_status||'').toLowerCase();
+  const dialogs=rt.active_dialogs??0;
+  const err=rt.last_error||'';
+  let level='ok';
+  if(err)level='degraded';
+  if(c.register && reg && !/(registered|reachable|ok|disabled)/.test(reg))level='degraded';
+  const detail=(rt.register_status||'enabled')+' · '+dialogs+' active dialog(s)';
+  const extra=err?('Last error: '+err):('Remote '+(rt.remote||c.remote||'—')+' · codec '+(rt.codec||c.codec||'—'));
+  return {level,detail,extra};
+}
+function classifyDapnetHealth(data){
+  if(!data||!data.enabled)return {level:'ok',detail:'disabled',extra:'DAPNET worker is not active.'};
+  const rt=data.runtime||{};
+  const paths=[];
+  if(data.forward_sds||rt.forward_sds)paths.push('SDS');
+  if(data.forward_callout||rt.forward_callout)paths.push('TPG2200');
+  if(data.forward_telegram||rt.forward_telegram)paths.push('Telegram');
+  let level='ok';
+  const notes=[];
+  const rwthStatus=String(rt.rwth_core_status||'').toLowerCase();
+  const lastError=rt.last_error||'';
+  if(data.rwth_core_enabled){
+    if(!data.rwth_core_callsign)notes.push('RWTH callsign missing');
+    if(!data.rwth_core_authkey_set)notes.push('RWTH authkey missing');
+    if(lastError)notes.push('Last error: '+lastError);
+    if(rwthStatus && !/(logged in|connected)/.test(rwthStatus))notes.push('RWTH status '+rt.rwth_core_status);
+  } else {
+    notes.push('RWTH receive feed disabled');
+  }
+  if(!paths.length)notes.push('no forwarding path enabled');
+  if(notes.length)level='degraded';
+  const status=rt.rwth_core_status||(data.rwth_core_enabled?'enabled':'disabled');
+  const detail='RWTH '+status+' · '+(paths.length?paths.join(', '):'no forwarding');
+  const extra=notes.length?notes.join(' · '):('Host '+(rt.endpoint||((data.rwth_core_host||'—')+':'+(data.rwth_core_port||'—')))+' · seen '+(rt.seen_messages??0)+(rt.last_rx?' · last RX '+rt.last_rx:''));
+  return {level,detail,extra};
+}
+function classifyGeoalarmHealth(data){
+  if(!data||!data.enabled)return {level:'ok',detail:'disabled',extra:'GeoAlarm is not active.'};
+  const rt=data.runtime||{};
+  const err=rt.last_error||'';
+  const paths=[];
+  if(data.forward_tpg2200||rt.forward_tpg2200)paths.push('TPG2200');
+  if(data.forward_sds||rt.forward_sds)paths.push('SDS');
+  if(data.forward_sip||rt.forward_sip)paths.push('SIP');
+  if(data.forward_telegram||rt.forward_telegram)paths.push('Telegram');
+  const notes=[];
+  if(!paths.length)notes.push('no forwarding path enabled');
+  if(!data.trigger_tetra&&!data.trigger_meshcom)notes.push('no input source enabled');
+  if(err)notes.push('Last error: '+err);
+  const level=notes.length?'degraded':'ok';
+  const detail=(rt.seen_positions??0)+' position(s) · '+(rt.alarm_count??0)+' alarm(s)';
+  const extra=notes.length?notes.join(' · '):('Center '+(rt.center||'—')+' · radius '+Number(rt.radius_m||data.radius_m||0).toFixed(0)+' m · routes '+paths.join(', '));
+  return {level,detail,extra};
+}
+function renderHealthIntegrations(){
+  const grid=document.getElementById('health-integrations-grid');
+  if(!grid)return;
+  grid.innerHTML='';
+  if(healthIntegrationState.asterisk){
+    const a=classifyAsteriskHealth(healthIntegrationState.asterisk);
+    grid.appendChild(integrationHealthCard('Asterisk SIP','☎',a.level,a.detail,a.extra));
+  } else {
+    grid.appendChild(integrationHealthCard('Asterisk SIP','☎','degraded','status unavailable','Open the Asterisk SIP page or wait for the next refresh.'));
+  }
+  if(healthIntegrationState.dapnet){
+    const d=classifyDapnetHealth(healthIntegrationState.dapnet);
+    grid.appendChild(integrationHealthCard('DAPNET','📟',d.level,d.detail,d.extra));
+  } else {
+    grid.appendChild(integrationHealthCard('DAPNET','📟','degraded','status unavailable','Open the DAPNET page or wait for the next refresh.'));
+  }
+  if(healthIntegrationState.geoalarm){
+    const g=classifyGeoalarmHealth(healthIntegrationState.geoalarm);
+    grid.appendChild(integrationHealthCard('GeoAlarm','◎',g.level,g.detail,g.extra));
+  } else {
+    grid.appendChild(integrationHealthCard('GeoAlarm','◎','degraded','status unavailable','Open the GeoAlarm page or wait for the next refresh.'));
+  }
+}
+async function loadHealthIntegrations(){
+  healthIntegrationState.lastLoad=Date.now();
+  try{
+    const [ast,dap,geo]=await Promise.all([
+      fetch('/api/asterisk/status').then(r=>r.ok?r.json():null).catch(()=>null),
+      fetch('/api/dapnet').then(r=>r.ok?r.json():null).catch(()=>null),
+      fetch('/api/geoalarm').then(r=>r.ok?r.json():null).catch(()=>null)
+    ]);
+    healthIntegrationState.asterisk=ast;
+    healthIntegrationState.dapnet=dap;
+    healthIntegrationState.geoalarm=geo;
+  }catch{}
+  renderHealthIntegrations();
+}
+
 function handleHealth(h){
   // Topbar station-health badge: colour + label by overall level, details in the tooltip.
   const badge = document.getElementById('health-badge');
@@ -5194,6 +6365,9 @@ function handleHealth(h){
   badge.title = tip;
   // Also refresh the full Health "Looking Glass" tab.
   renderHealthTab(h);
+  if(document.getElementById('page-health')?.classList.contains('active') && Date.now()-healthIntegrationState.lastLoad>10000){
+    loadHealthIntegrations();
+  }
 }
 
 function handleSysHealth(msg){

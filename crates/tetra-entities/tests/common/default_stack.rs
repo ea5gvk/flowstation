@@ -1,5 +1,7 @@
 use tetra_config::bluestation::{
-    CfgCellInfo, CfgEmergency, CfgHealth, CfgNetInfo, CfgPhyIo, CfgRecovery, CfgSecurity, CfgWxService, PhyBackend, StackConfig, StackMode,
+    CfgAsterisk, CfgCellInfo, CfgDapnet, CfgEmergency, CfgGeoalarm, CfgHealth, CfgNetInfo, CfgPhyIo,
+    CfgRecovery, CfgSecurity, CfgSnomNotify, CfgTpg2200Action, CfgWxService, PhyBackend, StackConfig,
+    StackMode,
 };
 use tetra_core::{freqs::FreqInfo, ranges::SortedDisjointSsiRanges};
 
@@ -20,6 +22,11 @@ pub fn default_test_config_bs() -> StackConfig {
         net: net_info,
         cell: cell_info,
         brew: None,
+        asterisk: CfgAsterisk::default(),
+        dapnet: CfgDapnet::default(),
+        geoalarm: CfgGeoalarm::default(),
+        tpg2200_action: CfgTpg2200Action::default(),
+        snom_notify: CfgSnomNotify::default(),
         dashboard: None,
         telemetry: None,
         control: None,

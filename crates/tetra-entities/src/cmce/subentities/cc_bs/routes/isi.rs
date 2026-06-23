@@ -14,8 +14,14 @@ impl CcBsSubentity {
             .map(|(id, call)| (*id, call.clone()))
     }
 
-    pub(super) fn rx_network_circuit_setup_request(&mut self, queue: &mut MessageQueue, brew_uuid: uuid::Uuid, call: NetworkCircuitCall) {
-        self.fsm_on_network_circuit_setup_request(queue, brew_uuid, call);
+    pub(super) fn rx_network_circuit_setup_request(
+        &mut self,
+        queue: &mut MessageQueue,
+        network_entity: TetraEntity,
+        brew_uuid: uuid::Uuid,
+        call: NetworkCircuitCall,
+    ) {
+        self.fsm_on_network_circuit_setup_request(queue, network_entity, brew_uuid, call);
     }
 
     pub(super) fn rx_network_circuit_setup_accept(&mut self, brew_uuid: uuid::Uuid) {

@@ -155,7 +155,7 @@ impl CcBsSubentity {
             queue.push_back(SapMsg {
                 sap: Sap::Control,
                 src: TetraEntity::Cmce,
-                dest: TetraEntity::Brew,
+                dest: call.network_entity,
                 msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSimplexGranted {
                     brew_uuid,
                     grant: TransmissionGrant::Granted.into_raw() as u8,
@@ -181,7 +181,7 @@ impl CcBsSubentity {
             queue.push_back(SapMsg {
                 sap: Sap::Control,
                 src: TetraEntity::Cmce,
-                dest: TetraEntity::Brew,
+                dest: call.network_entity,
                 msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSimplexIdle {
                     brew_uuid,
                     grant: TransmissionGrant::NotGranted.into_raw() as u8,
@@ -832,7 +832,7 @@ impl CcBsSubentity {
             queue.push_back(SapMsg {
                 sap: Sap::Control,
                 src: TetraEntity::Cmce,
-                dest: TetraEntity::Brew,
+                dest: call.network_entity,
                 msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitDtmf {
                     brew_uuid,
                     length_bits: 8,

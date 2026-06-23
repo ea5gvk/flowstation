@@ -2,7 +2,11 @@ use serde::Deserialize;
 use std::sync::{Arc, RwLock};
 use tetra_core::freqs::FreqInfo;
 
-use crate::bluestation::{CfgCellInfo, CfgControl, CfgEmergency, CfgHealth, CfgNetInfo, CfgPhyIo, CfgRecovery, CfgSecurity, CfgWxService, PhyBackend, StackState};
+use crate::bluestation::{
+    CfgAsterisk, CfgCellInfo, CfgControl, CfgDapnet, CfgEmergency, CfgHealth, CfgGeoalarm,
+    CfgNetInfo, CfgPhyIo, CfgRecovery, CfgSecurity, CfgSnomNotify, CfgTpg2200Action, CfgWxService,
+    PhyBackend, StackState,
+};
 
 use super::sec_dashboard::CfgDashboard;
 use super::sec_brew::CfgBrew;
@@ -71,6 +75,21 @@ pub struct StackConfig {
 
     /// Brew protocol (TetraPack/BrandMeister) configuration
     pub brew: Option<CfgBrew>,
+
+    /// Asterisk SIP/RTP bridge configuration.
+    pub asterisk: CfgAsterisk,
+
+    /// DAPNET inbound-message forwarding configuration.
+    pub dapnet: CfgDapnet,
+
+    /// Geo-fence alarm configuration for TETRA/MeshCom positions.
+    pub geoalarm: CfgGeoalarm,
+
+    /// Token-protected ActionURL trigger for Motorola TPG2200 Call-Out.
+    pub tpg2200_action: CfgTpg2200Action,
+
+    /// Snom XML minibrowser notifications via Asterisk AMI PJSIPNotify.
+    pub snom_notify: CfgSnomNotify,
 
     /// Dashboard HTTP server configuration (None = disabled)
     pub dashboard: Option<CfgDashboard>,
@@ -301,6 +320,119 @@ impl SharedConfig {
                 // Health alerts aren't part of the dashboard live-edit override yet — take the
                 // base config value so the field is always populated.
                 alert_health: base.alert_health,
+            }
+        } else {
+            base
+        }
+    }
+
+    /// Effective DAPNET settings: the dashboard runtime override if present, otherwise the config
+    /// file values. Returns an owned [`CfgDapnet`] so callers don't hold the state lock.
+    pub fn effective_dapnet(&self) -> crate::bluestation::CfgDapnet {
+        let base = self.cfg.dapnet.clone();
+        if let Some(o) = self.state_read().dapnet_override.as_ref() {
+            crate::bluestation::CfgDapnet {
+                enabled: o.enabled,
+                api_url: o.api_url.clone(),
+                username: o.username.clone(),
+                password: crate::bluestation::SecretField::from(o.password.clone()),
+                poll_interval_secs: o.poll_interval_secs.max(1),
+                forward_sds: o.forward_sds,
+                forward_callout: o.forward_callout,
+                forward_telegram: o.forward_telegram,
+                sds_source_issi: o.sds_source_issi,
+                sds_dest_issi: o.sds_dest_issi,
+                sds_dest_is_group: o.sds_dest_is_group,
+                ric_issi_routes: o.ric_issi_routes.clone(),
+                ric_gssi_routes: o.ric_gssi_routes.clone(),
+                sds_allowed_rics: o.sds_allowed_rics.clone(),
+                callout_allowed_rics: o.callout_allowed_rics.clone(),
+                telegram_allowed_rics: o.telegram_allowed_rics.clone(),
+                callout_source_issi: o.callout_source_issi,
+                callout_dest_issi: o.callout_dest_issi,
+                callout_incident_base: o.callout_incident_base.clamp(1, 256),
+                callout_text_prefix: o.callout_text_prefix.clone(),
+                telegram_prefix: o.telegram_prefix.clone(),
+                rwth_core_enabled: o.rwth_core_enabled,
+                rwth_core_host: o.rwth_core_host.clone(),
+                rwth_core_port: o.rwth_core_port,
+                rwth_core_device: o.rwth_core_device.clone(),
+                rwth_core_version: o.rwth_core_version.clone(),
+                rwth_core_callsign: o.rwth_core_callsign.clone(),
+                rwth_core_authkey: crate::bluestation::SecretField::from(o.rwth_core_authkey.clone()),
+                rwth_messages_limit: o.rwth_messages_limit.max(1),
+            }
+        } else {
+            base
+        }
+    }
+
+    /// Effective GeoAlarm settings: the dashboard runtime override if present, otherwise the
+    /// config file values. Returns an owned [`CfgGeoalarm`] so callers don't hold the state lock.
+    pub fn effective_geoalarm(&self) -> crate::bluestation::CfgGeoalarm {
+        let base = self.cfg.geoalarm.clone();
+        if let Some(o) = self.state_read().geoalarm_override.as_ref() {
+            crate::bluestation::CfgGeoalarm {
+                enabled: o.enabled,
+                flowstation_lat: o.flowstation_lat,
+                flowstation_lon: o.flowstation_lon,
+                radius_m: if o.radius_m.is_finite() && o.radius_m > 0.0 {
+                    o.radius_m
+                } else {
+                    base.radius_m
+                },
+                cooldown_secs: o.cooldown_secs.clamp(1, 86_400),
+                trigger_tetra: o.trigger_tetra,
+                trigger_meshcom: o.trigger_meshcom,
+                forward_tpg2200: o.forward_tpg2200,
+                forward_sds: o.forward_sds,
+                forward_sip: o.forward_sip,
+                forward_telegram: o.forward_telegram,
+                tetra_issi_whitelist: o.tetra_issi_whitelist.clone(),
+                tetra_issi_blacklist: o.tetra_issi_blacklist.clone(),
+                meshcom_source_whitelist: o.meshcom_source_whitelist.clone(),
+                meshcom_source_blacklist: o.meshcom_source_blacklist.clone(),
+                sds_source_issi: o.sds_source_issi.max(1),
+                sds_dest_issi: o.sds_dest_issi,
+                sds_dest_is_group: o.sds_dest_is_group,
+                tpg2200_source_issi: o.tpg2200_source_issi.max(1),
+                tpg2200_dest_issi: o.tpg2200_dest_issi,
+                tpg2200_incident_base: o.tpg2200_incident_base.clamp(1, 256),
+                tpg2200_text_prefix: o.tpg2200_text_prefix.clone(),
+                tpg2200_max_text_chars: o.tpg2200_max_text_chars.clamp(8, 160),
+                sip_title_prefix: o.sip_title_prefix.clone(),
+                telegram_prefix: o.telegram_prefix.clone(),
+            }
+        } else {
+            base
+        }
+    }
+
+    /// Effective Snom XML NOTIFY settings: the dashboard runtime override if present, otherwise
+    /// the config file values. Returns an owned [`CfgSnomNotify`] so callers don't hold the
+    /// state lock while sending AMI requests.
+    pub fn effective_snom_notify(&self) -> crate::bluestation::CfgSnomNotify {
+        let base = self.cfg.snom_notify.clone();
+        if let Some(o) = self.state_read().snom_notify_override.as_ref() {
+            crate::bluestation::CfgSnomNotify {
+                enabled: o.enabled,
+                ami_host: o.ami_host.clone(),
+                ami_port: o.ami_port,
+                ami_username: o.ami_username.clone(),
+                ami_password: crate::bluestation::SecretField::from(o.ami_password.clone()),
+                endpoints: o.endpoints.clone(),
+                notify_sds: o.notify_sds,
+                notify_dapnet: o.notify_dapnet,
+                notify_telegram: o.notify_telegram,
+                sds_directions: o.sds_directions.clone(),
+                dapnet_allowed_rics: o.dapnet_allowed_rics.clone(),
+                sds_allowed_issis: o.sds_allowed_issis.clone(),
+                title_prefix: o.title_prefix.clone(),
+                notify_event: o.notify_event.clone(),
+                content_type: o.content_type.clone(),
+                subscription_state: o.subscription_state.clone(),
+                max_text_chars: o.max_text_chars.clamp(40, 2000),
+                connect_timeout_secs: o.connect_timeout_secs.clamp(1, 30),
             }
         } else {
             base

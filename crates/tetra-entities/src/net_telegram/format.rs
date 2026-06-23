@@ -170,6 +170,22 @@ pub fn test_message(station: &StationInfo) -> String {
     )
 }
 
+/// A DAPNET message forwarded by the DAPNET worker.
+pub fn dapnet(station: &StationInfo, prefix: &str, callsign: &str, text: &str) -> String {
+    let prefix = truncate_chars(prefix.trim(), 32);
+    let callsign = truncate_chars(callsign.trim(), 64);
+    let text = truncate_chars(text.trim(), 900);
+    frame(
+        "📟",
+        if prefix.is_empty() { "DAPNET" } else { &prefix },
+        &[
+            format!("Callsign/recipient: <code>{}</code>", escape_html(&callsign)),
+            format!("Message: {}", escape_html(&text)),
+        ],
+        station,
+    )
+}
+
 /// Station health changed level. Lists the domains that are not Ok, plus the last action taken.
 pub fn health(station: &StationInfo, snap: &crate::health::HealthSnapshot) -> String {
     use crate::health::HealthLevel;
@@ -242,6 +258,14 @@ mod tests {
         assert!(empty.contains("binary"));
         let textual = lip_beacon(&station(), 1, 2, "4426.12N 02606.55E");
         assert!(textual.contains("4426.12N"));
+    }
+
+    #[test]
+    fn dapnet_message_contains_prefix_callsign_and_text() {
+        let m = dapnet(&station(), "DAPNET", "DL1ABC", "Test <msg>");
+        assert!(m.contains("<b>DAPNET</b>"));
+        assert!(m.contains("<code>DL1ABC</code>"));
+        assert!(m.contains("Test &lt;msg&gt;"));
     }
 
     #[test]

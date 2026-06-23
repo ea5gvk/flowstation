@@ -177,6 +177,228 @@ pub struct TelegramRuntimeOverride {
     pub alert_critical_logs: bool,
 }
 
+/// Runtime override for DAPNET receive/send/forwarding settings, edited from the dashboard.
+///
+/// Mirrors `[dapnet]`. When present, it takes precedence over the config file so routing edits
+/// apply immediately; the dashboard also writes the values back to TOML for persistence.
+#[derive(Debug, Clone, Default)]
+pub struct DapnetRuntimeOverride {
+    pub enabled: bool,
+    pub api_url: String,
+    pub username: String,
+    pub password: String,
+    pub poll_interval_secs: u64,
+    pub forward_sds: bool,
+    pub forward_callout: bool,
+    pub forward_telegram: bool,
+    pub sds_source_issi: u32,
+    pub sds_dest_issi: u32,
+    pub sds_dest_is_group: bool,
+    pub ric_issi_routes: std::collections::BTreeMap<u32, u32>,
+    pub ric_gssi_routes: std::collections::BTreeMap<u32, u32>,
+    pub sds_allowed_rics: std::collections::BTreeSet<u32>,
+    pub callout_allowed_rics: std::collections::BTreeSet<u32>,
+    pub telegram_allowed_rics: std::collections::BTreeSet<u32>,
+    pub callout_source_issi: u32,
+    pub callout_dest_issi: u32,
+    pub callout_incident_base: u16,
+    pub callout_text_prefix: String,
+    pub telegram_prefix: String,
+    pub rwth_core_enabled: bool,
+    pub rwth_core_host: String,
+    pub rwth_core_port: u16,
+    pub rwth_core_device: String,
+    pub rwth_core_version: String,
+    pub rwth_core_callsign: String,
+    pub rwth_core_authkey: String,
+    pub rwth_messages_limit: usize,
+}
+
+/// Runtime override for GeoAlarm settings, edited from the dashboard.
+///
+/// Mirrors `[geoalarm]`. When present, it takes precedence over the config file so radius,
+/// filters and forwarding edits apply immediately; the dashboard also writes the values back to
+/// TOML for persistence.
+#[derive(Debug, Clone, Default)]
+pub struct GeoalarmRuntimeOverride {
+    pub enabled: bool,
+    pub flowstation_lat: f64,
+    pub flowstation_lon: f64,
+    pub radius_m: f64,
+    pub cooldown_secs: u64,
+    pub trigger_tetra: bool,
+    pub trigger_meshcom: bool,
+    pub forward_tpg2200: bool,
+    pub forward_sds: bool,
+    pub forward_sip: bool,
+    pub forward_telegram: bool,
+    pub tetra_issi_whitelist: std::collections::BTreeSet<u32>,
+    pub tetra_issi_blacklist: std::collections::BTreeSet<u32>,
+    pub meshcom_source_whitelist: std::collections::BTreeSet<String>,
+    pub meshcom_source_blacklist: std::collections::BTreeSet<String>,
+    pub sds_source_issi: u32,
+    pub sds_dest_issi: u32,
+    pub sds_dest_is_group: bool,
+    pub tpg2200_source_issi: u32,
+    pub tpg2200_dest_issi: u32,
+    pub tpg2200_incident_base: u16,
+    pub tpg2200_text_prefix: String,
+    pub tpg2200_max_text_chars: usize,
+    pub sip_title_prefix: String,
+    pub telegram_prefix: String,
+}
+
+/// Runtime override for Snom XML NOTIFY settings, edited from the dashboard.
+///
+/// Mirrors `[snom_notify]`. When present, it takes precedence over the config file so
+/// notification routing edits apply immediately; the dashboard also writes the values
+/// back to TOML for persistence.
+#[derive(Debug, Clone, Default)]
+pub struct SnomNotifyRuntimeOverride {
+    pub enabled: bool,
+    pub ami_host: String,
+    pub ami_port: u16,
+    pub ami_username: String,
+    pub ami_password: String,
+    pub endpoints: Vec<String>,
+    pub notify_sds: bool,
+    pub notify_dapnet: bool,
+    pub notify_telegram: bool,
+    pub sds_directions: Vec<String>,
+    pub dapnet_allowed_rics: std::collections::BTreeSet<u32>,
+    pub sds_allowed_issis: std::collections::BTreeSet<u32>,
+    pub title_prefix: String,
+    pub notify_event: String,
+    pub content_type: String,
+    pub subscription_state: String,
+    pub max_text_chars: usize,
+    pub connect_timeout_secs: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct AsteriskRuntimeStatus {
+    pub configured: bool,
+    pub enabled: bool,
+    pub register_status: String,
+    pub sip_listen: String,
+    pub remote: String,
+    pub rtp_port_range: String,
+    pub codec: String,
+    pub active_dialogs: usize,
+    pub last_rx: Option<String>,
+    pub last_tx: Option<String>,
+    pub last_error: Option<String>,
+}
+
+impl Default for AsteriskRuntimeStatus {
+    fn default() -> Self {
+        Self {
+            configured: false,
+            enabled: false,
+            register_status: "disabled".to_string(),
+            sip_listen: String::new(),
+            remote: String::new(),
+            rtp_port_range: String::new(),
+            codec: "PCMU".to_string(),
+            active_dialogs: 0,
+            last_rx: None,
+            last_tx: None,
+            last_error: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DapnetRuntimeStatus {
+    pub configured: bool,
+    pub enabled: bool,
+    pub rwth_core_enabled: bool,
+    pub rwth_core_status: String,
+    pub endpoint: String,
+    pub callsign: String,
+    pub forward_sds: bool,
+    pub forward_callout: bool,
+    pub forward_telegram: bool,
+    pub seen_messages: usize,
+    pub last_rx: Option<String>,
+    pub last_error: Option<String>,
+}
+
+impl Default for DapnetRuntimeStatus {
+    fn default() -> Self {
+        Self {
+            configured: false,
+            enabled: false,
+            rwth_core_enabled: false,
+            rwth_core_status: "disabled".to_string(),
+            endpoint: String::new(),
+            callsign: String::new(),
+            forward_sds: false,
+            forward_callout: false,
+            forward_telegram: false,
+            seen_messages: 0,
+            last_rx: None,
+            last_error: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GeoalarmEventStatus {
+    pub ts: String,
+    pub source: String,
+    pub device: String,
+    pub lat: f64,
+    pub lon: f64,
+    pub distance_m: f64,
+    pub inside_radius: bool,
+    pub alarmed: bool,
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GeoalarmRuntimeStatus {
+    pub configured: bool,
+    pub enabled: bool,
+    pub center: String,
+    pub radius_m: f64,
+    pub trigger_tetra: bool,
+    pub trigger_meshcom: bool,
+    pub forward_tpg2200: bool,
+    pub forward_sds: bool,
+    pub forward_sip: bool,
+    pub forward_telegram: bool,
+    pub seen_positions: u64,
+    pub alarm_count: u64,
+    pub last_position: Option<String>,
+    pub last_alarm: Option<String>,
+    pub last_error: Option<String>,
+    pub events: Vec<GeoalarmEventStatus>,
+}
+
+impl Default for GeoalarmRuntimeStatus {
+    fn default() -> Self {
+        Self {
+            configured: false,
+            enabled: false,
+            center: String::new(),
+            radius_m: 0.0,
+            trigger_tetra: false,
+            trigger_meshcom: false,
+            forward_tpg2200: false,
+            forward_sds: false,
+            forward_sip: false,
+            forward_telegram: false,
+            seen_positions: 0,
+            alarm_count: 0,
+            last_position: None,
+            last_alarm: None,
+            last_error: None,
+            events: Vec::new(),
+        }
+    }
+}
+
 /// Mutable, stack-editable state (mutex-protected).
 #[derive(Debug, Clone)]
 pub struct StackState {
@@ -201,6 +423,20 @@ pub struct StackState {
     pub wx_override: Option<WxRuntimeOverride>,
     /// Runtime override for Telegram alerts (dashboard editing). See TelegramRuntimeOverride.
     pub telegram_override: Option<TelegramRuntimeOverride>,
+    /// Runtime override for DAPNET settings (dashboard editing). See DapnetRuntimeOverride.
+    pub dapnet_override: Option<DapnetRuntimeOverride>,
+    /// Runtime override for GeoAlarm settings (dashboard editing). See GeoalarmRuntimeOverride.
+    pub geoalarm_override: Option<GeoalarmRuntimeOverride>,
+    /// Runtime override for Snom XML NOTIFY settings. See SnomNotifyRuntimeOverride.
+    pub snom_notify_override: Option<SnomNotifyRuntimeOverride>,
+    /// Next TPG2200 ActionURL incident number. Initialised lazily from `[tpg2200_action]`.
+    pub tpg2200_action_next_incident: Option<u16>,
+    /// Runtime Asterisk SIP/RTP bridge status for `/api/asterisk/status` and the dashboard tab.
+    pub asterisk_status: AsteriskRuntimeStatus,
+    /// Runtime DAPNET receiver/forwarding status for `/api/dapnet` and the Health tab.
+    pub dapnet_status: DapnetRuntimeStatus,
+    /// Runtime GeoAlarm status for `/api/geoalarm`.
+    pub geoalarm_status: GeoalarmRuntimeStatus,
     /// Live map "identity currently reachable on a traffic channel" → (DL timeslot, usage_marker),
     /// republished every tick by CMCE call control from the live call tables (so it is never
     /// stale). Keyed by GSSI for active group calls and by each participant ISSI for connected
@@ -316,6 +552,13 @@ impl Default for StackState {
             issi_whitelist_override: None,
             wx_override: None,
             telegram_override: None,
+            dapnet_override: None,
+            geoalarm_override: None,
+            snom_notify_override: None,
+            tpg2200_action_next_incident: None,
+            asterisk_status: AsteriskRuntimeStatus::default(),
+            dapnet_status: DapnetRuntimeStatus::default(),
+            geoalarm_status: GeoalarmRuntimeStatus::default(),
             active_call_ts: std::collections::HashMap::new(),
             ee_monitoring_windows: std::collections::HashMap::new(),
         }

@@ -11,6 +11,11 @@ use crate::bluestation::{CellInfoDto, CfgControlDto, NetInfoDto, apply_control_p
 
 use super::config::{StackConfig, StackMode};
 use super::sec_brew::{CfgBrewDto, apply_brew_patch};
+use super::sec_asterisk::{CfgAsteriskDto, apply_asterisk_patch};
+use super::sec_dapnet::{CfgDapnetDto, apply_dapnet_patch};
+use super::sec_geoalarm::{CfgGeoalarmDto, apply_geoalarm_patch};
+use super::sec_tpg2200_action::{CfgTpg2200ActionDto, apply_tpg2200_action_patch};
+use super::sec_snom_notify::{CfgSnomNotifyDto, apply_snom_notify_patch};
 use super::sec_dashboard::{CfgDashboardDto, apply_dashboard_patch};
 use super::sec_emergency::{CfgEmergencyDto, apply_emergency_patch};
 use super::sec_health::{CfgHealthDto, apply_health_patch};
@@ -117,6 +122,41 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
         return Err(format!("Unrecognized fields in brew config: {:?}", sorted_keys(&brew.extra)).into());
     }
 
+    // Optional asterisk section
+    if let Some(ref asterisk) = root.asterisk
+        && !asterisk.extra.is_empty()
+    {
+        return Err(format!("Unrecognized fields in asterisk config: {:?}", sorted_keys(&asterisk.extra)).into());
+    }
+
+    // Optional dapnet section
+    if let Some(ref dapnet) = root.dapnet
+        && !dapnet.extra.is_empty()
+    {
+        return Err(format!("Unrecognized fields in dapnet config: {:?}", sorted_keys(&dapnet.extra)).into());
+    }
+
+    // Optional geoalarm section
+    if let Some(ref geoalarm) = root.geoalarm
+        && !geoalarm.extra.is_empty()
+    {
+        return Err(format!("Unrecognized fields in geoalarm config: {:?}", sorted_keys(&geoalarm.extra)).into());
+    }
+
+    // Optional tpg2200_action section
+    if let Some(ref action) = root.tpg2200_action
+        && !action.extra.is_empty()
+    {
+        return Err(format!("Unrecognized fields in tpg2200_action config: {:?}", sorted_keys(&action.extra)).into());
+    }
+
+    // Optional snom_notify section
+    if let Some(ref snom) = root.snom_notify
+        && !snom.extra.is_empty()
+    {
+        return Err(format!("Unrecognized fields in snom_notify config: {:?}", sorted_keys(&snom.extra)).into());
+    }
+
     // Optional telemetry section
     if let Some(ref telemetry) = root.telemetry
         && !telemetry.extra.is_empty()
@@ -189,6 +229,11 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
         net: net_dto_to_cfg(root.net_info),
         cell: cell_cfg,
         brew: None,
+        asterisk: apply_asterisk_patch(root.asterisk.unwrap_or_default())?,
+        dapnet: apply_dapnet_patch(root.dapnet.unwrap_or_default())?,
+        geoalarm: apply_geoalarm_patch(root.geoalarm.unwrap_or_default())?,
+        tpg2200_action: apply_tpg2200_action_patch(root.tpg2200_action.unwrap_or_default())?,
+        snom_notify: apply_snom_notify_patch(root.snom_notify.unwrap_or_default())?,
         dashboard: None,
         telemetry: None,
         control: None,
@@ -260,6 +305,11 @@ struct TomlConfigRoot {
     cell_info: CellInfoDto,
 
     brew: Option<CfgBrewDto>,
+    asterisk: Option<CfgAsteriskDto>,
+    dapnet: Option<CfgDapnetDto>,
+    geoalarm: Option<CfgGeoalarmDto>,
+    tpg2200_action: Option<CfgTpg2200ActionDto>,
+    snom_notify: Option<CfgSnomNotifyDto>,
     dashboard: Option<CfgDashboardDto>,
     telemetry: Option<CfgTelemetryDto>,
     command: Option<CfgControlDto>,
@@ -367,6 +417,90 @@ ca_cert = "/tmp/ca.der"
 username = "station"
 password = "x"
 
+[asterisk]
+enabled = true
+outbound_prefix = "91"
+strip_outbound_prefix = true
+inbound_prefix = "T"
+register = true
+codec = "PCMU"
+service_numbers = ["600", "601"]
+rtp_port_min = 30000
+rtp_port_max = 30100
+bind_addr = "0.0.0.0"
+bind_port = 5062
+remote_host = "127.0.0.1"
+remote_port = 5060
+contact_host = "127.0.0.1"
+from_domain = "127.0.0.1"
+local_user = "flowstation"
+auth_user = "flowstation"
+password = ""
+realm = "asterisk"
+
+[dapnet]
+enabled = true
+api_url = "https://hampager.de/api/calls"
+username = "dl1abc"
+password = "example"
+poll_interval_secs = 30
+forward_sds = true
+forward_callout = true
+forward_telegram = true
+sds_source_issi = 9999
+sds_dest_issi = 1234567
+sds_dest_is_group = false
+ric_issi_routes = { "0632585" = 2632585, "0x9A70A" = 2632586 }
+ric_gssi_routes = { "0004520" = 80 }
+sds_allowed_rics = ["0632585", "0004520"]
+callout_allowed_rics = ["0004520"]
+telegram_allowed_rics = ["0000200", "0x1C40"]
+callout_source_issi = 9999
+callout_dest_issi = 1234567
+callout_incident_base = 2
+callout_text_prefix = "DAPNET"
+telegram_prefix = "DAPNET"
+rwth_core_enabled = true
+rwth_core_host = "dapnet.afu.rwth-aachen.de"
+rwth_core_port = 43434
+rwth_core_device = "FlowStation"
+rwth_core_version = "1.0"
+rwth_core_callsign = "DL1ABC"
+rwth_core_authkey = "example"
+rwth_messages_limit = 100
+
+[geoalarm]
+enabled = true
+
+[tpg2200_action]
+enabled = true
+token = "example-token"
+source_issi = 9999
+dest_issi = 1234567
+incident_base = 1
+default_text = "ALARM"
+max_text_chars = 80
+
+[snom_notify]
+enabled = true
+ami_host = "127.0.0.1"
+ami_port = 5038
+ami_username = "flowstation"
+ami_password = "example"
+endpoints = ["385"]
+notify_sds = true
+notify_dapnet = true
+notify_telegram = true
+sds_directions = ["rx", "net", "tx"]
+dapnet_allowed_rics = ["0632585", "0000200"]
+sds_allowed_issis = [2632585, 9999]
+title_prefix = "FlowStation"
+notify_event = "xml"
+content_type = "application/snomxml"
+subscription_state = "active;expires=30000"
+max_text_chars = 240
+connect_timeout_secs = 3
+
 [recovery]
 enabled = true
 issi_allowlist = []
@@ -390,9 +524,32 @@ sds_queue_critical = 128
 "#;
         let cfg = from_toml_str(toml).unwrap_or_else(|e| panic!("documented optional blocks must parse when uncommented: {e}"));
         assert!(cfg.recovery.enabled);
+        assert!(cfg.tpg2200_action.enabled);
+        assert_eq!(cfg.tpg2200_action.dest_issi, 1234567);
+        assert!(cfg.snom_notify.enabled);
+        assert_eq!(cfg.snom_notify.endpoints, vec!["385"]);
+        assert!(cfg.snom_notify.notify_sds);
+        assert!(cfg.snom_notify.sds_directions.iter().any(|d| d == "tx"));
+        assert!(cfg.snom_notify.dapnet_allowed_rics.contains(&632585));
+        assert!(cfg.snom_notify.sds_allowed_issis.contains(&2632585));
+        assert_eq!(cfg.snom_notify.content_type, "application/snomxml");
         assert_eq!(cfg.recovery.max_replay_attempts, 150);
         assert!(cfg.health.enabled);
         assert_eq!(cfg.health.core_stall_secs, 10);
+        assert!(cfg.asterisk.enabled);
+        assert_eq!(cfg.asterisk.service_numbers, vec!["600".to_string(), "601".to_string()]);
+        assert!(cfg.dapnet.enabled);
+        assert!(cfg.dapnet.rwth_core_enabled);
+        assert_eq!(cfg.dapnet.callout_incident_base, 2);
+        assert_eq!(cfg.dapnet.ric_issi_routes.get(&632585), Some(&2632585));
+        assert_eq!(cfg.dapnet.ric_issi_routes.get(&632586), Some(&2632586));
+        assert_eq!(cfg.dapnet.ric_gssi_routes.get(&4520), Some(&80));
+        assert!(cfg.dapnet.sds_allowed_rics.contains(&632585));
+        assert!(cfg.dapnet.sds_allowed_rics.contains(&4520));
+        assert!(cfg.dapnet.callout_allowed_rics.contains(&4520));
+        assert!(cfg.dapnet.telegram_allowed_rics.contains(&200));
+        assert!(cfg.dapnet.telegram_allowed_rics.contains(&0x1C40));
+        assert!(cfg.geoalarm.enabled);
     }
 
     fn minimal_toml(extra_cell: &str) -> String {

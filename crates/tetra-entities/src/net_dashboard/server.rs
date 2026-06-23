@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex, RwLock};
@@ -10,6 +10,7 @@ use crate::net_dashboard::html::DASHBOARD_HTML;
 use crate::net_dashboard::state::{DashboardState, DashboardStateInner, MsEntry, CallEntry};
 use crate::net_telemetry::TelemetryEvent;
 use crate::net_control::commands::ControlCommand;
+use crate::tpg2200::build_tpg2200_callout_payload;
 
 type CmdSender = crossbeam_channel::Sender<ControlCommand>;
 
@@ -878,6 +879,17 @@ impl DashboardServer {
                         }
                     }
                 }
+                TelemetryEvent::DapnetLog { direction, id, callsign, recipient, text, priority, paths } => {
+                    s.push_dapnet_log(
+                        direction,
+                        id.clone(),
+                        callsign.clone(),
+                        recipient.clone(),
+                        text.clone(),
+                        *priority,
+                        paths.clone(),
+                    );
+                }
             }
         }
         if let Some(json) = msg {
@@ -1007,6 +1019,8 @@ fn event_to_ws_msg(event: &TelemetryEvent) -> Option<String> {
         // Emergency add/remove are broadcast explicitly (transition-gated) from handle_telemetry,
         // so the generic path stays silent — otherwise every periodic re-send would re-broadcast.
         TelemetryEvent::EmergencyAlarm { .. } | TelemetryEvent::EmergencyCancel { .. } => return None,
+        TelemetryEvent::DapnetLog { direction, id, callsign, recipient, text, priority, paths } =>
+            serde_json::json!({"type":"dapnet_log","direction":direction,"id":id,"callsign":callsign,"recipient":recipient,"text":text,"priority":priority,"paths":paths}),
     };
     serde_json::to_string(&v).ok()
 }
@@ -1140,6 +1154,14 @@ fn handle_connection(
     }
     let header_str = String::from_utf8_lossy(&header_buf);
     let req_line = header_str.lines().next().unwrap_or("").to_string();
+
+    // Snom/desk-phone ActionURL endpoint. It has its own token and must work without the
+    // dashboard cookie session, so handle it before the normal dashboard auth gate.
+    if is_tpg2200_action_request(&req_line) {
+        drain_http_headers(&mut stream);
+        serve_tpg2200_action_url(stream, &req_line, &shared_config, &cmd_tx, &state);
+        return;
+    }
 
     // ── Cookie-session auth ──────────────────────────────────────────────────
     // We replaced the browser-native Basic Auth dialog with a form-based login at
@@ -1486,6 +1508,17 @@ fn handle_connection(
             if line == "\r\n" || line.is_empty() || line == "\n" { break; }
         }
         serve_bts_info(buf.into_inner(), &shared_config);
+    } else if req_line.contains("GET /api/asterisk/status") {
+        let mut s = stream;
+        drain_http_headers(&mut s);
+        serve_asterisk_status(s, &shared_config);
+    } else if req_line.contains("GET /api/snom-notify") {
+        let mut s = stream;
+        drain_http_headers(&mut s);
+        serve_snom_notify_get(s, &shared_config);
+    } else if req_line.contains("POST /api/snom-notify") {
+        let (inner, body_str) = read_post_body(stream);
+        serve_snom_notify_post(inner, &shared_config, &config_path, &body_str);
     } else if req_line.contains("GET /api/whitelist") {
         let mut buf = BufReader::new(stream);
         loop {
@@ -1554,6 +1587,31 @@ fn handle_connection(
     } else if req_line.contains("POST /api/telegram") {
         let (inner, body_str) = read_post_body(stream);
         serve_telegram_post(inner, &shared_config, &config_path, &body_str);
+    } else if req_line.contains("DELETE /api/dapnet-log") {
+        let mut s = stream;
+        drain_http_headers(&mut s);
+        serve_dapnet_log_clear(s, &state);
+    } else if req_line.contains("GET /api/dapnet-log") {
+        let mut s = stream;
+        drain_http_headers(&mut s);
+        serve_dapnet_log(s, &state);
+    } else if req_line.contains("POST /api/dapnet/send") {
+        let (inner, body_str) = read_post_body(stream);
+        serve_dapnet_send(inner, &shared_config, &state, &clients, &body_str);
+    } else if req_line.contains("GET /api/dapnet") {
+        let mut s = stream;
+        drain_http_headers(&mut s);
+        serve_dapnet_get(s, &shared_config);
+    } else if req_line.contains("POST /api/dapnet") {
+        let (inner, body_str) = read_post_body(stream);
+        serve_dapnet_post(inner, &shared_config, &config_path, &body_str);
+    } else if req_line.contains("GET /api/geoalarm") {
+        let mut s = stream;
+        drain_http_headers(&mut s);
+        serve_geoalarm_get(s, &shared_config);
+    } else if req_line.contains("POST /api/geoalarm") {
+        let (inner, body_str) = read_post_body(stream);
+        serve_geoalarm_post(inner, &shared_config, &config_path, &body_str);
     } else if req_line.contains("GET /api/config") {
         let mut buf = BufReader::new(stream);
         loop {
@@ -1562,6 +1620,14 @@ fn handle_connection(
             if line == "\r\n" || line.is_empty() || line == "\n" { break; }
         }
         serve_config_get(buf.into_inner(), &config_path);
+    } else if req_line.contains("DELETE /api/sds-log") {
+        let mut buf = BufReader::new(stream);
+        loop {
+            let mut line = String::new();
+            let _ = buf.read_line(&mut line);
+            if line == "\r\n" || line.is_empty() || line == "\n" { break; }
+        }
+        serve_sds_log_clear(buf.into_inner(), &state);
     } else if req_line.contains("GET /api/sds-log") {
         // Return the persisted SDS Log (newest first) as JSON.
         let mut buf = BufReader::new(stream);
@@ -3057,6 +3123,1416 @@ fn serve_login_page(mut stream: TcpStream) {
     );
     let _ = stream.write_all(header.as_bytes());
     let _ = stream.write_all(body.as_bytes());
+}
+
+// ===========================================================================
+// Integration dashboard endpoints — DAPNET / GeoAlarm / Snom NOTIFY / Asterisk
+// plus the TPG2200 ActionURL and DAPNET/SDS log helpers. Ported from the dj2th
+// fork (echolink/meshcom routes intentionally excluded).
+// ===========================================================================
+
+/// DELETE /api/sds-log — clear the persisted SDS Log.
+fn serve_sds_log_clear(stream: TcpStream, state: &DashboardState) {
+    if let Ok(mut s) = state.write() {
+        s.clear_sds_log();
+    }
+    http_json_response(stream, 200, "{\"ok\":true}");
+}
+
+/// GET /api/dapnet-log — the persisted DAPNET Log as a JSON array, newest entry first.
+fn serve_dapnet_log(stream: TcpStream, state: &DashboardState) {
+    let body = {
+        match state.read() {
+            Ok(s) => {
+                let list: Vec<_> = s.dapnet_log.iter().rev().cloned().collect();
+                serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string())
+            }
+            Err(_) => "[]".to_string(),
+        }
+    };
+    http_json_response(stream, 200, &body);
+}
+
+/// DELETE /api/dapnet-log — clear the persisted DAPNET Log.
+fn serve_dapnet_log_clear(stream: TcpStream, state: &DashboardState) {
+    if let Ok(mut s) = state.write() {
+        s.clear_dapnet_log();
+    }
+    http_json_response(stream, 200, "{\"ok\":true}");
+}
+
+fn request_path(req_line: &str) -> Option<&str> {
+    req_line.split_whitespace().nth(1)
+}
+
+fn is_tpg2200_action_request(req_line: &str) -> bool {
+    let mut parts = req_line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let path = parts.next().unwrap_or("");
+    let route = path.split_once('?').map(|(route, _)| route).unwrap_or(path);
+    matches!(method, "GET" | "POST") && route == "/api/action/tpg2200"
+}
+
+fn query_params(path: &str) -> HashMap<String, String> {
+    let Some((_, query)) = path.split_once('?') else {
+        return HashMap::new();
+    };
+    query
+        .split('&')
+        .filter_map(|part| {
+            if part.is_empty() {
+                return None;
+            }
+            let (key, value) = part.split_once('=').unwrap_or((part, ""));
+            Some((url_decode(key), url_decode(value)))
+        })
+        .collect()
+}
+
+fn truncate_action_text(text: &str, max: usize) -> (String, bool) {
+    match text.char_indices().nth(max) {
+        Some((idx, _)) => (text[..idx].to_string(), true),
+        None => (text.to_string(), false),
+    }
+}
+
+fn next_tpg2200_action_incident(
+    cfg: &tetra_config::bluestation::SharedConfig,
+    base: u16,
+) -> u16 {
+    let base = base.clamp(1, 256);
+    let mut state = cfg.state_write();
+    let incident = state.tpg2200_action_next_incident.unwrap_or(base).clamp(1, 256);
+    state.tpg2200_action_next_incident = Some(if incident >= 256 { 1 } else { incident + 1 });
+    incident
+}
+
+/// GET /api/action/tpg2200?token=...&text=...
+///
+/// Public-by-design ActionURL endpoint for phones that cannot hold the dashboard session cookie.
+/// The dedicated token is mandatory and configured in `[tpg2200_action]`.
+fn serve_tpg2200_action_url(
+    stream: TcpStream,
+    req_line: &str,
+    shared_config: &Option<tetra_config::bluestation::SharedConfig>,
+    cmd_tx: &Arc<Mutex<Option<CmdSender>>>,
+    state: &DashboardState,
+) {
+    let Some(cfg) = shared_config else {
+        http_response(stream, 503, "Config not available");
+        return;
+    };
+    let action = cfg.config().tpg2200_action.clone();
+    if !action.enabled {
+        http_response(stream, 404, "TPG2200 ActionURL disabled");
+        return;
+    }
+    let Some(path) = request_path(req_line) else {
+        http_response(stream, 400, "Invalid request");
+        return;
+    };
+    let params = query_params(path);
+    let supplied_token = params.get("token").map(|s| s.as_str()).unwrap_or("");
+    let expected_token = action.token.as_ref();
+    if expected_token.trim().is_empty()
+        || !timing_safe_eq(supplied_token.as_bytes(), expected_token.as_bytes())
+    {
+        tracing::warn!("TPG2200 ActionURL rejected: invalid token");
+        http_response(stream, 403, "Forbidden");
+        return;
+    }
+    if action.dest_issi == 0 || action.source_issi == 0 {
+        http_response(stream, 500, "TPG2200 ActionURL not fully configured");
+        return;
+    }
+
+    let requested_text = params
+        .get("text")
+        .or_else(|| params.get("message"))
+        .or_else(|| params.get("msg"))
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(action.default_text.trim());
+    let message = if requested_text.is_empty() { "ALARM" } else { requested_text };
+    let (message, truncated) = truncate_action_text(message, action.max_text_chars.max(1));
+    if truncated {
+        tracing::warn!(
+            "TPG2200 ActionURL text truncated to {} chars",
+            action.max_text_chars
+        );
+    }
+
+    let tx = match cmd_tx.lock() {
+        Ok(guard) => guard.clone(),
+        Err(_) => None,
+    };
+    let Some(tx) = tx else {
+        http_response(stream, 503, "CMCE control channel unavailable");
+        return;
+    };
+
+    let incident = next_tpg2200_action_incident(cfg, action.incident_base);
+    let payload = build_tpg2200_callout_payload(incident, &message);
+    if payload.len() > (u16::MAX as usize / 8) {
+        http_response(stream, 500, "TPG2200 payload too large");
+        return;
+    }
+    let len_bits = (payload.len() * 8) as u16;
+    let cmd = ControlCommand::SendRawSdsType4 {
+        handle: 0,
+        source_ssi: action.source_issi,
+        dest_ssi: action.dest_issi,
+        dest_is_group: false,
+        len_bits,
+        payload,
+    };
+    if tx.send(cmd).is_err() {
+        http_response(stream, 503, "CMCE control channel unavailable");
+        return;
+    }
+
+    tracing::info!(
+        "TPG2200 ActionURL sent: dest={} source={} incident={} text={:?}",
+        action.dest_issi,
+        action.source_issi,
+        incident,
+        message
+    );
+    if let Ok(mut s) = state.write() {
+        s.push_log(
+            "INFO",
+            format!(
+                "TPG2200 ActionURL sent to {}: incident {} text {}",
+                action.dest_issi, incident, message
+            ),
+        );
+    }
+    http_response(stream, 200, &format!("OK incident={incident}"));
+}
+
+/// GET /api/asterisk/status — return Asterisk SIP/RTP config + runtime status.
+fn serve_asterisk_status(
+    stream: TcpStream,
+    shared_config: &Option<tetra_config::bluestation::SharedConfig>,
+) {
+    let body = match shared_config {
+        Some(cfg) => {
+            let c = cfg.config();
+            let runtime = cfg.state_read().asterisk_status.clone();
+            serde_json::json!({
+                "config": {
+                    "configured": true,
+                    "enabled": c.asterisk.enabled,
+                    "register": c.asterisk.register,
+                    "sip_listen": format!("{}:{}", c.asterisk.bind_addr, c.asterisk.bind_port),
+                    "remote": format!("{}:{}", c.asterisk.remote_host, c.asterisk.remote_port),
+                    "rtp_port_range": format!("{}-{}", c.asterisk.rtp_port_min, c.asterisk.rtp_port_max),
+                    "codec": c.asterisk.codec.clone(),
+                    "outbound_prefix": c.asterisk.outbound_prefix.clone(),
+                    "strip_outbound_prefix": c.asterisk.strip_outbound_prefix,
+                    "service_numbers": c.asterisk.service_numbers.clone(),
+                    "local_user": c.asterisk.local_user.clone(),
+                    "auth_user": c.asterisk.auth_user.clone(),
+                    "realm": c.asterisk.realm.clone(),
+                },
+                "runtime": {
+                    "configured": runtime.configured,
+                    "enabled": runtime.enabled,
+                    "register_status": runtime.register_status,
+                    "sip_listen": runtime.sip_listen,
+                    "remote": runtime.remote,
+                    "rtp_port_range": runtime.rtp_port_range,
+                    "codec": runtime.codec,
+                    "active_dialogs": runtime.active_dialogs,
+                    "last_rx": runtime.last_rx,
+                    "last_tx": runtime.last_tx,
+                    "last_error": runtime.last_error,
+                }
+            })
+        }
+        None => serde_json::json!({
+            "config": { "configured": false, "enabled": false },
+            "runtime": {
+                "configured": false,
+                "enabled": false,
+                "register_status": "disabled",
+                "sip_listen": "",
+                "remote": "",
+                "rtp_port_range": "",
+                "codec": "PCMU",
+                "active_dialogs": 0,
+                "last_rx": null,
+                "last_tx": null,
+                "last_error": null,
+            }
+        }),
+    };
+    http_json_response(stream, 200, &body.to_string());
+}
+
+/// GET /api/snom-notify — return effective Snom XML NOTIFY settings.
+fn serve_snom_notify_get(
+    stream: TcpStream,
+    shared_config: &Option<tetra_config::bluestation::SharedConfig>,
+) {
+    let snom = shared_config
+        .as_ref()
+        .map(|cfg| cfg.effective_snom_notify())
+        .unwrap_or_default();
+    let password = snom.ami_password.as_ref();
+    let body = serde_json::json!({
+        "enabled": snom.enabled,
+        "ami_host": snom.ami_host.clone(),
+        "ami_port": snom.ami_port,
+        "ami_username": snom.ami_username.clone(),
+        "ami_password_masked": crate::net_dashboard::snom_notify::mask_secret(password),
+        "ami_password_set": !password.trim().is_empty(),
+        "endpoints": snom.endpoints.clone(),
+        "notify_sds": snom.notify_sds,
+        "notify_dapnet": snom.notify_dapnet,
+        "notify_telegram": snom.notify_telegram,
+        "sds_directions": snom.sds_directions.clone(),
+        "dapnet_allowed_rics": dapnet_ric_set_as_json(&snom.dapnet_allowed_rics),
+        "sds_allowed_issis": snom.sds_allowed_issis.iter().copied().collect::<Vec<u32>>(),
+        "title_prefix": snom.title_prefix.clone(),
+        "notify_event": snom.notify_event.clone(),
+        "content_type": snom.content_type.clone(),
+        "subscription_state": snom.subscription_state.clone(),
+        "max_text_chars": snom.max_text_chars,
+        "connect_timeout_secs": snom.connect_timeout_secs,
+    });
+    http_json_response(stream, 200, &body.to_string());
+}
+
+/// POST /api/snom-notify — update Snom XML NOTIFY settings live and persist to config.toml.
+fn serve_snom_notify_post(
+    stream: TcpStream,
+    shared_config: &Option<tetra_config::bluestation::SharedConfig>,
+    config_path: &str,
+    body: &str,
+) {
+    use tetra_config::bluestation::SnomNotifyRuntimeOverride;
+
+    let json: serde_json::Value = match serde_json::from_str(body.trim()) {
+        Ok(v) => v,
+        Err(e) => {
+            http_response(stream, 400, &format!("Invalid JSON: {e}"));
+            return;
+        }
+    };
+    let Some(cfg) = shared_config else {
+        http_response(stream, 503, "Config not available");
+        return;
+    };
+
+    let cur = cfg.effective_snom_notify();
+    let dapnet_allowed_rics =
+        match dapnet_ric_set_from_json(&json, "dapnet_allowed_rics", &cur.dapnet_allowed_rics) {
+            Ok(rics) => rics,
+            Err(err) => {
+                http_response(stream, 400, &format!("Invalid Snom DAPNET RIC filter: {err}"));
+                return;
+            }
+        };
+    let sds_allowed_issis =
+        match snom_issi_set_from_json(&json, "sds_allowed_issis", &cur.sds_allowed_issis) {
+            Ok(issis) => issis,
+            Err(err) => {
+                http_response(stream, 400, &format!("Invalid Snom SDS ISSI filter: {err}"));
+                return;
+            }
+        };
+
+    let enabled = dapnet_as_bool(&json, "enabled", cur.enabled);
+    let ami_host = snom_non_empty_or(dapnet_as_string(&json, "ami_host", &cur.ami_host), "127.0.0.1");
+    let ami_port = dapnet_as_u16(&json, "ami_port", cur.ami_port);
+    if ami_port == 0 {
+        http_response(stream, 400, "Invalid Snom NOTIFY setting: AMI port cannot be 0");
+        return;
+    }
+    if enabled && ami_host.trim().is_empty() {
+        http_response(stream, 400, "Invalid Snom NOTIFY setting: AMI host is required when enabled");
+        return;
+    }
+
+    let endpoints = snom_string_list(&json, "endpoints", &cur.endpoints);
+    let sds_directions = snom_string_list(&json, "sds_directions", &cur.sds_directions)
+        .into_iter()
+        .map(|d| d.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let ov = SnomNotifyRuntimeOverride {
+        enabled,
+        ami_host,
+        ami_port,
+        ami_username: dapnet_as_string(&json, "ami_username", &cur.ami_username),
+        ami_password: dapnet_resolve_secret(&json, "ami_password", cur.ami_password.as_ref()),
+        endpoints,
+        notify_sds: dapnet_as_bool(&json, "notify_sds", cur.notify_sds),
+        notify_dapnet: dapnet_as_bool(&json, "notify_dapnet", cur.notify_dapnet),
+        notify_telegram: dapnet_as_bool(&json, "notify_telegram", cur.notify_telegram),
+        sds_directions,
+        dapnet_allowed_rics,
+        sds_allowed_issis,
+        title_prefix: snom_non_empty_or(
+            dapnet_as_string(&json, "title_prefix", &cur.title_prefix),
+            "FlowStation",
+        ),
+        notify_event: snom_non_empty_or(dapnet_as_string(&json, "notify_event", &cur.notify_event), "xml"),
+        content_type: snom_non_empty_or(
+            dapnet_as_string(&json, "content_type", &cur.content_type),
+            "application/snomxml",
+        ),
+        subscription_state: snom_non_empty_or(
+            dapnet_as_string(&json, "subscription_state", &cur.subscription_state),
+            "active;expires=30000",
+        ),
+        max_text_chars: dapnet_as_usize(&json, "max_text_chars", cur.max_text_chars).clamp(40, 2000),
+        connect_timeout_secs: dapnet_as_u64(
+            &json,
+            "connect_timeout_secs",
+            cur.connect_timeout_secs,
+        )
+        .clamp(1, 30),
+    };
+
+    let mut text_fields = vec![
+        ov.ami_host.as_str(),
+        ov.ami_username.as_str(),
+        ov.ami_password.as_str(),
+        ov.title_prefix.as_str(),
+        ov.notify_event.as_str(),
+        ov.content_type.as_str(),
+        ov.subscription_state.as_str(),
+    ];
+    text_fields.extend(ov.endpoints.iter().map(String::as_str));
+    text_fields.extend(ov.sds_directions.iter().map(String::as_str));
+    if !text_fields.iter().all(|v| dapnet_text_acceptable(v)) {
+        http_response(stream, 400, "Invalid Snom NOTIFY setting: control characters are not allowed");
+        return;
+    }
+
+    {
+        let mut state = cfg.state_write();
+        state.snom_notify_override = Some(ov.clone());
+    }
+
+    if let Err(e) = crate::net_dashboard::snom_notify::write_snom_notify_to_toml(config_path, &ov) {
+        tracing::warn!("Dashboard: Snom NOTIFY applied at runtime but failed to persist to TOML: {}", e);
+        http_response(stream, 200, "Applied at runtime; failed to write config file (check permissions)");
+        return;
+    }
+
+    tracing::info!(
+        "Dashboard: Snom NOTIFY updated (enabled={} endpoints={} sds={} dapnet={} telegram={})",
+        ov.enabled,
+        ov.endpoints.len(),
+        ov.notify_sds,
+        ov.notify_dapnet,
+        ov.notify_telegram
+    );
+    http_response(stream, 200, "OK");
+}
+
+fn snom_non_empty_or(value: String, fallback: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn dapnet_resolve_secret(json: &serde_json::Value, key: &str, current: &str) -> String {
+    match json.get(key).and_then(|v| v.as_str()) {
+        Some(v) if !v.contains('…') => v.trim().to_string(),
+        _ => current.to_string(),
+    }
+}
+
+fn dapnet_text_acceptable(s: &str) -> bool {
+    s.chars().all(|c| !c.is_control())
+}
+
+const DAPNET_API_TEXT_MAX_CHARS: usize = 80;
+
+fn dapnet_as_bool(json: &serde_json::Value, key: &str, default: bool) -> bool {
+    json.get(key).and_then(|x| x.as_bool()).unwrap_or(default)
+}
+
+fn dapnet_as_u32(json: &serde_json::Value, key: &str, default: u32) -> u32 {
+    json.get(key)
+        .and_then(|x| x.as_u64())
+        .map(|n| n.min(16_777_215) as u32)
+        .unwrap_or(default)
+}
+
+fn dapnet_as_u64(json: &serde_json::Value, key: &str, default: u64) -> u64 {
+    json.get(key).and_then(|x| x.as_u64()).unwrap_or(default)
+}
+
+fn dapnet_as_u16(json: &serde_json::Value, key: &str, default: u16) -> u16 {
+    json.get(key)
+        .and_then(|x| x.as_u64())
+        .map(|n| n.min(u16::MAX as u64) as u16)
+        .unwrap_or(default)
+}
+
+fn dapnet_as_f64(json: &serde_json::Value, key: &str, default: f64) -> f64 {
+    json.get(key)
+        .and_then(|x| x.as_f64().or_else(|| x.as_str().and_then(|s| s.trim().parse::<f64>().ok())))
+        .filter(|v| v.is_finite())
+        .unwrap_or(default)
+}
+
+fn dapnet_as_usize(json: &serde_json::Value, key: &str, default: usize) -> usize {
+    json.get(key)
+        .and_then(|x| x.as_u64())
+        .map(|n| n.max(1) as usize)
+        .unwrap_or(default)
+}
+
+fn dapnet_as_string(json: &serde_json::Value, key: &str, default: &str) -> String {
+    json.get(key)
+        .and_then(|x| x.as_str())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| default.to_string())
+}
+
+fn dapnet_ric_routes_as_json(routes: &BTreeMap<u32, u32>) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for (ric, issi) in routes {
+        map.insert(
+            tetra_config::bluestation::format_ric_route_key(*ric),
+            serde_json::json!(issi),
+        );
+    }
+    serde_json::Value::Object(map)
+}
+
+fn dapnet_ric_set_as_json(rics: &BTreeSet<u32>) -> serde_json::Value {
+    serde_json::Value::Array(
+        rics.iter()
+            .map(|ric| {
+                serde_json::Value::String(tetra_config::bluestation::format_ric_route_key(*ric))
+            })
+            .collect(),
+    )
+}
+
+fn dapnet_parse_ric_json_value(value: &serde_json::Value, label: &str) -> Result<u32, String> {
+    if let Some(s) = value.as_str() {
+        return tetra_config::bluestation::parse_ric_route_key(s);
+    }
+    if let Some(n) = value.as_u64() {
+        if n <= u32::MAX as u64 {
+            return Ok(n as u32);
+        }
+    }
+    Err(format!("{label}: RIC must be a string or positive integer"))
+}
+
+fn dapnet_ric_set_from_json(
+    json: &serde_json::Value,
+    key: &str,
+    current: &BTreeSet<u32>,
+) -> Result<BTreeSet<u32>, String> {
+    let Some(value) = json.get(key) else {
+        return Ok(current.clone());
+    };
+    let mut rics = BTreeSet::new();
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                rics.insert(dapnet_parse_ric_json_value(item, key)?);
+            }
+        }
+        serde_json::Value::String(text) => {
+            for line_raw in text.lines() {
+                let line = line_raw.split('#').next().unwrap_or("").trim();
+                if line.is_empty() {
+                    continue;
+                }
+                for part in line.split(|c: char| c == ',' || c.is_whitespace()) {
+                    let part = part.trim();
+                    if part.is_empty() {
+                        continue;
+                    }
+                    rics.insert(tetra_config::bluestation::parse_ric_route_key(part)?);
+                }
+            }
+        }
+        _ => return Err(format!("{key} must be an array or text list")),
+    }
+    Ok(rics)
+}
+
+fn dapnet_ric_routes_from_json_key(
+    json: &serde_json::Value,
+    key: &str,
+    current: &BTreeMap<u32, u32>,
+) -> Result<BTreeMap<u32, u32>, String> {
+    let Some(value) = json.get(key) else {
+        return Ok(current.clone());
+    };
+    let mut routes = BTreeMap::new();
+    match value {
+        serde_json::Value::Object(map) => {
+            for (raw_ric, raw_issi) in map {
+                let ric = tetra_config::bluestation::parse_ric_route_key(raw_ric)?;
+                let Some(issi) = raw_issi.as_u64() else {
+                    return Err(format!("RIC route {raw_ric}: ISSI must be a number"));
+                };
+                if issi == 0 || issi > 16_777_215 {
+                    return Err(format!("RIC route {raw_ric}: ISSI out of range"));
+                }
+                routes.insert(ric, issi as u32);
+            }
+        }
+        serde_json::Value::String(text) => {
+            for line in text.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let Some((raw_ric, raw_issi)) = line.split_once('=') else {
+                    return Err(format!("RIC route line '{line}' must be RIC=ISSI"));
+                };
+                let ric = tetra_config::bluestation::parse_ric_route_key(raw_ric)?;
+                let issi = raw_issi
+                    .trim()
+                    .parse::<u32>()
+                    .map_err(|_| format!("RIC route line '{line}' has invalid ISSI"))?;
+                if issi == 0 || issi > 16_777_215 {
+                    return Err(format!("RIC route line '{line}' has ISSI out of range"));
+                }
+                routes.insert(ric, issi);
+            }
+        }
+        _ => return Err(format!("{key} must be an object or text lines")),
+    }
+    Ok(routes)
+}
+
+fn dapnet_ric_routes_from_json(
+    json: &serde_json::Value,
+    current: &BTreeMap<u32, u32>,
+) -> Result<BTreeMap<u32, u32>, String> {
+    dapnet_ric_routes_from_json_key(json, "ric_issi_routes", current)
+}
+
+fn dapnet_validate_route_conflicts(
+    issi_routes: &BTreeMap<u32, u32>,
+    gssi_routes: &BTreeMap<u32, u32>,
+) -> Result<(), String> {
+    for ric in issi_routes.keys() {
+        if gssi_routes.contains_key(ric) {
+            return Err(format!(
+                "RIC {} is configured as both ISSI and GSSI route",
+                tetra_config::bluestation::format_ric_route_key(*ric)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// GET /api/dapnet — return effective DAPNET settings as JSON. Secrets are masked and are never
+/// echoed in the clear.
+fn serve_dapnet_get(
+    stream: TcpStream,
+    shared_config: &Option<tetra_config::bluestation::SharedConfig>,
+) {
+    let (dapnet, runtime) = match shared_config {
+        Some(cfg) => (cfg.effective_dapnet(), cfg.state_read().dapnet_status.clone()),
+        None => (
+            tetra_config::bluestation::CfgDapnet::default(),
+            tetra_config::bluestation::DapnetRuntimeStatus::default(),
+        ),
+    };
+    let password = dapnet.password.as_ref();
+    let authkey = dapnet.rwth_core_authkey.as_ref();
+    let runtime_body = serde_json::json!({
+        "configured": runtime.configured,
+        "enabled": runtime.enabled,
+        "rwth_core_enabled": runtime.rwth_core_enabled,
+        "rwth_core_status": runtime.rwth_core_status,
+        "endpoint": runtime.endpoint,
+        "callsign": runtime.callsign,
+        "forward_sds": runtime.forward_sds,
+        "forward_callout": runtime.forward_callout,
+        "forward_telegram": runtime.forward_telegram,
+        "seen_messages": runtime.seen_messages,
+        "last_rx": runtime.last_rx,
+        "last_error": runtime.last_error,
+    });
+    let mut body = serde_json::json!({
+        "enabled": dapnet.enabled,
+        "api_url": dapnet.api_url.clone(),
+        "username": dapnet.username.clone(),
+        "password_masked": crate::net_dashboard::dapnet::mask_secret(password),
+        "password_set": !password.trim().is_empty(),
+        "poll_interval_secs": dapnet.poll_interval_secs,
+        "forward_sds": dapnet.forward_sds,
+        "forward_callout": dapnet.forward_callout,
+        "forward_telegram": dapnet.forward_telegram,
+        "sds_source_issi": dapnet.sds_source_issi,
+        "sds_dest_issi": dapnet.sds_dest_issi,
+        "sds_dest_is_group": dapnet.sds_dest_is_group,
+        "ric_issi_routes": dapnet_ric_routes_as_json(&dapnet.ric_issi_routes),
+        "ric_gssi_routes": dapnet_ric_routes_as_json(&dapnet.ric_gssi_routes),
+        "sds_allowed_rics": dapnet_ric_set_as_json(&dapnet.sds_allowed_rics),
+        "callout_allowed_rics": dapnet_ric_set_as_json(&dapnet.callout_allowed_rics),
+        "telegram_allowed_rics": dapnet_ric_set_as_json(&dapnet.telegram_allowed_rics),
+        "callout_source_issi": dapnet.callout_source_issi,
+        "callout_dest_issi": dapnet.callout_dest_issi,
+        "callout_incident_base": dapnet.callout_incident_base,
+        "callout_text_prefix": dapnet.callout_text_prefix.clone(),
+        "telegram_prefix": dapnet.telegram_prefix.clone(),
+        "rwth_core_enabled": dapnet.rwth_core_enabled,
+        "rwth_core_host": dapnet.rwth_core_host.clone(),
+        "rwth_core_port": dapnet.rwth_core_port,
+        "rwth_core_device": dapnet.rwth_core_device.clone(),
+        "rwth_core_version": dapnet.rwth_core_version.clone(),
+        "rwth_core_callsign": dapnet.rwth_core_callsign.clone(),
+        "rwth_core_authkey_masked": crate::net_dashboard::dapnet::mask_secret(authkey),
+        "rwth_core_authkey_set": !authkey.trim().is_empty(),
+        "rwth_messages_limit": dapnet.rwth_messages_limit,
+    });
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("runtime".to_string(), runtime_body);
+    }
+    http_json_response(stream, 200, &body.to_string());
+}
+
+/// POST /api/dapnet — update DAPNET settings. Applies immediately through StackState override
+/// and rewrites `[dapnet]` in config.toml. Secrets are changed only when a fresh, non-masked
+/// value is supplied.
+fn serve_dapnet_post(
+    stream: TcpStream,
+    shared_config: &Option<tetra_config::bluestation::SharedConfig>,
+    config_path: &str,
+    body: &str,
+) {
+    use tetra_config::bluestation::DapnetRuntimeOverride;
+
+    let json: serde_json::Value = match serde_json::from_str(body.trim()) {
+        Ok(v) => v,
+        Err(e) => {
+            http_response(stream, 400, &format!("Invalid JSON: {e}"));
+            return;
+        }
+    };
+    let Some(cfg) = shared_config else {
+        http_response(stream, 503, "Config not available");
+        return;
+    };
+
+    let cur = cfg.effective_dapnet();
+    let password = dapnet_resolve_secret(&json, "password", cur.password.as_ref());
+    let rwth_core_authkey = dapnet_resolve_secret(&json, "rwth_core_authkey", cur.rwth_core_authkey.as_ref());
+    let ric_issi_routes = match dapnet_ric_routes_from_json(&json, &cur.ric_issi_routes) {
+        Ok(routes) => routes,
+        Err(err) => {
+            http_response(stream, 400, &format!("Invalid DAPNET RIC route: {err}"));
+            return;
+        }
+    };
+    let ric_gssi_routes =
+        match dapnet_ric_routes_from_json_key(&json, "ric_gssi_routes", &cur.ric_gssi_routes) {
+            Ok(routes) => routes,
+            Err(err) => {
+                http_response(stream, 400, &format!("Invalid DAPNET group RIC route: {err}"));
+                return;
+            }
+        };
+    if let Err(err) = dapnet_validate_route_conflicts(&ric_issi_routes, &ric_gssi_routes) {
+        http_response(stream, 400, &format!("Invalid DAPNET RIC route: {err}"));
+        return;
+    }
+    let sds_allowed_rics =
+        match dapnet_ric_set_from_json(&json, "sds_allowed_rics", &cur.sds_allowed_rics) {
+            Ok(rics) => rics,
+            Err(err) => {
+                http_response(stream, 400, &format!("Invalid SDS RIC filter: {err}"));
+                return;
+            }
+        };
+    let callout_allowed_rics =
+        match dapnet_ric_set_from_json(&json, "callout_allowed_rics", &cur.callout_allowed_rics) {
+            Ok(rics) => rics,
+            Err(err) => {
+                http_response(stream, 400, &format!("Invalid Call-Out RIC filter: {err}"));
+                return;
+            }
+        };
+    let telegram_allowed_rics =
+        match dapnet_ric_set_from_json(&json, "telegram_allowed_rics", &cur.telegram_allowed_rics) {
+            Ok(rics) => rics,
+            Err(err) => {
+                http_response(stream, 400, &format!("Invalid Telegram RIC filter: {err}"));
+                return;
+            }
+        };
+
+    let ov = DapnetRuntimeOverride {
+        enabled: dapnet_as_bool(&json, "enabled", cur.enabled),
+        api_url: dapnet_as_string(&json, "api_url", &cur.api_url),
+        username: dapnet_as_string(&json, "username", &cur.username),
+        password,
+        poll_interval_secs: dapnet_as_u64(&json, "poll_interval_secs", cur.poll_interval_secs).max(1),
+        forward_sds: dapnet_as_bool(&json, "forward_sds", cur.forward_sds),
+        forward_callout: dapnet_as_bool(&json, "forward_callout", cur.forward_callout),
+        forward_telegram: dapnet_as_bool(&json, "forward_telegram", cur.forward_telegram),
+        sds_source_issi: dapnet_as_u32(&json, "sds_source_issi", cur.sds_source_issi).max(1),
+        sds_dest_issi: dapnet_as_u32(&json, "sds_dest_issi", cur.sds_dest_issi),
+        sds_dest_is_group: dapnet_as_bool(&json, "sds_dest_is_group", cur.sds_dest_is_group),
+        ric_issi_routes,
+        ric_gssi_routes,
+        sds_allowed_rics,
+        callout_allowed_rics,
+        telegram_allowed_rics,
+        callout_source_issi: dapnet_as_u32(
+            &json,
+            "callout_source_issi",
+            cur.callout_source_issi,
+        )
+        .max(1),
+        callout_dest_issi: dapnet_as_u32(&json, "callout_dest_issi", cur.callout_dest_issi),
+        callout_incident_base: dapnet_as_u16(
+            &json,
+            "callout_incident_base",
+            cur.callout_incident_base,
+        )
+        .clamp(1, 256),
+        callout_text_prefix: dapnet_as_string(&json, "callout_text_prefix", &cur.callout_text_prefix),
+        telegram_prefix: dapnet_as_string(&json, "telegram_prefix", &cur.telegram_prefix),
+        rwth_core_enabled: dapnet_as_bool(&json, "rwth_core_enabled", cur.rwth_core_enabled),
+        rwth_core_host: dapnet_as_string(&json, "rwth_core_host", &cur.rwth_core_host),
+        rwth_core_port: dapnet_as_u16(&json, "rwth_core_port", cur.rwth_core_port),
+        rwth_core_device: dapnet_as_string(&json, "rwth_core_device", &cur.rwth_core_device),
+        rwth_core_version: dapnet_as_string(&json, "rwth_core_version", &cur.rwth_core_version),
+        rwth_core_callsign: dapnet_as_string(&json, "rwth_core_callsign", &cur.rwth_core_callsign),
+        rwth_core_authkey,
+        rwth_messages_limit: dapnet_as_usize(&json, "rwth_messages_limit", cur.rwth_messages_limit),
+    };
+
+    let text_fields = [
+        ov.api_url.as_str(),
+        ov.username.as_str(),
+        ov.password.as_str(),
+        ov.callout_text_prefix.as_str(),
+        ov.telegram_prefix.as_str(),
+        ov.rwth_core_host.as_str(),
+        ov.rwth_core_device.as_str(),
+        ov.rwth_core_version.as_str(),
+        ov.rwth_core_callsign.as_str(),
+        ov.rwth_core_authkey.as_str(),
+    ];
+    if !text_fields.iter().all(|v| dapnet_text_acceptable(v)) {
+        http_response(stream, 400, "Invalid DAPNET setting: control characters are not allowed");
+        return;
+    }
+
+    {
+        let mut state = cfg.state_write();
+        state.dapnet_override = Some(ov.clone());
+    }
+
+    if let Err(e) = crate::net_dashboard::dapnet::write_dapnet_to_toml(config_path, &ov) {
+        tracing::warn!("Dashboard: DAPNET applied at runtime but failed to persist to TOML: {}", e);
+        http_response(stream, 200, "Applied at runtime; failed to write config file (check permissions)");
+        return;
+    }
+
+    tracing::info!(
+        "Dashboard: DAPNET updated (enabled={} rwth_core={} routes=sds:{} callout:{} telegram:{})",
+        ov.enabled,
+        ov.rwth_core_enabled,
+        ov.forward_sds,
+        ov.forward_callout,
+        ov.forward_telegram
+    );
+    http_response(stream, 200, "OK");
+}
+
+/// GET /api/geoalarm — return effective GeoAlarm settings and runtime status as JSON.
+fn serve_geoalarm_get(
+    stream: TcpStream,
+    shared_config: &Option<tetra_config::bluestation::SharedConfig>,
+) {
+    let (geoalarm, runtime) = match shared_config {
+        Some(cfg) => (cfg.effective_geoalarm(), cfg.state_read().geoalarm_status.clone()),
+        None => (
+            tetra_config::bluestation::CfgGeoalarm::default(),
+            tetra_config::bluestation::GeoalarmRuntimeStatus::default(),
+        ),
+    };
+    let events = runtime
+        .events
+        .iter()
+        .map(|event| {
+            serde_json::json!({
+                "ts": event.ts.clone(),
+                "source": event.source.clone(),
+                "device": event.device.clone(),
+                "lat": event.lat,
+                "lon": event.lon,
+                "distance_m": event.distance_m,
+                "inside_radius": event.inside_radius,
+                "alarmed": event.alarmed,
+                "paths": event.paths.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let runtime_body = serde_json::json!({
+        "configured": runtime.configured,
+        "enabled": runtime.enabled,
+        "center": runtime.center,
+        "radius_m": runtime.radius_m,
+        "trigger_tetra": runtime.trigger_tetra,
+        "trigger_meshcom": runtime.trigger_meshcom,
+        "forward_tpg2200": runtime.forward_tpg2200,
+        "forward_sds": runtime.forward_sds,
+        "forward_sip": runtime.forward_sip,
+        "forward_telegram": runtime.forward_telegram,
+        "seen_positions": runtime.seen_positions,
+        "alarm_count": runtime.alarm_count,
+        "last_position": runtime.last_position,
+        "last_alarm": runtime.last_alarm,
+        "last_error": runtime.last_error,
+    });
+    let body = serde_json::json!({
+        "enabled": geoalarm.enabled,
+        "flowstation_lat": geoalarm.flowstation_lat,
+        "flowstation_lon": geoalarm.flowstation_lon,
+        "radius_m": geoalarm.radius_m,
+        "cooldown_secs": geoalarm.cooldown_secs,
+        "trigger_tetra": geoalarm.trigger_tetra,
+        "trigger_meshcom": geoalarm.trigger_meshcom,
+        "forward_tpg2200": geoalarm.forward_tpg2200,
+        "forward_sds": geoalarm.forward_sds,
+        "forward_sip": geoalarm.forward_sip,
+        "forward_telegram": geoalarm.forward_telegram,
+        "tetra_issi_whitelist": issi_set_as_json(&geoalarm.tetra_issi_whitelist),
+        "tetra_issi_blacklist": issi_set_as_json(&geoalarm.tetra_issi_blacklist),
+        "meshcom_source_whitelist": meshcom_source_list_as_json(&geoalarm.meshcom_source_whitelist),
+        "meshcom_source_blacklist": meshcom_source_list_as_json(&geoalarm.meshcom_source_blacklist),
+        "sds_source_issi": geoalarm.sds_source_issi,
+        "sds_dest_issi": geoalarm.sds_dest_issi,
+        "sds_dest_is_group": geoalarm.sds_dest_is_group,
+        "tpg2200_source_issi": geoalarm.tpg2200_source_issi,
+        "tpg2200_dest_issi": geoalarm.tpg2200_dest_issi,
+        "tpg2200_incident_base": geoalarm.tpg2200_incident_base,
+        "tpg2200_text_prefix": geoalarm.tpg2200_text_prefix.clone(),
+        "tpg2200_max_text_chars": geoalarm.tpg2200_max_text_chars,
+        "sip_title_prefix": geoalarm.sip_title_prefix.clone(),
+        "telegram_prefix": geoalarm.telegram_prefix.clone(),
+        "runtime": runtime_body,
+        "events": events,
+    });
+    http_json_response(stream, 200, &body.to_string());
+}
+
+/// POST /api/geoalarm — update GeoAlarm settings. Applies immediately through StackState
+/// override and rewrites `[geoalarm]` in config.toml.
+fn serve_geoalarm_post(
+    stream: TcpStream,
+    shared_config: &Option<tetra_config::bluestation::SharedConfig>,
+    config_path: &str,
+    body: &str,
+) {
+    use tetra_config::bluestation::{
+        CfgGeoalarmDto, GeoalarmRuntimeOverride, apply_geoalarm_patch,
+    };
+
+    let json: serde_json::Value = match serde_json::from_str(body.trim()) {
+        Ok(v) => v,
+        Err(e) => {
+            http_response(stream, 400, &format!("Invalid JSON: {e}"));
+            return;
+        }
+    };
+    let Some(cfg) = shared_config else {
+        http_response(stream, 503, "Config not available");
+        return;
+    };
+
+    let cur = cfg.effective_geoalarm();
+    let tetra_issi_whitelist = match snom_issi_set_from_json(
+        &json,
+        "tetra_issi_whitelist",
+        &cur.tetra_issi_whitelist,
+    ) {
+        Ok(v) => v,
+        Err(err) => {
+            http_response(stream, 400, &err);
+            return;
+        }
+    };
+    let tetra_issi_blacklist = match snom_issi_set_from_json(
+        &json,
+        "tetra_issi_blacklist",
+        &cur.tetra_issi_blacklist,
+    ) {
+        Ok(v) => v,
+        Err(err) => {
+            http_response(stream, 400, &err);
+            return;
+        }
+    };
+    let meshcom_source_whitelist = match meshcom_source_list_from_json(
+        &json,
+        "meshcom_source_whitelist",
+        &cur.meshcom_source_whitelist,
+    ) {
+        Ok(v) => v,
+        Err(err) => {
+            http_response(stream, 400, &err);
+            return;
+        }
+    };
+    let meshcom_source_blacklist = match meshcom_source_list_from_json(
+        &json,
+        "meshcom_source_blacklist",
+        &cur.meshcom_source_blacklist,
+    ) {
+        Ok(v) => v,
+        Err(err) => {
+            http_response(stream, 400, &err);
+            return;
+        }
+    };
+
+    let dto = CfgGeoalarmDto {
+        enabled: dapnet_as_bool(&json, "enabled", cur.enabled),
+        flowstation_lat: dapnet_as_f64(&json, "flowstation_lat", cur.flowstation_lat),
+        flowstation_lon: dapnet_as_f64(&json, "flowstation_lon", cur.flowstation_lon),
+        radius_m: dapnet_as_f64(&json, "radius_m", cur.radius_m),
+        cooldown_secs: dapnet_as_u64(&json, "cooldown_secs", cur.cooldown_secs),
+        trigger_tetra: dapnet_as_bool(&json, "trigger_tetra", cur.trigger_tetra),
+        trigger_meshcom: dapnet_as_bool(&json, "trigger_meshcom", cur.trigger_meshcom),
+        forward_tpg2200: dapnet_as_bool(&json, "forward_tpg2200", cur.forward_tpg2200),
+        forward_sds: dapnet_as_bool(&json, "forward_sds", cur.forward_sds),
+        forward_sip: dapnet_as_bool(&json, "forward_sip", cur.forward_sip),
+        forward_telegram: dapnet_as_bool(&json, "forward_telegram", cur.forward_telegram),
+        tetra_issi_whitelist: tetra_issi_whitelist.iter().copied().collect(),
+        tetra_issi_blacklist: tetra_issi_blacklist.iter().copied().collect(),
+        meshcom_source_whitelist,
+        meshcom_source_blacklist,
+        sds_source_issi: dapnet_as_u32(&json, "sds_source_issi", cur.sds_source_issi),
+        sds_dest_issi: dapnet_as_u32(&json, "sds_dest_issi", cur.sds_dest_issi),
+        sds_dest_is_group: dapnet_as_bool(&json, "sds_dest_is_group", cur.sds_dest_is_group),
+        tpg2200_source_issi: dapnet_as_u32(&json, "tpg2200_source_issi", cur.tpg2200_source_issi),
+        tpg2200_dest_issi: dapnet_as_u32(&json, "tpg2200_dest_issi", cur.tpg2200_dest_issi),
+        tpg2200_incident_base: dapnet_as_u16(&json, "tpg2200_incident_base", cur.tpg2200_incident_base),
+        tpg2200_text_prefix: dapnet_as_string(&json, "tpg2200_text_prefix", &cur.tpg2200_text_prefix),
+        tpg2200_max_text_chars: dapnet_as_usize(&json, "tpg2200_max_text_chars", cur.tpg2200_max_text_chars),
+        sip_title_prefix: dapnet_as_string(&json, "sip_title_prefix", &cur.sip_title_prefix),
+        telegram_prefix: dapnet_as_string(&json, "telegram_prefix", &cur.telegram_prefix),
+        extra: HashMap::new(),
+    };
+    let normalized = match apply_geoalarm_patch(dto) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            http_response(stream, 400, &err);
+            return;
+        }
+    };
+    let text_fields = [
+        normalized.tpg2200_text_prefix.as_str(),
+        normalized.sip_title_prefix.as_str(),
+        normalized.telegram_prefix.as_str(),
+    ];
+    if !text_fields.iter().all(|v| dapnet_text_acceptable(v))
+        || !normalized
+            .meshcom_source_whitelist
+            .iter()
+            .chain(normalized.meshcom_source_blacklist.iter())
+            .all(|v| dapnet_text_acceptable(v))
+    {
+        http_response(stream, 400, "Invalid GeoAlarm setting: control characters are not allowed");
+        return;
+    }
+
+    let ov = GeoalarmRuntimeOverride {
+        enabled: normalized.enabled,
+        flowstation_lat: normalized.flowstation_lat,
+        flowstation_lon: normalized.flowstation_lon,
+        radius_m: normalized.radius_m,
+        cooldown_secs: normalized.cooldown_secs,
+        trigger_tetra: normalized.trigger_tetra,
+        trigger_meshcom: normalized.trigger_meshcom,
+        forward_tpg2200: normalized.forward_tpg2200,
+        forward_sds: normalized.forward_sds,
+        forward_sip: normalized.forward_sip,
+        forward_telegram: normalized.forward_telegram,
+        tetra_issi_whitelist: normalized.tetra_issi_whitelist,
+        tetra_issi_blacklist: normalized.tetra_issi_blacklist,
+        meshcom_source_whitelist: normalized.meshcom_source_whitelist,
+        meshcom_source_blacklist: normalized.meshcom_source_blacklist,
+        sds_source_issi: normalized.sds_source_issi,
+        sds_dest_issi: normalized.sds_dest_issi,
+        sds_dest_is_group: normalized.sds_dest_is_group,
+        tpg2200_source_issi: normalized.tpg2200_source_issi,
+        tpg2200_dest_issi: normalized.tpg2200_dest_issi,
+        tpg2200_incident_base: normalized.tpg2200_incident_base,
+        tpg2200_text_prefix: normalized.tpg2200_text_prefix,
+        tpg2200_max_text_chars: normalized.tpg2200_max_text_chars,
+        sip_title_prefix: normalized.sip_title_prefix,
+        telegram_prefix: normalized.telegram_prefix,
+    };
+
+    {
+        let mut state = cfg.state_write();
+        state.geoalarm_override = Some(ov.clone());
+    }
+
+    if let Err(e) = crate::net_dashboard::geoalarm::write_geoalarm_to_toml(config_path, &ov) {
+        tracing::warn!("Dashboard: GeoAlarm applied at runtime but failed to persist to TOML: {}", e);
+        http_response(stream, 200, "Applied at runtime; failed to write config file (check permissions)");
+        return;
+    }
+
+    tracing::info!(
+        "Dashboard: GeoAlarm updated (enabled={} center={:.6},{:.6} radius={:.0}m routes=tpg2200:{} sds:{} sip:{} telegram:{})",
+        ov.enabled,
+        ov.flowstation_lat,
+        ov.flowstation_lon,
+        ov.radius_m,
+        ov.forward_tpg2200,
+        ov.forward_sds,
+        ov.forward_sip,
+        ov.forward_telegram
+    );
+    http_response(stream, 200, "OK");
+}
+
+fn snom_string_list(json: &serde_json::Value, key: &str, default: &[String]) -> Vec<String> {
+    if let Some(arr) = json.get(key).and_then(|v| v.as_array()) {
+        return arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+    }
+    if let Some(s) = json.get(key).and_then(|v| v.as_str()) {
+        return s
+            .split(|c: char| c == ',' || c == '\n' || c == '\r')
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect();
+    }
+    default.to_vec()
+}
+
+fn meshcom_source_list_as_json(values: &BTreeSet<String>) -> serde_json::Value {
+    serde_json::Value::Array(
+        values
+            .iter()
+            .map(|value| serde_json::Value::String(value.clone()))
+            .collect(),
+    )
+}
+
+fn issi_set_as_json(values: &BTreeSet<u32>) -> serde_json::Value {
+    serde_json::Value::Array(
+        values
+            .iter()
+            .map(|value| serde_json::json!(*value))
+            .collect(),
+    )
+}
+
+fn meshcom_source_list_from_json(
+    json: &serde_json::Value,
+    key: &str,
+    current: &BTreeSet<String>,
+) -> Result<Vec<String>, String> {
+    let Some(value) = json.get(key) else {
+        return Ok(current.iter().cloned().collect());
+    };
+    let mut out = Vec::new();
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                let Some(text) = item.as_str() else {
+                    return Err(format!("{key}: source entries must be strings"));
+                };
+                push_meshcom_source_parts(key, text, &mut out)?;
+            }
+        }
+        serde_json::Value::String(text) => {
+            push_meshcom_source_parts(key, text, &mut out)?;
+        }
+        _ => return Err(format!("{key} must be an array or text list")),
+    }
+    Ok(out)
+}
+
+fn push_meshcom_source_parts(key: &str, text: &str, out: &mut Vec<String>) -> Result<(), String> {
+    for line_raw in text.lines() {
+        let line = line_raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        for part in line.split(|c: char| c == ',' || c.is_whitespace()) {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if !dapnet_text_acceptable(part) {
+                return Err(format!("{key}: source entries may not contain control characters"));
+            }
+            out.push(part.to_string());
+        }
+    }
+    Ok(())
+}
+
+fn snom_issi_set_from_json(
+    json: &serde_json::Value,
+    key: &str,
+    current: &BTreeSet<u32>,
+) -> Result<BTreeSet<u32>, String> {
+    let Some(value) = json.get(key) else {
+        return Ok(current.clone());
+    };
+    let mut out = BTreeSet::new();
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                let issi = if let Some(n) = item.as_u64() {
+                    n
+                } else if let Some(s) = item.as_str() {
+                    s.trim()
+                        .parse::<u64>()
+                        .map_err(|_| format!("{key}: ISSI must be numeric"))?
+                } else {
+                    return Err(format!("{key}: ISSI must be a positive integer"));
+                };
+                if issi > 16_777_215 {
+                    return Err(format!("{key}: ISSI {} out of range", issi));
+                }
+                out.insert(issi as u32);
+            }
+        }
+        serde_json::Value::String(text) => {
+            for part in text.split(|c: char| c == ',' || c.is_whitespace()) {
+                let part = part.trim();
+                if part.is_empty() {
+                    continue;
+                }
+                let issi = part
+                    .parse::<u64>()
+                    .map_err(|_| format!("{key}: ISSI must be numeric"))?;
+                if issi > 16_777_215 {
+                    return Err(format!("{key}: ISSI {} out of range", issi));
+                }
+                out.insert(issi as u32);
+            }
+        }
+        _ => return Err(format!("{key} must be an array or text list")),
+    }
+    Ok(out)
+}
+
+fn dapnet_string_list(json: &serde_json::Value, keys: &[&str]) -> Vec<String> {
+    for key in keys {
+        if let Some(arr) = json.get(*key).and_then(|v| v.as_array()) {
+            return arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+        if let Some(s) = json.get(*key).and_then(|v| v.as_str()) {
+            return s
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect();
+        }
+    }
+    Vec::new()
+}
+
+fn normalize_dapnet_api_url(api_url: &str) -> String {
+    let mut url = api_url.trim().trim_end_matches('/').to_string();
+    if let Some(rest) = url.strip_prefix("https://www.hampager.de") {
+        url = format!("https://hampager.de{rest}");
+    } else if let Some(rest) = url.strip_prefix("http://www.hampager.de") {
+        url = format!("http://hampager.de{rest}");
+    }
+    if let Some(base) = url.strip_suffix("/api/messages") {
+        return format!("{base}/api/calls");
+    }
+    if let Some(base) = url.strip_suffix("/messages")
+        && base.ends_with("/api") {
+            return format!("{base}/calls");
+        }
+    url
+}
+
+fn build_dapnet_call_payload(
+    text: &str,
+    callsigns: Vec<String>,
+    groups: Vec<String>,
+    emergency: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "text": text,
+        "callSignNames": callsigns,
+        "transmitterGroupNames": groups,
+        "emergency": emergency,
+    })
+}
+
+fn push_dapnet_log_and_broadcast(
+    state: &DashboardState,
+    clients: &WsClients,
+    direction: &str,
+    id: String,
+    callsign: String,
+    recipient: String,
+    text: String,
+    priority: Option<u8>,
+    paths: Vec<String>,
+) {
+    {
+        if let Ok(mut s) = state.write() {
+            s.push_dapnet_log(
+                direction,
+                id.clone(),
+                callsign.clone(),
+                recipient.clone(),
+                text.clone(),
+                priority,
+                paths.clone(),
+            );
+        }
+    }
+    if let Ok(json) = serde_json::to_string(&serde_json::json!({
+        "type": "dapnet_log",
+        "direction": direction,
+        "id": id,
+        "callsign": callsign,
+        "recipient": recipient,
+        "text": text,
+        "priority": priority,
+        "paths": paths,
+    })) {
+        if let Ok(mut clients) = clients.lock() {
+            clients.retain(|tx| tx.send(json.clone()).is_ok());
+        }
+    }
+}
+
+/// POST /api/dapnet/send — send one outbound DAPNET message through the configured Hampager API.
+fn serve_dapnet_send(
+    stream: TcpStream,
+    shared_config: &Option<tetra_config::bluestation::SharedConfig>,
+    state: &DashboardState,
+    clients: &WsClients,
+    body: &str,
+) {
+    let json: serde_json::Value = match serde_json::from_str(body.trim()) {
+        Ok(v) => v,
+        Err(e) => {
+            http_json_response(stream, 400, &serde_json::json!({"ok":false,"error":format!("Invalid JSON: {e}")}).to_string());
+            return;
+        }
+    };
+    let Some(cfg) = shared_config else {
+        http_json_response(stream, 503, "{\"ok\":false,\"error\":\"Config not available\"}");
+        return;
+    };
+    let dapnet = cfg.effective_dapnet();
+    if !dapnet.enabled {
+        http_json_response(stream, 200, "{\"ok\":false,\"error\":\"DAPNET is disabled\"}");
+        return;
+    }
+    let text = json.get("text").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    if text.is_empty() {
+        http_json_response(stream, 200, "{\"ok\":false,\"error\":\"Message text is empty\"}");
+        return;
+    }
+    if !dapnet_text_acceptable(&text) {
+        http_json_response(stream, 200, "{\"ok\":false,\"error\":\"Message contains control characters\"}");
+        return;
+    }
+    if text.chars().count() > DAPNET_API_TEXT_MAX_CHARS {
+        http_json_response(stream, 200, "{\"ok\":false,\"error\":\"DAPNET message text exceeds 80 characters\"}");
+        return;
+    }
+    let api_url = normalize_dapnet_api_url(&dapnet.api_url);
+    if api_url.is_empty() {
+        http_json_response(stream, 200, "{\"ok\":false,\"error\":\"DAPNET api_url is empty\"}");
+        return;
+    }
+    let callsigns = dapnet_string_list(&json, &["callSignNames", "callsigns", "call_signs"]);
+    let groups = dapnet_string_list(&json, &["transmitterGroupNames", "transmitter_groups", "groups"]);
+    if callsigns.is_empty() && groups.is_empty() {
+        http_json_response(stream, 200, "{\"ok\":false,\"error\":\"Set at least one callsign or transmitter group\"}");
+        return;
+    }
+    let emergency = json.get("emergency").and_then(|v| v.as_bool()).unwrap_or(false);
+    let req_body = build_dapnet_call_payload(&text, callsigns, groups, emergency);
+
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            http_json_response(stream, 200, &serde_json::json!({"ok":false,"error":format!("HTTP client error: {e}")}).to_string());
+            return;
+        }
+    };
+    let mut request = client.post(&api_url).json(&req_body);
+    if !dapnet.username.trim().is_empty() {
+        request = request.basic_auth(dapnet.username.trim().to_string(), Some(dapnet.password.as_ref().to_string()));
+    }
+    match request.send() {
+        Ok(resp) => {
+            let status = resp.status();
+            if status.is_success() {
+                tracing::info!(
+                    "Dashboard: DAPNET outbound sent via {} (callsigns={} groups={} emergency={})",
+                    api_url,
+                    req_body["callSignNames"].as_array().map(|a| a.len()).unwrap_or(0),
+                    req_body["transmitterGroupNames"].as_array().map(|a| a.len()).unwrap_or(0),
+                    emergency
+                );
+                push_dapnet_log_and_broadcast(
+                    state,
+                    clients,
+                    "tx",
+                    format!("api:{}", chrono::Utc::now().timestamp_millis()),
+                    req_body["callSignNames"].as_array()
+                        .and_then(|a| a.first())
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    req_body["transmitterGroupNames"].as_array()
+                        .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(","))
+                        .unwrap_or_default(),
+                    text,
+                    if emergency { Some(1) } else { None },
+                    vec!["dapnet-api".to_string()],
+                );
+                http_json_response(stream, 200, "{\"ok\":true}");
+            } else {
+                let err = format!("DAPNET API returned HTTP {}", status.as_u16());
+                tracing::warn!("Dashboard: {}", err);
+                http_json_response(stream, 200, &serde_json::json!({"ok":false,"error":err}).to_string());
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Dashboard: DAPNET outbound send failed: {}", e);
+            http_json_response(stream, 200, &serde_json::json!({"ok":false,"error":format!("Network error: {e}")}).to_string());
+        }
+    }
 }
 
 #[cfg(test)]

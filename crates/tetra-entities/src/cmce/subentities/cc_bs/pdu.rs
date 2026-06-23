@@ -678,6 +678,61 @@ impl CcBsSubentity {
         !network_call.number.is_empty() || pdu.external_subscriber_number.is_some() || pdu.called_party_short_number_address.is_some()
     }
 
+    /// Derive a usable display SSI for an inbound network call's calling party from its
+    /// external (SIP/PBX) number when no real ISSI is available. Accepts a purely numeric
+    /// extension within the 24-bit SSI range; rejects everything else. Mirrors the upstream
+    /// fork's `external_number_as_ssi`.
+    pub(super) fn external_number_as_ssi(number: &str) -> Option<u32> {
+        let digits = number.trim();
+        if digits.is_empty() || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+            return None;
+        }
+        let value = digits.parse::<u32>().ok()?;
+        (value != 0 && value <= 0x00ff_ffff).then_some(value)
+    }
+
+    /// Decide whether a dialed (non-ISSI) number should be routed to the Asterisk SIP/RTP
+    /// bridge instead of Brew. Returns the SIP number to dial (prefix-stripped when configured),
+    /// or `None` to leave the call for Brew. Mirrors the upstream fork's `asterisk_route_number`.
+    #[cfg(feature = "asterisk")]
+    pub(super) fn asterisk_route_number(&self, network_call: &NetworkCircuitCall) -> Option<String> {
+        let cfg = &self.config.config().asterisk;
+        if !cfg.enabled {
+            return None;
+        }
+
+        let raw = if !network_call.number.trim().is_empty() {
+            network_call.number.trim().to_string()
+        } else if network_call.destination != 0 {
+            network_call.destination.to_string()
+        } else {
+            return None;
+        };
+
+        let mut routed = raw.as_str();
+        if !cfg.outbound_prefix.is_empty() && raw.starts_with(&cfg.outbound_prefix) && cfg.strip_outbound_prefix {
+            routed = &raw[cfg.outbound_prefix.len()..];
+        }
+
+        let routed = routed.trim();
+        if routed.is_empty() {
+            return None;
+        }
+
+        if cfg.service_numbers.is_empty() {
+            if !cfg.outbound_prefix.is_empty() && raw.starts_with(&cfg.outbound_prefix) {
+                return Some(routed.to_string());
+            }
+            return None;
+        }
+
+        if cfg.service_numbers.iter().any(|n| n == routed) {
+            Some(routed.to_string())
+        } else {
+            None
+        }
+    }
+
     pub(super) fn signal_umac_circuit_open(
         queue: &mut MessageQueue,
         call: &CmceCircuit,
@@ -983,7 +1038,7 @@ impl CcBsSubentity {
 
         if (call.called_over_brew || call.calling_over_brew) && disconnect_cause != DisconnectCause::SwmiRequestedDisconnection {
             if let Some(brew_uuid) = call.brew_uuid {
-                self.notify_network_circuit_release(queue, brew_uuid, disconnect_cause);
+                self.notify_network_circuit_release(queue, call.network_entity, brew_uuid, disconnect_cause);
             }
         }
 
@@ -1144,6 +1199,122 @@ impl PreemptVictim {
 #[cfg(test)]
 mod tests {
     use super::CcBsSubentity;
+    #[cfg(feature = "asterisk")]
+    use tetra_config::bluestation::{SharedConfig, parsing};
+    #[cfg(feature = "asterisk")]
+    use tetra_saps::control::call_control::NetworkCircuitCall;
+
+    #[cfg(feature = "asterisk")]
+    fn asterisk_test_cc() -> CcBsSubentity {
+        let toml = r#"
+config_version = "0.6"
+stack_mode = "Bs"
+
+[phy_io]
+backend = "None"
+
+[net_info]
+mcc = 901
+mnc = 9999
+
+[cell_info]
+main_carrier = 1584
+freq_band = 4
+freq_offset = 0
+duplex_spacing = 4
+reverse_operation = false
+location_area = 1
+
+[asterisk]
+enabled = true
+outbound_prefix = "91"
+strip_outbound_prefix = true
+codec = "PCMU"
+service_numbers = ["600", "601"]
+"#;
+        let cfg = parsing::from_toml_str(toml).expect("asterisk test config must parse");
+        CcBsSubentity::new(SharedConfig::from_parts(cfg, None))
+    }
+
+    #[cfg(feature = "asterisk")]
+    fn asterisk_open_prefix_test_cc() -> CcBsSubentity {
+        let toml = r#"
+config_version = "0.6"
+stack_mode = "Bs"
+
+[phy_io]
+backend = "None"
+
+[net_info]
+mcc = 901
+mnc = 9999
+
+[cell_info]
+main_carrier = 1584
+freq_band = 4
+freq_offset = 0
+duplex_spacing = 4
+reverse_operation = false
+location_area = 1
+
+[asterisk]
+enabled = true
+outbound_prefix = "91"
+strip_outbound_prefix = true
+codec = "PCMU"
+"#;
+        let cfg = parsing::from_toml_str(toml).expect("asterisk open-prefix test config must parse");
+        CcBsSubentity::new(SharedConfig::from_parts(cfg, None))
+    }
+
+    #[cfg(feature = "asterisk")]
+    fn network_call(destination: u32, number: &str) -> NetworkCircuitCall {
+        NetworkCircuitCall {
+            source_issi: 1000001,
+            destination,
+            number: number.to_string(),
+            priority: 0,
+            service: 0,
+            mode: 0,
+            duplex: 0,
+            method: 0,
+            communication: 0,
+            grant: 0,
+            permission: 0,
+            timeout: 0,
+            ownership: 0,
+            queued: 0,
+        }
+    }
+
+    #[cfg(feature = "asterisk")]
+    #[test]
+    fn asterisk_route_strips_prefix_for_configured_service_numbers() {
+        let cc = asterisk_test_cc();
+
+        assert_eq!(cc.asterisk_route_number(&network_call(91600, "")), Some("600".to_string()));
+        assert_eq!(cc.asterisk_route_number(&network_call(91601, "")), Some("601".to_string()));
+    }
+
+    #[cfg(feature = "asterisk")]
+    #[test]
+    fn asterisk_route_uses_dialed_number_and_leaves_non_matches_for_brew() {
+        let cc = asterisk_test_cc();
+
+        assert_eq!(cc.asterisk_route_number(&network_call(0, "91600")), Some("600".to_string()));
+        assert_eq!(cc.asterisk_route_number(&network_call(91602, "")), None);
+        assert_eq!(cc.asterisk_route_number(&network_call(0, "91234")), None);
+    }
+
+    #[cfg(feature = "asterisk")]
+    #[test]
+    fn asterisk_route_accepts_prefixed_numbers_when_service_list_is_empty() {
+        let cc = asterisk_open_prefix_test_cc();
+
+        assert_eq!(cc.asterisk_route_number(&network_call(91601, "")), Some("601".to_string()));
+        assert_eq!(cc.asterisk_route_number(&network_call(0, "91601")), Some("601".to_string()));
+        assert_eq!(cc.asterisk_route_number(&network_call(601, "")), None);
+    }
 
     #[test]
     fn external_subscriber_number_supports_24_digits() {

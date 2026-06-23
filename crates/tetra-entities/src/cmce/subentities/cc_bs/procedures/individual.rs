@@ -202,7 +202,7 @@ impl CcBsSubentity {
             queue.push_back(SapMsg {
                 sap: Sap::Control,
                 src: TetraEntity::Cmce,
-                dest: TetraEntity::Brew,
+                dest: call_snapshot.network_entity,
                 msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitAlert { brew_uuid }),
             });
         } else if !call_snapshot.is_alerted() {
@@ -403,7 +403,7 @@ impl CcBsSubentity {
             queue.push_back(SapMsg {
                 sap: Sap::Control,
                 src: TetraEntity::Cmce,
-                dest: TetraEntity::Brew,
+                dest: call_snapshot.network_entity,
                 msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitConnectRequest {
                     brew_uuid,
                     call: call_info.clone(),

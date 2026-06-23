@@ -1,7 +1,10 @@
 pub mod callsign;
+pub mod dapnet;
+pub mod geoalarm;
 pub mod html;
 pub mod radioid;
 pub mod server;
+pub mod snom_notify;
 pub mod state;
 pub mod telegram;
 pub mod update_check;

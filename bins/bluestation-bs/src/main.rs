@@ -12,13 +12,18 @@ use tetra_entities::net_control::{
 use tetra_config::bluestation::{PhyBackend, SharedConfig, StackConfig, parsing};
 use tetra_core::{TdmaTime, debug};
 use tetra_entities::MessageRouter;
+#[cfg(feature = "asterisk")]
+use tetra_entities::net_asterisk::entity::AsteriskEntity;
 use tetra_entities::net_brew::entity::BrewEntity;
 use tetra_entities::net_brew::new_websocket_transport;
+use tetra_entities::net_dapnet::spawn_dapnet_worker;
 use tetra_entities::net_dashboard::DashboardServer;
-use tetra_entities::net_telegram::{TelegramAlerter, telegram_alert_channel};
+use tetra_entities::net_geoalarm::{GeoAlarmSink, spawn_geoalarm_worker};
+use tetra_entities::net_snom::{snom_notify_channel, spawn_snom_notify_worker};
+use tetra_entities::net_telegram::{TelegramAlertSink, TelegramAlerter, telegram_alert_channel};
 use tetra_entities::net_telemetry::worker::TelemetryWorker;
 use tetra_entities::net_telemetry::{
-    TELEMETRY_HEARTBEAT_INTERVAL, TELEMETRY_HEARTBEAT_TIMEOUT, TELEMETRY_PROTOCOL_VERSION, TelemetrySource, telemetry_channel,
+    TELEMETRY_HEARTBEAT_INTERVAL, TELEMETRY_HEARTBEAT_TIMEOUT, TELEMETRY_PROTOCOL_VERSION, TelemetrySink, TelemetrySource, telemetry_channel,
 };
 use tetra_entities::network::transports::websocket::{WebSocketTransport, WebSocketTransportConfig};
 use tetra_entities::{
@@ -139,13 +144,18 @@ fn start_control_worker(cfg: SharedConfig, command_dispatchers: HashMap<TetraEnt
 }
 
 /// Start base station stack
-fn build_bs_stack(cfg: &mut SharedConfig, config_path: &str) -> (MessageRouter, Option<TelemetrySource>, HashMap<TetraEntity, CommandDispatcher>) {
+fn build_bs_stack(
+    cfg: &mut SharedConfig,
+    config_path: &str,
+) -> (MessageRouter, Option<TelemetrySource>, HashMap<TetraEntity, CommandDispatcher>, Option<TelemetrySink>) {
     let mut router = MessageRouter::new(cfg.clone());
 
     // Build telemetry sink/source — always create if either telemetry or dashboard is enabled
     let needs_telemetry = cfg.config().telemetry.is_some()
         || cfg.config().dashboard.is_some()
-        || cfg.config().telegram.is_some();
+        || cfg.config().telegram.is_some()
+        || cfg.config().geoalarm.enabled
+        || cfg.effective_snom_notify().enabled;
     let (tsink, tsource) = if needs_telemetry {
         let (a, b) = telemetry_channel();
         (Some(a), Some(b))
@@ -260,10 +270,25 @@ fn build_bs_stack(cfg: &mut SharedConfig, config_path: &str) -> (MessageRouter, 
         eprintln!(" -> Brew/TetraPack integration enabled");
     }
 
+    // Register Asterisk SIP/RTP entity if enabled. Only compiled in with the
+    // `asterisk` feature, which links the native TETRA codec.
+    #[cfg(feature = "asterisk")]
+    if cfg.config().asterisk.enabled {
+        match AsteriskEntity::new(cfg.clone()) {
+            Ok(asterisk_entity) => {
+                router.register_entity(Box::new(asterisk_entity));
+                eprintln!(" -> Asterisk SIP integration enabled");
+            }
+            Err(err) => {
+                panic!("Failed to start Asterisk SIP integration: {}", err);
+            }
+        }
+    }
+
     // Init network time
     router.set_dl_time(TdmaTime::default());
 
-    (router, tsource, c_d)
+    (router, tsource, c_d, tsink)
 }
 
 #[derive(Parser, Debug)]
@@ -329,7 +354,28 @@ fn main() {
         );
     }
 
-    let (mut router, tsource, cdispatchers) = build_bs_stack(&mut cfg, &args.config);
+    let (mut router, tsource, cdispatchers, dapnet_telemetry_sink) =
+        build_bs_stack(&mut cfg, &args.config);
+    let dapnet_cmd_tx = cdispatchers
+        .get(&TetraEntity::Cmce)
+        .map(|dispatcher| dispatcher.clone_sender());
+    let mut dapnet_telegram_sink: Option<TelegramAlertSink> = None;
+    #[allow(unused_assignments)]
+    let mut geoalarm_sink: Option<GeoAlarmSink> = None;
+
+    // Snom XML NOTIFY worker — off-path; idles when disabled and reads settings live.
+    let (snom_sink, snom_source) = snom_notify_channel();
+    spawn_snom_notify_worker(cfg.clone(), snom_source);
+    let snom_notify_sink = Some(snom_sink);
+    if cfg.effective_snom_notify().enabled {
+        let snom = cfg.effective_snom_notify();
+        eprintln!(
+            " -> Snom NOTIFY integration enabled (AMI {}:{}, endpoints={})",
+            snom.ami_host,
+            snom.ami_port,
+            snom.endpoints.join(",")
+        );
+    }
 
     // Start Telemetry and Control threads, if enabled
     // If dashboard is also enabled, tee the telemetry events to both.
@@ -344,13 +390,24 @@ fn main() {
         let alert_sink = if has_telegram {
             let (sink, alert_source) = telegram_alert_channel();
             let alert_cfg = cfg.clone();
+            let snom_for_alerts = snom_notify_sink.clone();
             thread::Builder::new().name("telegram-alerter".into()).spawn(move || {
-                TelegramAlerter::new(alert_cfg, alert_source).run();
+                TelegramAlerter::new(alert_cfg, alert_source)
+                    .with_snom_sink(snom_for_alerts)
+                    .run();
             }).expect("failed to spawn telegram-alerter thread");
             Some(sink)
         } else {
             None
         };
+        dapnet_telegram_sink = alert_sink.clone();
+        // GeoAlarm worker — fed TETRA LIP positions from the telemetry fan-out below.
+        geoalarm_sink = spawn_geoalarm_worker(
+            cfg.clone(),
+            dapnet_cmd_tx.clone(),
+            alert_sink.clone(),
+            snom_notify_sink.clone(),
+        );
 
         // Optional dashboard HTTP server.
         let dashboard: Option<std::sync::Arc<DashboardServer>> = if has_dashboard {
@@ -441,6 +498,8 @@ fn main() {
         {
             let dash = dashboard.clone();
             let alert = alert_sink.clone();
+            let snom = snom_notify_sink.clone();
+            let geoalarm = geoalarm_sink.clone();
             thread::Builder::new().name("telemetry-fanout".into()).spawn(move || {
                 use tetra_entities::health::registry as health_registry;
                 use tetra_entities::net_telemetry::TelemetryEvent;
@@ -466,8 +525,24 @@ fn main() {
                                 TelemetryEvent::MsRssi { .. } => health_registry().note_radio_activity(),
                                 _ => {}
                             }
+                            // Feed decoded TETRA LIP positions (SDS protocol-id 10, inbound from
+                            // a radio) to the GeoAlarm worker so it can geofence them.
+                            if let Some(g) = &geoalarm
+                                && let TelemetryEvent::SdsLog {
+                                    direction,
+                                    source_issi,
+                                    protocol_id,
+                                    text,
+                                    ..
+                                } = &event
+                                && *protocol_id == 10
+                                && direction == "rx"
+                            {
+                                g.send_tetra_lip(*source_issi, text);
+                            }
                             if let Some(d) = &dash { d.handle_telemetry(event.clone()); }
                             if let Some(s) = &alert { s.send_event(event.clone()); }
+                            if let Some(s) = &snom { s.send_event(event.clone()); }
                             if let Some(t) = &tee_sink { t.send(event); }
                         }
                         None => break,
@@ -483,6 +558,9 @@ fn main() {
     if cfg.config().control.is_some() {
         start_control_worker(cfg.clone(), cdispatchers);
     };
+
+    // DAPNET worker — off-path; idles when disabled and reads settings live.
+    spawn_dapnet_worker(cfg.clone(), dapnet_cmd_tx, dapnet_telegram_sink, dapnet_telemetry_sink);
 
     // Set up Ctrl+C handler for graceful shutdown.
     // Also installs lifecycle control so RestartService / ShutdownService commands

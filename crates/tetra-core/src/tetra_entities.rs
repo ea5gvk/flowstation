@@ -26,4 +26,7 @@ pub enum TetraEntity {
 
     /// Brew protocol bridge (TetraPack/BrandMeister integration)
     Brew,
+
+    /// Asterisk SIP/RTP bridge
+    Asterisk,
 }

@@ -114,6 +114,7 @@ impl<T: NetworkTransport> ControlWorker<T> {
     fn route_control_command(command: &ControlCommand) -> TetraEntity {
         match command {
             ControlCommand::SendSds { .. } => TetraEntity::Cmce,
+            ControlCommand::SendRawSdsType4 { .. } => TetraEntity::Cmce,
             ControlCommand::KickMs { .. } => TetraEntity::Cmce,
             // DGNA is a Mobility Management procedure: group attach/detach state and the
             // D-ATTACH/DETACH GROUP IDENTITY send path both live in the MM entity.
@@ -194,6 +195,19 @@ mod tests {
             source_ssi: 12345,
             is_group: false,
             payload: vec![],
+        });
+        assert_eq!(target, TetraEntity::Cmce);
+    }
+
+    #[test]
+    fn test_route_raw_sds_type4_to_cmce() {
+        let target = ControlWorker::<MockTransport>::route_control_command(&ControlCommand::SendRawSdsType4 {
+            handle: 3,
+            source_ssi: 9999,
+            dest_ssi: 2260571,
+            dest_is_group: false,
+            len_bits: 16,
+            payload: vec![0xC3, 0x00],
         });
         assert_eq!(target, TetraEntity::Cmce);
     }

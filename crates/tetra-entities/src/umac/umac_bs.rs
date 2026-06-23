@@ -1389,6 +1389,24 @@ impl UmacBs {
                     }
                 }
 
+                // Forward UL voice to Asterisk if the SIP bridge is enabled. The Asterisk entity
+                // keeps its own ts -> dialog map and ignores unrelated circuits, so we fan out to
+                // every enabled network entity and let each self-filter by active call.
+                #[cfg(feature = "asterisk")]
+                if self.config.config().asterisk.enabled {
+                    if self.channel_scheduler.circuit_is_active(Direction::Ul, ts) {
+                        let msg = SapMsg {
+                            sap: Sap::TmdSap,
+                            src: TetraEntity::Umac,
+                            dest: TetraEntity::Asterisk,
+                            msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd { ts, data: data.clone() }),
+                        };
+                        queue.push_back(msg);
+                    } else {
+                        tracing::trace!("rx_tmd_prim: no active UL circuit on ts={}, dropping UL voice to Asterisk", ts);
+                    }
+                }
+
                 // Determine DL target timeslot:
                 //   - Full-duplex P2P (local): UL on `ts` cross-routed to peer MS's DL on `peer_ts`.
                 //   - Group / simplex (LocalLoopback, no peer_ts): same-ts loopback so all members hear.

@@ -2,6 +2,9 @@ use super::*;
 
 impl CcBsSubentity {
     pub fn rx_call_control(&mut self, queue: &mut MessageQueue, message: SapMsg) {
+        // The originating network entity (Brew or Asterisk). Inbound network-initiated setup
+        // requests carry no prior call record, so we route replies back to the sender.
+        let src_entity = message.src;
         let SapMsgInner::CmceCallControl(call_control) = message.msg else {
             tracing::warn!("CMCE CC control ingress received non-call-control message");
             return;
@@ -23,7 +26,7 @@ impl CcBsSubentity {
                 self.handle_ul_inactivity_timeout(queue, ts);
             }
             CallControl::NetworkCircuitSetupRequest { brew_uuid, call } => {
-                self.rx_network_circuit_setup_request(queue, brew_uuid, call);
+                self.rx_network_circuit_setup_request(queue, src_entity, brew_uuid, call);
             }
             CallControl::NetworkCircuitSetupAccept { brew_uuid } => {
                 self.rx_network_circuit_setup_accept(brew_uuid);

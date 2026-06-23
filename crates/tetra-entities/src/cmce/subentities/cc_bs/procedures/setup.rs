@@ -320,9 +320,15 @@ impl CcBsSubentity {
             pdu.called_party_type_identifier,
             PartyTypeIdentifier::Ssi | PartyTypeIdentifier::Tsi
         );
-        if !is_issi_address && !brew::is_active(&self.config) {
+        // When the Asterisk feature is off, behave as if Asterisk is disabled: a non-ISSI
+        // destination is only acceptable if Brew is active.
+        #[cfg(feature = "asterisk")]
+        let asterisk_can_route = self.config.config().asterisk.enabled;
+        #[cfg(not(feature = "asterisk"))]
+        let asterisk_can_route = false;
+        if !is_issi_address && !brew::is_active(&self.config) && !asterisk_can_route {
             tracing::warn!(
-                "U-SETUP P2P with non-ISSI called_party_type_identifier={} (rejecting, Brew disabled)",
+                "U-SETUP P2P with non-ISSI called_party_type_identifier={} (rejecting, Brew/Asterisk disabled)",
                 pdu.called_party_type_identifier
             );
             self.reject_setup_request(
@@ -330,7 +336,7 @@ impl CcBsSubentity {
                 message,
                 calling_party,
                 DisconnectCause::RequestedServiceNotAvailable,
-                "non-ISSI destination requires Brew",
+                "non-ISSI destination requires Brew or Asterisk",
             );
             return;
         }
@@ -568,6 +574,9 @@ impl CcBsSubentity {
                 call_timeout: Self::p2p_call_timeout(pdu.simplex_duplex_selection),
                 called_over_brew: false,
                 calling_over_brew: false,
+                // Local-only call: no network leg. Defaults to Brew but is never used
+                // because all network sends are gated on called/calling_over_brew + brew_uuid.
+                network_entity: TetraEntity::Brew,
                 brew_uuid: None,
                 network_call: None,
                 connect_request_sent: false,
@@ -622,9 +631,37 @@ impl CcBsSubentity {
         let SapMsgInner::LcmcMleUnitdataInd(prim) = &message.msg else {
             panic!()
         };
+        #[cfg_attr(not(feature = "asterisk"), allow(unused_mut))]
         let mut network_call = Self::build_network_circuit_call_from_u_setup(pdu, calling_party.ssi);
 
-        if !brew::is_active(&self.config) {
+        // Decide whether this dialed (non-ISSI) number routes to the Asterisk SIP/RTP bridge
+        // instead of Brew. Asterisk takes precedence; otherwise the call falls through to Brew.
+        // Without the asterisk feature there is no SIP bridge, so every call falls through to Brew.
+        #[cfg(feature = "asterisk")]
+        let network_entity = {
+            let asterisk_number = self.asterisk_route_number(&network_call);
+            let entity = if asterisk_number.is_some() {
+                TetraEntity::Asterisk
+            } else {
+                TetraEntity::Brew
+            };
+            if let Some(number) = asterisk_number {
+                tracing::info!(
+                    "CMCE: routing U-SETUP src={} dialed='{}' to Asterisk SIP number='{}'",
+                    calling_party.ssi,
+                    network_call.number,
+                    number
+                );
+                network_call.number = number;
+                network_call.destination = 0;
+                network_call.duplex = 1;
+            }
+            entity
+        };
+        #[cfg(not(feature = "asterisk"))]
+        let network_entity = TetraEntity::Brew;
+
+        if network_entity == TetraEntity::Brew && !brew::is_active(&self.config) {
             tracing::info!(
                 "CMCE: rejecting U-SETUP P2P from ISSI {} (Brew disabled, called_ssi={})",
                 calling_party.ssi,
@@ -652,7 +689,9 @@ impl CcBsSubentity {
             return;
         }
 
-        if !self.config.state_read().network_connected {
+        // The backhaul-connected and ISSI-routability gates are Brew-specific (they check the
+        // Brew websocket state and the Brew ISSI whitelist). Asterisk-bridged calls bypass them.
+        if network_entity == TetraEntity::Brew && !self.config.state_read().network_connected {
             tracing::info!(
                 "CMCE: rejecting U-SETUP over Brew src={} dst={} (backhaul disconnected)",
                 calling_party.ssi,
@@ -668,7 +707,7 @@ impl CcBsSubentity {
             return;
         }
 
-        if !brew::is_brew_issi_routable(&self.config, calling_party.ssi) {
+        if network_entity == TetraEntity::Brew && !brew::is_brew_issi_routable(&self.config, calling_party.ssi) {
             tracing::info!(
                 "CMCE: rejecting U-SETUP P2P over Brew src={} dst={} (source ISSI not routable)",
                 calling_party.ssi,
@@ -685,7 +724,9 @@ impl CcBsSubentity {
         }
 
         let has_external_called_party = Self::has_external_called_party(pdu, &network_call);
-        let destination_routable = network_call.destination == 0 || brew::is_brew_issi_routable(&self.config, network_call.destination);
+        let destination_routable = network_entity == TetraEntity::Asterisk
+            || network_call.destination == 0
+            || brew::is_brew_issi_routable(&self.config, network_call.destination);
 
         if !has_external_called_party && !destination_routable {
             tracing::info!(
@@ -750,7 +791,8 @@ impl CcBsSubentity {
         let brew_uuid = uuid::Uuid::new_v4();
 
         tracing::info!(
-            "CMCE: forwarding U-SETUP over Brew call_id={} src={} dst={} ts={} duplex={} number='{}' uuid={}",
+            "CMCE: forwarding U-SETUP over {:?} call_id={} src={} dst={} ts={} duplex={} number='{}' uuid={}",
+            network_entity,
             call_id,
             calling_party.ssi,
             network_call.destination,
@@ -765,7 +807,7 @@ impl CcBsSubentity {
         queue.push_back(SapMsg {
             sap: Sap::Control,
             src: TetraEntity::Cmce,
-            dest: TetraEntity::Brew,
+            dest: network_entity,
             msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupRequest {
                 brew_uuid,
                 call: network_call.clone(),
@@ -797,6 +839,7 @@ impl CcBsSubentity {
                 call_timeout: Self::p2p_call_timeout(pdu.simplex_duplex_selection),
                 called_over_brew: true,
                 calling_over_brew: false,
+                network_entity,
                 brew_uuid: Some(brew_uuid),
                 network_call: Some(network_call),
                 connect_request_sent: false,

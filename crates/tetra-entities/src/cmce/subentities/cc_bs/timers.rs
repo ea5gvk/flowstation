@@ -188,7 +188,8 @@ impl CcBsSubentity {
                             if (ind_call.called_over_brew || ind_call.calling_over_brew)
                                 && let Some(brew_uuid) = ind_call.brew_uuid
                             {
-                                self.notify_network_circuit_release(queue, brew_uuid, disconnect_cause);
+                                let network_entity = ind_call.network_entity;
+                                self.notify_network_circuit_release(queue, network_entity, brew_uuid, disconnect_cause);
                             }
                         }
 

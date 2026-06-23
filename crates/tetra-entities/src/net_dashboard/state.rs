@@ -72,6 +72,20 @@ pub struct SdsLogEntry {
     pub text: String,
 }
 
+/// DAPNET Log entry — one inbound RWTH-core message or outbound Hampager API send. Persisted to
+/// disk (`dapnet_log.json` next to the active config) so the history survives a restart.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DapnetLogEntry {
+    pub ts: String,           // "YYYY-MM-DD HH:MM:SS" local time
+    pub direction: String,    // "rx" | "tx"
+    pub id: String,
+    pub callsign: String,
+    pub recipient: String,
+    pub text: String,
+    pub priority: Option<u8>,
+    pub paths: Vec<String>,
+}
+
 /// Shared mutable state for the dashboard, protected by RwLock
 #[derive(Debug, Default)]
 pub struct DashboardStateInner {
@@ -86,6 +100,10 @@ pub struct DashboardStateInner {
     pub sds_log: std::collections::VecDeque<SdsLogEntry>,
     /// Where `sds_log` is persisted. Empty disables persistence (e.g. config without a parent dir).
     sds_log_path: std::path::PathBuf,
+    /// DAPNET Log ring (chronological, oldest at the front). Backed by an on-disk JSON file.
+    pub dapnet_log: std::collections::VecDeque<DapnetLogEntry>,
+    /// Where `dapnet_log` is persisted. Empty disables persistence.
+    dapnet_log_path: std::path::PathBuf,
     pub config_path: String,
     pub brew_online: bool,
     pub brew_version: u8,
@@ -153,6 +171,8 @@ pub const LAST_HEARD_MAX: usize = 50;
 /// Max SDS Log entries kept in memory and on disk. The log is human-messaging volume, so a
 /// few hundred entries cover a long history while keeping the JSON file small.
 pub const SDS_LOG_MAX: usize = 500;
+/// Max DAPNET Log entries kept in memory and on disk.
+pub const DAPNET_LOG_MAX: usize = 500;
 
 #[derive(Debug)]
 pub struct MsEntry {
@@ -204,6 +224,14 @@ impl DashboardStateInner {
         if !sds_log.is_empty() {
             tracing::info!("SDS Log: loaded {} entries from {}", sds_log.len(), sds_log_path.display());
         }
+        let dapnet_log_path = std::path::Path::new(&config_path)
+            .parent()
+            .map(|d| d.join("dapnet_log.json"))
+            .unwrap_or_else(|| std::path::PathBuf::from("dapnet_log.json"));
+        let dapnet_log = load_dapnet_log(&dapnet_log_path);
+        if !dapnet_log.is_empty() {
+            tracing::info!("DAPNET Log: loaded {} entries from {}", dapnet_log.len(), dapnet_log_path.display());
+        }
         Self {
             ms_map: HashMap::new(),
             calls: HashMap::new(),
@@ -212,6 +240,8 @@ impl DashboardStateInner {
             last_heard: std::collections::VecDeque::with_capacity(LAST_HEARD_MAX + 1),
             sds_log,
             sds_log_path,
+            dapnet_log,
+            dapnet_log_path,
             config_path,
             brew_online: false,
             brew_version: 0,
@@ -279,6 +309,54 @@ impl DashboardStateInner {
         }
     }
 
+    pub fn clear_sds_log(&mut self) {
+        self.sds_log.clear();
+        self.persist_sds_log();
+    }
+
+    /// Append one DAPNET event to the log, evicting the oldest past DAPNET_LOG_MAX, then persist
+    /// the ring to disk. Best-effort only: write failures never affect radio operation.
+    pub fn push_dapnet_log(
+        &mut self,
+        direction: &str,
+        id: String,
+        callsign: String,
+        recipient: String,
+        text: String,
+        priority: Option<u8>,
+        paths: Vec<String>,
+    ) {
+        let entry = DapnetLogEntry {
+            ts: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+            direction: direction.to_string(),
+            id,
+            callsign,
+            recipient,
+            text,
+            priority,
+            paths,
+        };
+        if self.dapnet_log.len() >= DAPNET_LOG_MAX {
+            self.dapnet_log.pop_front();
+        }
+        self.dapnet_log.push_back(entry);
+        self.persist_dapnet_log();
+    }
+
+    fn persist_dapnet_log(&self) {
+        if self.dapnet_log_path.as_os_str().is_empty() {
+            return;
+        }
+        if let Ok(text) = serde_json::to_string(&self.dapnet_log) {
+            let _ = std::fs::write(&self.dapnet_log_path, text);
+        }
+    }
+
+    pub fn clear_dapnet_log(&mut self) {
+        self.dapnet_log.clear();
+        self.persist_dapnet_log();
+    }
+
     pub fn snapshot_ms(&self) -> Vec<MsState> {
         self.ms_map.values().map(|e| MsState {
             issi: e.issi,
@@ -344,6 +422,13 @@ impl DashboardStateInner {
 /// Load the persisted SDS Log from disk. Returns an empty ring when the file is missing or
 /// unparseable (e.g. first run, or a schema change) — the log is best-effort, never fatal.
 fn load_sds_log(path: &std::path::Path) -> std::collections::VecDeque<SdsLogEntry> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return std::collections::VecDeque::new();
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+fn load_dapnet_log(path: &std::path::Path) -> std::collections::VecDeque<DapnetLogEntry> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return std::collections::VecDeque::new();
     };

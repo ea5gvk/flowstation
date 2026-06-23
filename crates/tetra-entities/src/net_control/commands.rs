@@ -21,6 +21,16 @@ pub enum ControlCommand {
         payload: Vec<u8>,
     },
 
+    /// Send an already-built SDS Type-4 payload for local delivery.
+    SendRawSdsType4 {
+        handle: u32,
+        source_ssi: u32,
+        dest_ssi: u32,
+        dest_is_group: bool,
+        len_bits: u16,
+        payload: Vec<u8>,
+    },
+
     /// Forcibly deregister a terminal from the BS
     KickMs { issi: u32 },
 

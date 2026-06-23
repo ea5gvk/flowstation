@@ -142,10 +142,16 @@ impl CcBsSubentity {
         Self::push_control(queue, TetraEntity::Brew, CallControl::NetworkCallEnd { brew_uuid });
     }
 
-    pub(super) fn notify_network_circuit_release(&self, queue: &mut MessageQueue, brew_uuid: uuid::Uuid, cause: DisconnectCause) {
+    pub(super) fn notify_network_circuit_release(
+        &self,
+        queue: &mut MessageQueue,
+        network_entity: TetraEntity,
+        brew_uuid: uuid::Uuid,
+        cause: DisconnectCause,
+    ) {
         Self::push_control(
             queue,
-            TetraEntity::Brew,
+            network_entity,
             CallControl::NetworkCircuitRelease {
                 brew_uuid,
                 cause: cause.into_raw() as u8,
