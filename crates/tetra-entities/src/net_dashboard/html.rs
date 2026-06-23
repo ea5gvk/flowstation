@@ -21,6 +21,7 @@ html,body{height:100%;overflow:hidden;}
   --accent2: #4da6ff;
   --warn:    #ffb224;
   --danger:  #ff4d6d;
+  --ok:      #30d158;   /* premium status-OK green (health/integration cards) */
   --text:    #eef3fb;
   --text2:   #94abc9;
   --text3:   #4c628a;
@@ -35,7 +36,7 @@ html,body{height:100%;overflow:hidden;}
 [data-theme="light"]{
   --bg:#eceff4;--bg2:#ffffff;--bg3:#e6eaf1;--bg4:#d6dde7;
   --border:#dde3ec;--border2:#c4cdd9;
-  --accent:#00876a;--accent2:#1565c0;--warn:#9a5400;--danger:#c0203a;
+  --accent:#00876a;--accent2:#1565c0;--warn:#9a5400;--danger:#c0203a;--ok:#2ea043;
   --text:#16202e;--text2:#3d4f66;--text3:#5f7188;
   --sidebar:#ffffff;--sidebar-border:#e3e8ef;
   --card-shadow:0 1px 3px rgba(20,30,50,0.06),0 4px 16px -8px rgba(20,30,50,0.10);
@@ -43,7 +44,7 @@ html,body{height:100%;overflow:hidden;}
 [data-theme="blue"]{
   --bg:#03071e;--bg2:#060d2a;--bg3:#091235;--bg4:#0d1840;
   --border:#112060;--border2:#1a2e7a;
-  --accent:#00f5d4;--accent2:#60b8ff;--warn:#ffc947;--danger:#ff5577;
+  --accent:#00f5d4;--accent2:#60b8ff;--warn:#ffc947;--danger:#ff5577;--ok:#30d158;
   --text:#deeeff;--text2:#7ab0e0;--text3:#1a3a60;
   --sidebar:#020514;--sidebar-border:#0c1840;
   --card-shadow:0 1px 3px rgba(0,0,200,0.15);
@@ -1686,6 +1687,125 @@ tbody tr:hover td{background:color-mix(in srgb,var(--bg3) 70%, transparent);}
   html[data-uisize="h"]{ --ts:1.16; }
   html[data-uisize="u"]{ --ts:1.28; }
 }
+
+/* ── Premium health / integration components (Apple-style) ───────────────────
+   Theme-aware via tokens + color-mix. Status hues: ok=--ok, warn=--warn,
+   bad=--danger; blue/purple are fixed icon accents for domain variety.
+   Used by the Health page, the SDR Hardware-Health card and the
+   Asterisk / DAPNET / GeoAlarm pages so they all match. */
+.h-wrap{max-width:1100px;}
+
+/* Hero */
+.h-hero{
+  display:flex;align-items:center;gap:18px;
+  background:var(--bg2);border:1px solid var(--border);border-radius:18px;
+  padding:18px 22px;margin-bottom:6px;box-shadow:var(--card-shadow);
+}
+.h-ring{
+  flex:0 0 auto;width:52px;height:52px;border-radius:50%;position:relative;
+  display:flex;align-items:center;justify-content:center;
+  background:color-mix(in srgb,var(--ok) 14%,transparent);
+  box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--ok) 55%,transparent),
+             0 0 18px -2px color-mix(in srgb,var(--ok) 45%,transparent);
+  color:var(--ok);transition:background .25s,box-shadow .25s,color .25s;
+}
+.h-ring svg{width:26px;height:26px;display:block;}
+.h-ring.warn{background:color-mix(in srgb,var(--warn) 14%,transparent);color:var(--warn);
+  box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--warn) 55%,transparent),0 0 18px -2px color-mix(in srgb,var(--warn) 45%,transparent);}
+.h-ring.bad{background:color-mix(in srgb,var(--danger) 14%,transparent);color:var(--danger);
+  box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--danger) 55%,transparent),0 0 18px -2px color-mix(in srgb,var(--danger) 45%,transparent);}
+.h-hero-txt{flex:1;min-width:0;display:flex;flex-direction:column;justify-content:center;}
+.h-hero-title{font-size:21px;font-weight:650;letter-spacing:-.01em;color:var(--text);line-height:1.2;}
+.h-hero-sub{font-size:14px;color:var(--text2);margin-top:3px;line-height:1.4;}
+.h-hero-meta{flex:0 0 auto;text-align:right;display:flex;flex-direction:column;justify-content:center;gap:2px;}
+.h-hero-meta .hm-val{font-size:15px;font-weight:600;color:var(--text);font-variant-numeric:tabular-nums;}
+.h-hero-meta .hm-sub{font-size:12px;color:var(--text3);}
+
+/* Section label */
+.h-sec{font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--text3);margin:22px 4px 11px;}
+
+/* Grid of cards */
+.h-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:13px;}
+
+/* Card */
+.h-card{
+  display:flex;gap:13px;align-items:flex-start;
+  background:var(--bg2);border:1px solid var(--border);border-radius:16px;
+  padding:15px 16px;box-shadow:var(--card-shadow);
+}
+.h-ico{
+  flex:0 0 auto;width:36px;height:36px;border-radius:10px;
+  display:flex;align-items:center;justify-content:center;
+  background:color-mix(in srgb,var(--accent) 14%,transparent);color:var(--accent);
+}
+.h-ico svg{width:18px;height:18px;display:block;}
+.h-ico.blue{background:color-mix(in srgb,#5ac8fa 16%,transparent);color:#5ac8fa;}
+.h-ico.purple{background:color-mix(in srgb,#bf8cff 16%,transparent);color:#bf8cff;}
+.h-ico.warn{background:color-mix(in srgb,var(--warn) 16%,transparent);color:var(--warn);}
+.h-ico.ok{background:color-mix(in srgb,var(--ok) 16%,transparent);color:var(--ok);}
+.h-ico.bad{background:color-mix(in srgb,var(--danger) 16%,transparent);color:var(--danger);}
+.h-col{flex:1;min-width:0;display:flex;flex-direction:column;}
+.h-head{display:flex;align-items:center;gap:8px;min-height:36px;}
+.h-ttl{font-size:15px;font-weight:600;letter-spacing:-.01em;color:var(--text);flex:1;min-width:0;}
+.h-card.compact .h-ttl{font-size:14px;}
+.h-pill{
+  flex:0 0 auto;font-size:11px;font-weight:700;letter-spacing:.03em;
+  border-radius:7px;padding:2px 8px;text-transform:uppercase;white-space:nowrap;
+}
+.h-pill.ok{background:color-mix(in srgb,var(--ok) 15%,transparent);color:var(--ok);}
+.h-pill.warn{background:color-mix(in srgb,var(--warn) 16%,transparent);color:var(--warn);}
+.h-pill.bad{background:color-mix(in srgb,var(--danger) 16%,transparent);color:var(--danger);}
+.h-det{font-size:13px;color:var(--text2);margin-top:6px;line-height:1.45;font-variant-numeric:tabular-nums;}
+.h-det b{color:var(--text);font-weight:600;}
+.h-det .h-status-lbl{color:var(--text3);}
+.h-todo{
+  border-top:1px solid var(--border);margin-top:11px;padding-top:10px;
+  font-size:12.5px;color:var(--text2);line-height:1.5;
+}
+.h-todo .h-todo-h{font-weight:600;color:var(--text);}
+.h-todo b{color:var(--warn);font-weight:600;}
+.h-todo ul{margin:6px 0 0 16px;padding:0;}
+.h-todo li{margin-top:3px;}
+
+/* Hardware metric strip (gauge + value) */
+.h-metricstrip{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:13px;}
+.h-metric{
+  display:flex;align-items:center;gap:14px;
+  background:var(--bg2);border:1px solid var(--border);border-radius:16px;
+  padding:14px 16px;box-shadow:var(--card-shadow);
+}
+.h-gauge{
+  flex:0 0 auto;width:48px;height:48px;border-radius:50%;position:relative;
+  display:flex;align-items:center;justify-content:center;
+  background:conic-gradient(var(--g-col,var(--ok)) calc(var(--g-pct,0)*1%),var(--border2) 0);
+}
+.h-gauge::before{
+  content:"";position:absolute;width:37px;height:37px;border-radius:50%;background:var(--bg2);
+}
+.h-gauge .h-gauge-n{position:relative;font-size:12px;font-weight:700;color:var(--text);font-variant-numeric:tabular-nums;}
+.h-mcol{display:flex;flex-direction:column;justify-content:center;min-width:0;}
+.h-mcol .h-mval{font-size:19px;font-weight:650;color:var(--text);font-variant-numeric:tabular-nums;line-height:1.1;}
+.h-mcol .h-mlbl{font-size:12px;color:var(--text3);margin-top:2px;}
+.h-mcol .h-mval.ok{color:var(--ok);}
+.h-mcol .h-mval.warn{color:var(--warn);}
+.h-mcol .h-mval.bad{color:var(--danger);}
+
+/* Legend / note row under the health page */
+.h-note{margin-top:18px;font-size:12px;color:var(--text2);line-height:1.6;}
+.h-note b.ok{color:var(--ok);}
+.h-note b.warn{color:var(--warn);}
+.h-note b.bad{color:var(--danger);}
+
+/* Premium form layout (asterisk/dapnet/geoalarm) — replaces repeated inline styles */
+.h-form{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;align-items:center;}
+.h-form.wide{grid-template-columns:repeat(auto-fit,minmax(260px,1fr));align-items:stretch;}
+.h-form-pair{display:grid;grid-template-columns:130px 1fr;gap:10px;align-items:center;}
+.h-flabel{color:var(--muted);font-size:13px;}
+.h-flabel.top{align-self:flex-start;padding-top:8px;}
+.h-finline{display:flex;align-items:center;gap:10px;}
+.h-finline .h-flabel-sm{color:var(--muted);font-size:12px;}
+.h-fopts{display:flex;gap:14px;flex-wrap:wrap;}
+.h-fopt{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:12px;}
 </style>
 </head>
 <body>
@@ -2344,8 +2464,13 @@ tbody tr:hover td{background:color-mix(in srgb,var(--bg3) 70%, transparent);}
         <div class="rf-hw-grid">
           <div class="rf-hw-temp">
             <div class="rf-qmetric-label" data-i18n="rf_temp">SDR Temperature</div>
-            <div class="rf-hw-temp-value" id="rf-temp">—</div>
-            <div class="rf-hw-temp-state" id="rf-temp-state">—</div>
+            <div class="h-metric" id="rf-temp-metric" style="background:transparent;border:none;box-shadow:none;padding:0;margin-top:4px">
+              <div class="h-gauge" id="rf-temp-gauge"><span class="h-gauge-n" id="rf-temp-gauge-n">—</span></div>
+              <div class="h-mcol">
+                <div class="h-mval" id="rf-temp">—</div>
+                <div class="h-mlbl rf-hw-temp-state" id="rf-temp-state">—</div>
+              </div>
+            </div>
           </div>
           <div class="rf-hw-gain-block">
             <div class="rf-qmetric-label" data-i18n="rf_tx_gain">TX Gain Stages (actual)</div>
@@ -2408,45 +2533,45 @@ tbody tr:hover td{background:color-mix(in srgb,var(--bg3) 70%, transparent);}
             <span class="sw"><input type="checkbox" id="snom-enabled"><i></i></span>
           </label>
 
-          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;align-items:center;margin-top:14px">
-            <label style="color:var(--muted);font-size:13px">AMI host</label>
+          <div class="h-form" style="margin-top:14px;grid-template-columns:repeat(auto-fit,minmax(220px,1fr))">
+            <label class="h-flabel">AMI host</label>
             <input type="text" id="snom-ami-host" class="form-input" placeholder="127.0.0.1">
-            <label style="color:var(--muted);font-size:13px">AMI port</label>
+            <label class="h-flabel">AMI port</label>
             <input type="number" id="snom-ami-port" class="form-input" min="1" max="65535" placeholder="5038">
-            <label style="color:var(--muted);font-size:13px">AMI user</label>
+            <label class="h-flabel">AMI user</label>
             <input type="text" id="snom-ami-user" class="form-input" autocomplete="off" spellcheck="false" placeholder="flowstation">
-            <label style="color:var(--muted);font-size:13px">AMI password</label>
+            <label class="h-flabel">AMI password</label>
             <input type="password" id="snom-ami-password" class="form-input" autocomplete="new-password" spellcheck="false" oninput="snomPasswordDirty=true">
-            <label style="color:var(--muted);font-size:13px;align-self:flex-start;padding-top:8px">PJSIP endpoints</label>
+            <label class="h-flabel top">PJSIP endpoints</label>
             <textarea id="snom-endpoints" class="form-input" rows="3" placeholder="385&#10;386"></textarea>
           </div>
 
-          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px;margin-top:16px">
+          <div class="h-form wide" style="margin-top:16px">
             <div>
               <label class="sw-row"><span class="sw-text">Notify TETRA SDS</span><span class="sw"><input type="checkbox" id="snom-notify-sds"><i></i></span></label>
-              <div style="display:flex;gap:14px;flex-wrap:wrap;margin:8px 0 10px;color:var(--muted);font-size:13px">
-                <label><input type="checkbox" id="snom-dir-rx"> RX</label>
-                <label><input type="checkbox" id="snom-dir-net"> NET</label>
-                <label><input type="checkbox" id="snom-dir-tx"> TX</label>
+              <div class="h-fopts" style="margin:8px 0 10px">
+                <label class="h-fopt"><input type="checkbox" id="snom-dir-rx"> RX</label>
+                <label class="h-fopt"><input type="checkbox" id="snom-dir-net"> NET</label>
+                <label class="h-fopt"><input type="checkbox" id="snom-dir-tx"> TX</label>
               </div>
-              <label style="color:var(--muted);font-size:13px">SDS ISSI whitelist</label>
+              <label class="h-flabel">SDS ISSI whitelist</label>
               <textarea id="snom-sds-issis" class="form-input" rows="4" placeholder="2632585&#10;9999"></textarea>
               <div class="help-text">Empty = every SDS. A match on source or destination ISSI is enough.</div>
             </div>
             <div>
               <label class="sw-row"><span class="sw-text">Notify DAPNET</span><span class="sw"><input type="checkbox" id="snom-notify-dapnet"><i></i></span></label>
-              <label style="color:var(--muted);font-size:13px">DAPNET RIC whitelist</label>
+              <label class="h-flabel">DAPNET RIC whitelist</label>
               <textarea id="snom-dapnet-rics" class="form-input" rows="4" placeholder="0632585&#10;0000200"></textarea>
               <div class="help-text">Empty = every DAPNET message. Leading zeros are preserved in config.</div>
             </div>
             <div>
               <label class="sw-row"><span class="sw-text">Notify Telegram</span><span class="sw"><input type="checkbox" id="snom-notify-telegram"><i></i></span></label>
-              <div style="display:grid;grid-template-columns:130px 1fr;gap:10px;align-items:center;margin-top:10px">
-                <label style="color:var(--muted);font-size:13px">Title prefix</label>
+              <div class="h-form-pair" style="margin-top:10px">
+                <label class="h-flabel">Title prefix</label>
                 <input type="text" id="snom-title-prefix" class="form-input" placeholder="FlowStation">
-                <label style="color:var(--muted);font-size:13px">Max text chars</label>
+                <label class="h-flabel">Max text chars</label>
                 <input type="number" id="snom-max-text" class="form-input" min="40" max="2000" placeholder="240">
-                <label style="color:var(--muted);font-size:13px">Timeout (s)</label>
+                <label class="h-flabel">Timeout (s)</label>
                 <input type="number" id="snom-timeout" class="form-input" min="1" max="30" placeholder="3">
               </div>
             </div>
@@ -2506,33 +2631,33 @@ tbody tr:hover td{background:color-mix(in srgb,var(--bg3) 70%, transparent);}
             <span class="sw"><input type="checkbox" id="dap-rwth-enabled"><i></i></span>
           </label>
 
-          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;align-items:center;margin-top:14px">
-            <label style="color:var(--muted);font-size:13px">Poll interval (s)</label>
+          <div class="h-form" style="margin-top:14px">
+            <label class="h-flabel">Poll interval (s)</label>
             <input type="number" id="dap-poll" class="form-input" min="1" placeholder="30">
-            <label style="color:var(--muted);font-size:13px">Messages limit</label>
+            <label class="h-flabel">Messages limit</label>
             <input type="number" id="dap-limit" class="form-input" min="1" placeholder="100">
 
-            <label style="color:var(--muted);font-size:13px">Hampager API URL</label>
+            <label class="h-flabel">Hampager API URL</label>
             <input type="text" id="dap-api-url" class="form-input" placeholder="https://hampager.de/api/calls" style="grid-column:1 / -1;min-width:0">
 
-            <label style="color:var(--muted);font-size:13px">API username</label>
+            <label class="h-flabel">API username</label>
             <input type="text" id="dap-username" class="form-input" autocomplete="off" spellcheck="false">
-            <label style="color:var(--muted);font-size:13px">API password</label>
+            <label class="h-flabel">API password</label>
             <input type="password" id="dap-password" class="form-input" autocomplete="new-password" spellcheck="false" oninput="dapPasswordDirty=true">
 
-            <label style="color:var(--muted);font-size:13px">RWTH host</label>
+            <label class="h-flabel">RWTH host</label>
             <input type="text" id="dap-rwth-host" class="form-input" placeholder="dapnet.afu.rwth-aachen.de">
-            <label style="color:var(--muted);font-size:13px">RWTH port</label>
+            <label class="h-flabel">RWTH port</label>
             <input type="number" id="dap-rwth-port" class="form-input" min="1" max="65535" placeholder="43434">
 
-            <label style="color:var(--muted);font-size:13px">Device</label>
+            <label class="h-flabel">Device</label>
             <input type="text" id="dap-rwth-device" class="form-input" placeholder="FlowStation">
-            <label style="color:var(--muted);font-size:13px">Version</label>
+            <label class="h-flabel">Version</label>
             <input type="text" id="dap-rwth-version" class="form-input" placeholder="1.0">
 
-            <label style="color:var(--muted);font-size:13px">RWTH callsign</label>
+            <label class="h-flabel">RWTH callsign</label>
             <input type="text" id="dap-rwth-callsign" class="form-input" autocomplete="off" spellcheck="false" style="text-transform:uppercase">
-            <label style="color:var(--muted);font-size:13px">RWTH authkey</label>
+            <label class="h-flabel">RWTH authkey</label>
             <input type="password" id="dap-rwth-authkey" class="form-input" autocomplete="new-password" spellcheck="false" oninput="dapAuthDirty=true">
           </div>
           <div class="config-msg" id="dap-msg"></div>
@@ -2547,47 +2672,47 @@ tbody tr:hover td{background:color-mix(in srgb,var(--bg3) 70%, transparent);}
           </div>
         </div>
         <div class="card-body">
-          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px">
+          <div class="h-form wide">
             <div>
               <label class="sw-row"><span class="sw-text">Forward to SDS</span><span class="sw"><input type="checkbox" id="dap-forward-sds"><i></i></span></label>
-              <div style="display:grid;grid-template-columns:130px 1fr;gap:10px;align-items:center;margin-top:10px">
-                <label style="color:var(--muted);font-size:13px">Source ISSI</label>
+              <div class="h-form-pair" style="margin-top:10px">
+                <label class="h-flabel">Source ISSI</label>
                 <input type="number" id="dap-sds-source" class="form-input" min="1" max="16777215" placeholder="9999">
-                <label style="color:var(--muted);font-size:13px">Destination</label>
+                <label class="h-flabel">Destination</label>
                 <input type="number" id="dap-sds-dest" class="form-input" min="0" max="16777215" placeholder="ISSI or GSSI">
-                <label style="color:var(--muted);font-size:13px">Destination is group</label>
-                <label style="display:flex;align-items:center;gap:10px"><span class="sw"><input type="checkbox" id="dap-sds-group"><i></i></span><span style="color:var(--muted);font-size:12px">GSSI</span></label>
-                <label style="color:var(--muted);font-size:13px;align-self:flex-start;padding-top:8px">RIC → ISSI</label>
+                <label class="h-flabel">Destination is group</label>
+                <label class="h-finline"><span class="sw"><input type="checkbox" id="dap-sds-group"><i></i></span><span class="h-flabel-sm">GSSI</span></label>
+                <label class="h-flabel top">RIC → ISSI</label>
                 <textarea id="dap-ric-routes" class="form-input" rows="3" placeholder="0632585=2632585"></textarea>
-                <label style="color:var(--muted);font-size:13px;align-self:flex-start;padding-top:8px">RIC → GSSI</label>
+                <label class="h-flabel top">RIC → GSSI</label>
                 <textarea id="dap-ric-group-routes" class="form-input" rows="3" placeholder="0004520=80"></textarea>
-                <label style="color:var(--muted);font-size:13px;align-self:flex-start;padding-top:8px">SDS RIC filter</label>
+                <label class="h-flabel top">SDS RIC filter</label>
                 <textarea id="dap-sds-rics" class="form-input" rows="3" placeholder="0004520&#10;0000200"></textarea>
               </div>
             </div>
 
             <div>
               <label class="sw-row"><span class="sw-text">Forward to TPG2200 Call-Out</span><span class="sw"><input type="checkbox" id="dap-forward-callout"><i></i></span></label>
-              <div style="display:grid;grid-template-columns:130px 1fr;gap:10px;align-items:center;margin-top:10px">
-                <label style="color:var(--muted);font-size:13px">Source ISSI</label>
+              <div class="h-form-pair" style="margin-top:10px">
+                <label class="h-flabel">Source ISSI</label>
                 <input type="number" id="dap-callout-source" class="form-input" min="1" max="16777215" placeholder="9999">
-                <label style="color:var(--muted);font-size:13px">Destination</label>
+                <label class="h-flabel">Destination</label>
                 <input type="number" id="dap-callout-dest" class="form-input" min="0" max="16777215" placeholder="TPG2200 ISSI">
-                <label style="color:var(--muted);font-size:13px">Incident base</label>
+                <label class="h-flabel">Incident base</label>
                 <input type="number" id="dap-callout-incident" class="form-input" min="1" max="256" placeholder="2">
-                <label style="color:var(--muted);font-size:13px">Text prefix</label>
+                <label class="h-flabel">Text prefix</label>
                 <input type="text" id="dap-callout-prefix" class="form-input" placeholder="DAPNET">
-                <label style="color:var(--muted);font-size:13px;align-self:flex-start;padding-top:8px">Call-Out RIC filter</label>
+                <label class="h-flabel top">Call-Out RIC filter</label>
                 <textarea id="dap-callout-rics" class="form-input" rows="3" placeholder="0004520"></textarea>
               </div>
             </div>
 
             <div>
               <label class="sw-row"><span class="sw-text">Forward to Telegram</span><span class="sw"><input type="checkbox" id="dap-forward-telegram"><i></i></span></label>
-              <div style="display:grid;grid-template-columns:130px 1fr;gap:10px;align-items:center;margin-top:10px">
-                <label style="color:var(--muted);font-size:13px">Telegram prefix</label>
+              <div class="h-form-pair" style="margin-top:10px">
+                <label class="h-flabel">Telegram prefix</label>
                 <input type="text" id="dap-telegram-prefix" class="form-input" placeholder="DAPNET">
-                <label style="color:var(--muted);font-size:13px;align-self:flex-start;padding-top:8px">Telegram RIC filter</label>
+                <label class="h-flabel top">Telegram RIC filter</label>
                 <textarea id="dap-telegram-rics" class="form-input" rows="3" placeholder="0004520"></textarea>
               </div>
               <div class="help-text" style="margin-top:10px">Uses the existing Telegram alert configuration and recipients.</div>
@@ -2604,14 +2729,14 @@ tbody tr:hover td{background:color-mix(in srgb,var(--bg3) 70%, transparent);}
           </div>
         </div>
         <div class="card-body">
-          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;align-items:center">
-            <label style="color:var(--muted);font-size:13px">Callsign recipients</label>
+          <div class="h-form">
+            <label class="h-flabel">Callsign recipients</label>
             <input type="text" id="dap-out-callsigns" class="form-input" placeholder="DJ2TH, DB0ABC">
-            <label style="color:var(--muted);font-size:13px">Transmitter groups</label>
+            <label class="h-flabel">Transmitter groups</label>
             <input type="text" id="dap-out-groups" class="form-input" placeholder="dl-all, regional">
-            <label style="color:var(--muted);font-size:13px">Emergency</label>
-            <label style="display:flex;align-items:center;gap:10px"><span class="sw"><input type="checkbox" id="dap-out-emergency"><i></i></span><span style="color:var(--muted);font-size:12px">Set emergency flag</span></label>
-            <label style="color:var(--muted);font-size:13px;align-self:flex-start;padding-top:8px">Message</label>
+            <label class="h-flabel">Emergency</label>
+            <label class="h-finline"><span class="sw"><input type="checkbox" id="dap-out-emergency"><i></i></span><span class="h-flabel-sm">Set emergency flag</span></label>
+            <label class="h-flabel top">Message</label>
             <textarea id="dap-out-text" class="form-input" rows="3" maxlength="80" placeholder="Message text"></textarea>
           </div>
           <div class="config-msg" id="dap-send-msg"></div>
@@ -2652,20 +2777,20 @@ tbody tr:hover td{background:color-mix(in srgb,var(--bg3) 70%, transparent);}
             <span class="sw-text">Enable GeoAlarm</span>
             <span class="sw"><input type="checkbox" id="geo-enabled"><i></i></span>
           </label>
-          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;align-items:center;margin-top:14px">
-            <label style="color:var(--muted);font-size:13px">FlowStation latitude</label>
+          <div class="h-form" style="margin-top:14px">
+            <label class="h-flabel">FlowStation latitude</label>
             <input type="number" id="geo-lat" class="form-input" step="0.000001" min="-90" max="90" placeholder="50.775346">
-            <label style="color:var(--muted);font-size:13px">FlowStation longitude</label>
+            <label class="h-flabel">FlowStation longitude</label>
             <input type="number" id="geo-lon" class="form-input" step="0.000001" min="-180" max="180" placeholder="6.083887">
-            <label style="color:var(--muted);font-size:13px">Radius / cooldown</label>
+            <label class="h-flabel">Radius / cooldown</label>
             <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
               <input type="number" id="geo-radius-m" class="form-input" min="1" step="1" placeholder="500">
               <input type="number" id="geo-cooldown" class="form-input" min="1" max="86400" placeholder="300">
             </div>
-            <label style="color:var(--muted);font-size:13px">Input sources</label>
-            <div style="display:flex;gap:14px;flex-wrap:wrap">
-              <label style="display:flex;align-items:center;gap:8px"><span class="sw"><input type="checkbox" id="geo-trigger-tetra"><i></i></span><span style="color:var(--muted);font-size:12px">TETRA LIP</span></label>
-              <label style="display:flex;align-items:center;gap:8px"><span class="sw"><input type="checkbox" id="geo-trigger-meshcom"><i></i></span><span style="color:var(--muted);font-size:12px">MeshCom</span></label>
+            <label class="h-flabel">Input sources</label>
+            <div class="h-fopts">
+              <label class="h-fopt"><span class="sw"><input type="checkbox" id="geo-trigger-tetra"><i></i></span><span class="h-flabel-sm">TETRA LIP</span></label>
+              <label class="h-fopt"><span class="sw"><input type="checkbox" id="geo-trigger-meshcom"><i></i></span><span class="h-flabel-sm">MeshCom</span></label>
             </div>
           </div>
           <div class="help-text" style="margin-top:10px">GeoAlarm fires when an allowed device enters the radius, then suppresses repeated alarms for the cooldown time.</div>
@@ -2678,7 +2803,7 @@ tbody tr:hover td{background:color-mix(in srgb,var(--bg3) 70%, transparent);}
           <div class="card-title">GeoAlarm Routing</div>
         </div>
         <div class="card-body">
-          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px">
+          <div class="h-form wide" style="grid-template-columns:repeat(auto-fit,minmax(280px,1fr))">
             <div>
               <label class="sw-row">
                 <span class="sw-text">Alarm → TPG2200</span>
@@ -2703,7 +2828,7 @@ tbody tr:hover td{background:color-mix(in srgb,var(--bg3) 70%, transparent);}
                 <input type="number" id="geo-sds-source" class="form-input" min="1" max="16777215" placeholder="Source ISSI">
                 <input type="number" id="geo-sds-dest" class="form-input" min="0" max="16777215" placeholder="Destination ISSI/GSSI">
               </div>
-              <label style="display:flex;align-items:center;gap:10px;margin-top:10px"><span class="sw"><input type="checkbox" id="geo-sds-group"><i></i></span><span style="color:var(--muted);font-size:12px">Destination is group/GSSI</span></label>
+              <label class="h-finline" style="margin-top:10px"><span class="sw"><input type="checkbox" id="geo-sds-group"><i></i></span><span class="h-flabel-sm">Destination is group/GSSI</span></label>
             </div>
             <div>
               <label class="sw-row">
@@ -2726,21 +2851,21 @@ tbody tr:hover td{background:color-mix(in srgb,var(--bg3) 70%, transparent);}
           <div class="card-title">GeoAlarm Filters</div>
         </div>
         <div class="card-body">
-          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:14px">
+          <div class="h-form wide">
             <div>
-              <label style="color:var(--muted);font-size:13px">TETRA ISSI whitelist</label>
+              <label class="h-flabel">TETRA ISSI whitelist</label>
               <textarea id="geo-tetra-white" class="form-input" rows="4" placeholder="empty = all TETRA ISSIs"></textarea>
             </div>
             <div>
-              <label style="color:var(--muted);font-size:13px">TETRA ISSI blacklist</label>
+              <label class="h-flabel">TETRA ISSI blacklist</label>
               <textarea id="geo-tetra-black" class="form-input" rows="4" placeholder="blocked ISSIs"></textarea>
             </div>
             <div>
-              <label style="color:var(--muted);font-size:13px">MeshCom source whitelist</label>
+              <label class="h-flabel">MeshCom source whitelist</label>
               <textarea id="geo-mesh-white" class="form-input" rows="4" placeholder="empty = all MeshCom sources"></textarea>
             </div>
             <div>
-              <label style="color:var(--muted);font-size:13px">MeshCom source blacklist</label>
+              <label class="h-flabel">MeshCom source blacklist</label>
               <textarea id="geo-mesh-black" class="form-input" rows="4" placeholder="blocked MeshCom sources"></textarea>
             </div>
           </div>
@@ -3061,26 +3186,29 @@ tbody tr:hover td{background:color-mix(in srgb,var(--bg3) 70%, transparent);}
 
     <!-- ── SYSTEM ── -->
     <div class="page" id="page-health">
-      <div style="max-width:1100px">
-        <div id="health-hero" style="display:flex;align-items:center;gap:16px;padding:18px 20px;border-radius:14px;border:1px solid var(--border,#2a2f3a);background:var(--bg2,#161a22);margin-bottom:18px">
-          <div id="health-hero-dot" style="width:44px;height:44px;border-radius:50%;flex:0 0 auto;background:#3a3f4a"></div>
-          <div style="flex:1;min-width:0">
-            <div id="health-hero-title" style="font-size:22px;font-weight:700;color:var(--text)">Station health</div>
-            <div id="health-hero-sub" style="font-size:14px;color:var(--text2,#9aa4b2);margin-top:3px">Waiting for the first health snapshot…</div>
+      <div class="h-wrap">
+        <div id="health-hero" class="h-hero">
+          <div id="health-hero-dot" class="h-ring">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
           </div>
-          <div style="text-align:right;color:var(--text2,#9aa4b2);font-size:13px;flex:0 0 auto">
-            <div id="health-uptime">—</div>
-            <div id="health-action" style="margin-top:4px"></div>
+          <div class="h-hero-txt">
+            <div id="health-hero-title" class="h-hero-title">Station health</div>
+            <div id="health-hero-sub" class="h-hero-sub">Waiting for the first health snapshot…</div>
+          </div>
+          <div class="h-hero-meta">
+            <div id="health-uptime" class="hm-val">—</div>
+            <div id="health-action" class="hm-sub"></div>
           </div>
         </div>
-        <div id="health-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:14px"></div>
-        <div style="margin-top:18px;font-size:13px;font-weight:700;color:var(--text);letter-spacing:.04em;text-transform:uppercase">Integrations</div>
-        <div id="health-integrations-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:14px;margin-top:10px">
+        <div class="h-sec">System domains</div>
+        <div id="health-grid" class="h-grid"></div>
+        <div class="h-sec">Integrations</div>
+        <div id="health-integrations-grid" class="h-grid">
           <div class="sds-empty" style="padding:12px 0">Loading integration health…</div>
         </div>
-        <div style="margin-top:16px;font-size:12px;color:var(--text2,#9aa4b2);line-height:1.6">
+        <div class="h-note">
           Auto-refreshes every few seconds. Levels:
-          <b style="color:#3fb950">OK</b> · <b style="color:var(--warn)">DEGRADED</b> · <b style="color:var(--danger)">CRITICAL</b>.
+          <b class="ok">OK</b> · <b class="warn">DEGRADED</b> · <b class="bad">CRITICAL</b>.
           The software watchdog (auto-restart when the core loop stalls) is configured in the <code>[health]</code> section.
         </div>
       </div>
@@ -6106,24 +6234,33 @@ function handleSdrHealth(msg){
   rfState.lastHwTs = Date.now();
   setText('rf-hw-age', t('rf_just_now')||'just now');
 
-  // Temperature with named state. Thresholds chosen so a typical LimeSDR running
-  // at room temp (~45-55°C) reads "nominal", >65 is "warm", >80 is "hot".
-  const tempEl = document.getElementById('rf-temp');
+  // Temperature with named state, rendered as a conic gauge. Thresholds chosen so a
+  // typical LimeSDR running at room temp (~45-55°C) reads "nominal", >65 "warm", >80 "hot".
+  const tempEl  = document.getElementById('rf-temp');
   const stateEl = document.getElementById('rf-temp-state');
+  const gauge   = document.getElementById('rf-temp-gauge');
+  const gaugeN  = document.getElementById('rf-temp-gauge-n');
   if(tempEl && stateEl){
     if(msg.temperature_c == null){
       tempEl.textContent = '—';
+      tempEl.className = 'h-mval';
       stateEl.textContent = t('rf_temp_na')||'no sensor';
-      stateEl.className = 'rf-hw-temp-state';
+      stateEl.className = 'h-mlbl rf-hw-temp-state';
+      if(gauge){ gauge.style.setProperty('--g-pct',0); gauge.style.setProperty('--g-col','var(--border2)'); }
+      if(gaugeN) gaugeN.textContent = '—';
     } else {
       const tc = msg.temperature_c;
       tempEl.textContent = tc.toFixed(1) + ' °C';
-      let cls = 'nominal', label = t('rf_temp_nominal')||'nominal';
-      if(tc < 20){ cls='cold'; label = t('rf_temp_cold')||'cold'; }
-      else if(tc > 80){ cls='hot'; label = t('rf_temp_hot')||'hot'; }
-      else if(tc > 65){ cls='warm'; label = t('rf_temp_warm')||'warm'; }
+      // gauge: map 0-100°C → 0-100%, colour by status band.
+      let cls = 'nominal', label = t('rf_temp_nominal')||'nominal', mval='', gcol='var(--ok)';
+      if(tc < 20){ cls='cold'; label = t('rf_temp_cold')||'cold'; gcol='var(--accent2)'; }
+      else if(tc > 80){ cls='hot'; label = t('rf_temp_hot')||'hot'; mval='bad'; gcol='var(--danger)'; }
+      else if(tc > 65){ cls='warm'; label = t('rf_temp_warm')||'warm'; mval='warn'; gcol='var(--warn)'; }
+      tempEl.className = 'h-mval' + (mval?(' '+mval):'');
       stateEl.textContent = label;
-      stateEl.className = 'rf-hw-temp-state ' + cls;
+      stateEl.className = 'h-mlbl rf-hw-temp-state ' + cls;
+      if(gauge){ gauge.style.setProperty('--g-pct',Math.max(0,Math.min(100,Math.round(tc)))); gauge.style.setProperty('--g-col',gcol); }
+      if(gaugeN) gaugeN.textContent = Math.round(tc) + '°';
     }
   }
   renderGainList('rf-tx-gains', msg.tx_gains || []);
@@ -6183,9 +6320,33 @@ const HEALTH_ADVICE = {
            'Reduce broadcast/SDS load until the queues drain.'] },
   },
 };
-function healthColor(lvl){ return lvl==='critical' ? 'var(--danger)' : (lvl==='degraded' ? 'var(--warn)' : '#3fb950'); }
+function healthColor(lvl){ return lvl==='critical' ? 'var(--danger)' : (lvl==='degraded' ? 'var(--warn)' : 'var(--ok)'); }
+// Map a health level to the premium status class suffix used by .h-pill / .h-ring / .h-ico.
+function healthLevelClass(lvl){ return lvl==='critical' ? 'bad' : (lvl==='degraded' ? 'warn' : 'ok'); }
 function healthDomainLabel(d){ return ({service:'Core loop',backhaul:'Backhaul (Brew)',radios:'Radios',congestion:'Congestion'})[d] || d; }
-function healthDomainIcon(d){ return ({service:'🔄',backhaul:'🛰️',radios:'📻',congestion:'📊'})[d] || '•'; }
+// Clean inline SVGs replace the old emoji domain icons. {svg, accent} where accent
+// drives the tinted .h-ico colour (default accent / blue / purple for domain variety).
+const HEALTH_SVG = {
+  service:{svg:'<path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/>',accent:''},
+  backhaul:{svg:'<path d="M4.93 4.93a14 14 0 0 0 0 14.14M19.07 4.93a14 14 0 0 1 0 14.14M8.46 8.46a7 7 0 0 0 0 7.08M15.54 8.46a7 7 0 0 1 0 7.08"/><circle cx="12" cy="12" r="1.5"/>',accent:'blue'},
+  radios:{svg:'<rect x="3" y="9" width="13" height="11" rx="1.5"/><path d="M16 4 9 9"/><circle cx="7.5" cy="14.5" r="2.5"/><path d="M19 10v9"/>',accent:'purple'},
+  congestion:{svg:'<path d="M3 3v18h18"/><rect x="7" y="11" width="3" height="6"/><rect x="13" y="7" width="3" height="10"/>',accent:''},
+};
+function healthDomainSvg(d){
+  const m = HEALTH_SVG[d] || {svg:'<circle cx="12" cy="12" r="3"/>',accent:''};
+  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'+m.svg+'</svg>';
+}
+function healthDomainAccent(d){ return (HEALTH_SVG[d]||{}).accent || ''; }
+// Inline SVGs for the integration cards (replace ☎ 📟 ◎).
+const INTEGRATION_SVG = {
+  asterisk:'<path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.9.34 1.85.57 2.81.7A2 2 0 0 1 22 16.92z"/>',
+  dapnet:'<rect x="5" y="2" width="14" height="20" rx="2"/><path d="M9 6h6M9 10h6M9 14h3"/>',
+  geoalarm:'<path d="M12 21s-7-5.5-7-11a7 7 0 0 1 14 0c0 5.5-7 11-7 11z"/><circle cx="12" cy="10" r="2.5"/>',
+};
+function integrationSvg(key){
+  const p = INTEGRATION_SVG[key] || '<circle cx="12" cy="12" r="3"/>';
+  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'+p+'</svg>';
+}
 function healthDur(s){ s=Math.max(0,Math.floor(s||0)); const d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60);
   return d>0 ? (d+'d '+h+'h') : (h>0 ? (h+'h '+m+'m') : (m+'m')); }
 
@@ -6198,7 +6359,8 @@ function renderHealthTab(h){
   const sub   = document.getElementById('health-hero-sub');
   const up    = document.getElementById('health-uptime');
   const act   = document.getElementById('health-action');
-  if(dot)   dot.style.background = healthColor(overall);
+  // Hero ring: status-tinted via class (was a bg colour) — keeps the SVG check inside.
+  if(dot)   dot.className = 'h-ring ' + healthLevelClass(overall);
   if(title) title.textContent = 'Station health: ' + overall.toUpperCase();
   const bad = (h.domains||[]).filter(function(d){return d.level!=='ok';});
   if(sub) sub.textContent = bad.length
@@ -6211,42 +6373,48 @@ function renderHealthTab(h){
   (h.domains||[]).forEach(function(d){
     const branch = HEALTH_ADVICE[d.domain] || {};
     const adv = branch[d.level] || branch.degraded || { why:'', do:[] };
-    const col = healthColor(d.level);
+    const lvlCls = healthLevelClass(d.level);
+    const accent = d.level==='ok' ? healthDomainAccent(d.domain) : lvlCls;
     const card = document.createElement('div');
-    card.style.cssText = 'border:1px solid var(--border,#2a2f3a);border-left:4px solid '+col+';border-radius:12px;padding:14px 16px;background:var(--bg2,#161a22)';
-    let doHtml = '';
+    card.className = 'h-card';
+    let todoHtml = '';
     if(d.level!=='ok' && adv.do && adv.do.length){
-      doHtml = '<div style="margin-top:10px;font-size:13px;color:var(--text)"><b>What to do</b>'
-             + '<ul style="margin:6px 0 0 18px;padding:0;color:var(--text2,#9aa4b2);line-height:1.55">'
+      todoHtml = '<div class="h-todo"><span class="h-todo-h">What to do</span><ul>'
              + adv.do.map(function(x){return '<li>'+escHtml(x)+'</li>';}).join('')
              + '</ul></div>';
     }
     card.innerHTML =
-      '<div style="display:flex;align-items:center;gap:8px">'
-        + '<span style="font-size:18px">'+healthDomainIcon(d.domain)+'</span>'
-        + '<span style="font-weight:700;color:var(--text);flex:1">'+escHtml(healthDomainLabel(d.domain))+'</span>'
-        + '<span style="font-size:11px;font-weight:700;letter-spacing:.5px;color:'+col+';border:1px solid '+col+';border-radius:6px;padding:2px 8px">'+(d.level||'').toUpperCase()+'</span>'
-      + '</div>'
-      + '<div style="margin-top:8px;font-size:13px;color:var(--text2,#9aa4b2)"><span style="opacity:.6">Status:</span> '+escHtml(d.detail||'')+'</div>'
-      + (adv.why ? '<div style="margin-top:6px;font-size:13px;color:var(--text2,#9aa4b2);line-height:1.5">'+escHtml(adv.why)+'</div>' : '')
-      + doHtml;
+      '<div class="h-ico '+accent+'">'+healthDomainSvg(d.domain)+'</div>'
+      + '<div class="h-col">'
+        + '<div class="h-head">'
+          + '<span class="h-ttl">'+escHtml(healthDomainLabel(d.domain))+'</span>'
+          + '<span class="h-pill '+lvlCls+'">'+(d.level||'').toUpperCase()+'</span>'
+        + '</div>'
+        + '<div class="h-det"><span class="h-status-lbl">Status:</span> '+escHtml(d.detail||'')+'</div>'
+        + (adv.why ? '<div class="h-det">'+escHtml(adv.why)+'</div>' : '')
+        + todoHtml
+      + '</div>';
     grid.appendChild(card);
   });
 }
 
 let healthIntegrationState={asterisk:null,dapnet:null,geoalarm:null,lastLoad:0};
-function integrationHealthCard(title,icon,level,detail,extra){
-  const col=healthColor(level);
+// title, iconKey (asterisk|dapnet|geoalarm), accent (blue|purple|''), level, detail, extra.
+function integrationHealthCard(title,iconKey,accent,level,detail,extra){
+  const lvlCls = healthLevelClass(level);
+  const icoCls = level==='ok' ? accent : lvlCls;
   const card=document.createElement('div');
-  card.style.cssText='border:1px solid var(--border,#2a2f3a);border-left:4px solid '+col+';border-radius:12px;padding:14px 16px;background:var(--bg2,#161a22)';
+  card.className='h-card compact';
   card.innerHTML=
-    '<div style="display:flex;align-items:center;gap:8px">'
-      + '<span style="font-size:18px">'+icon+'</span>'
-      + '<span style="font-weight:700;color:var(--text);flex:1">'+escHtml(title)+'</span>'
-      + '<span style="font-size:11px;font-weight:700;letter-spacing:.5px;color:'+col+';border:1px solid '+col+';border-radius:6px;padding:2px 8px">'+level.toUpperCase()+'</span>'
-    + '</div>'
-    + '<div style="margin-top:8px;font-size:13px;color:var(--text2,#9aa4b2)"><span style="opacity:.6">Status:</span> '+escHtml(detail||'')+'</div>'
-    + (extra?'<div style="margin-top:6px;font-size:13px;color:var(--text2,#9aa4b2);line-height:1.5">'+escHtml(extra)+'</div>':'');
+    '<div class="h-ico '+icoCls+'">'+integrationSvg(iconKey)+'</div>'
+    + '<div class="h-col">'
+      + '<div class="h-head">'
+        + '<span class="h-ttl">'+escHtml(title)+'</span>'
+        + '<span class="h-pill '+lvlCls+'">'+level.toUpperCase()+'</span>'
+      + '</div>'
+      + '<div class="h-det"><span class="h-status-lbl">Status:</span> '+escHtml(detail||'')+'</div>'
+      + (extra?'<div class="h-det">'+escHtml(extra)+'</div>':'')
+    + '</div>';
   return card;
 }
 function classifyAsteriskHealth(data){
@@ -6313,21 +6481,21 @@ function renderHealthIntegrations(){
   grid.innerHTML='';
   if(healthIntegrationState.asterisk){
     const a=classifyAsteriskHealth(healthIntegrationState.asterisk);
-    grid.appendChild(integrationHealthCard('Asterisk SIP','☎',a.level,a.detail,a.extra));
+    grid.appendChild(integrationHealthCard('Asterisk SIP','asterisk','',a.level,a.detail,a.extra));
   } else {
-    grid.appendChild(integrationHealthCard('Asterisk SIP','☎','degraded','status unavailable','Open the Asterisk SIP page or wait for the next refresh.'));
+    grid.appendChild(integrationHealthCard('Asterisk SIP','asterisk','','degraded','status unavailable','Open the Asterisk SIP page or wait for the next refresh.'));
   }
   if(healthIntegrationState.dapnet){
     const d=classifyDapnetHealth(healthIntegrationState.dapnet);
-    grid.appendChild(integrationHealthCard('DAPNET','📟',d.level,d.detail,d.extra));
+    grid.appendChild(integrationHealthCard('DAPNET','dapnet','blue',d.level,d.detail,d.extra));
   } else {
-    grid.appendChild(integrationHealthCard('DAPNET','📟','degraded','status unavailable','Open the DAPNET page or wait for the next refresh.'));
+    grid.appendChild(integrationHealthCard('DAPNET','dapnet','blue','degraded','status unavailable','Open the DAPNET page or wait for the next refresh.'));
   }
   if(healthIntegrationState.geoalarm){
     const g=classifyGeoalarmHealth(healthIntegrationState.geoalarm);
-    grid.appendChild(integrationHealthCard('GeoAlarm','◎',g.level,g.detail,g.extra));
+    grid.appendChild(integrationHealthCard('GeoAlarm','geoalarm','purple',g.level,g.detail,g.extra));
   } else {
-    grid.appendChild(integrationHealthCard('GeoAlarm','◎','degraded','status unavailable','Open the GeoAlarm page or wait for the next refresh.'));
+    grid.appendChild(integrationHealthCard('GeoAlarm','geoalarm','purple','degraded','status unavailable','Open the GeoAlarm page or wait for the next refresh.'));
   }
 }
 async function loadHealthIntegrations(){
