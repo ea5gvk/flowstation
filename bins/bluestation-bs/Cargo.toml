@@ -2,6 +2,7 @@
 name = "bluestation-bs"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "bluestation-bs"
@@ -29,3 +30,35 @@ tracing-appender = { workspace = true }
 
 [lints]
 workspace = true
+
+# ── Debian package (.deb) — built in CI by cargo-deb ───────────────────────────
+# Ships the prebuilt aarch64 binary + a systemd service + a default config, so a
+# Raspberry Pi 4/5 user can `apt install ./flowstation_*.deb` instead of compiling.
+# Asterisk SIP voice is NOT in this package (default features; no native codec).
+# Runtime requirement: SoapySDR >= 0.8 and the SXceiver SoapySDR module must be
+# present on the device (provided by the image / your SDR setup).
+[package.metadata.deb]
+name = "flowstation"
+maintainer = "Razvan Zeces <razvan@zeces.ro>"
+copyright = "2026, Razvan Zeces / FlowStation.Dev"
+section = "comm"
+priority = "optional"
+depends = "libc6"
+extended-description = """\
+FlowStation TETRA base station (bluestation-bs) — prebuilt aarch64 binary with a \
+systemd service and a default configuration. Configure it from the web dashboard \
+(http://flowstation.local once running). Requires a SoapySDR-supported SDR \
+(SXceiver) on the device. Asterisk SIP/PSTN voice is not included in this package."""
+conf-files = ["/etc/flowstation/config.toml"]
+assets = [
+    ["target/release/bluestation-bs", "usr/bin/bluestation-bs", "755"],
+    ["../../example_config/config.toml", "etc/flowstation/config.toml", "644"],
+    ["../../README.md", "usr/share/doc/flowstation/README.md", "644"],
+]
+
+[package.metadata.deb.systemd-units]
+unit-scripts = "../../contrib/packaging"
+unit-name = "bluestation-bs"
+enable = true
+start = false
+restart-after-upgrade = false

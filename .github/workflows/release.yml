@@ -4,6 +4,13 @@ on:
   push:
     tags:
       - 'v*'
+  # Manual run: rebuild assets and attach them to an EXISTING tag/release
+  # (e.g. to backfill the .deb onto v0.3.6). Pick the tag in the Actions UI.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to (re)build and attach assets to (e.g. v0.3.6)'
+        required: true
 
 jobs:
   build:
@@ -11,6 +18,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # On a tag push, github.ref is the tag. On a manual run, check out the
+          # tag the user typed so the build matches that release.
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -18,10 +29,21 @@ jobs:
       - name: Install cross
         run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Build aarch64
+      - name: Build aarch64 binary
         run: cross build --release --target aarch64-unknown-linux-gnu
 
-      - name: Create Release
+      - name: Install cargo-deb
+        run: cargo install cargo-deb
+
+      - name: Build .deb (aarch64)
+        # --no-build: reuse the cross-built binary above.
+        # --no-strip: the runner has no aarch64 strip; keep the binary as-is.
+        run: cargo deb --no-build --no-strip -p bluestation-bs --target aarch64-unknown-linux-gnu --output flowstation_arm64.deb
+
+      - name: Create / update Release
         uses: softprops/action-gh-release@v2
         with:
-          files: target/aarch64-unknown-linux-gnu/release/bluestation-bs
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            target/aarch64-unknown-linux-gnu/release/bluestation-bs
+            flowstation_arm64.deb

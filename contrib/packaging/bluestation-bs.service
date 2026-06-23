@@ -1,0 +1,20 @@
+[Unit]
+Description=FlowStation TETRA base station
+Documentation=https://github.com/razvanzeces/flowstation
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/bluestation-bs /etc/flowstation/config.toml
+# Real-time scheduling for the PHY loop (same as the source deployment).
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=73
+KillSignal=SIGINT
+Restart=on-failure
+RestartSec=10
+# Let RestartSec govern the pace instead of systemd's 5-in-10s default.
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target
