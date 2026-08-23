@@ -914,6 +914,20 @@ impl CcBsSubentity {
         let prim = Self::build_sapmsg(sdu, None, self.dltime, dest_addr, None);
         queue.push_back(prim);
 
+        // Also deliver D-RELEASE via FACCH stealing directly on the call's own traffic timeslot,
+        // mirroring send_d_tx_ceased_facch. The ts1/MCCH copy above is a single unacknowledged
+        // burst; an MS still monitoring the traffic channel through hangtime (as it should be)
+        // can miss it entirely if it isn't tuned to ts1 at that exact instant. Observed on a
+        // Sepura SRP2000: the resulting silent traffic-channel teardown is then reported as a
+        // downlink reception failure (RDC_fail) rather than a normal release, triggering a full
+        // band rescan and re-registration instead of a clean return to the control channel.
+        if let Some(call) = self.active_calls.get(&call_id) {
+            let sdu_facch = Self::build_d_release_from_d_setup(&cached.pdu, disconnect_cause);
+            let facch_msg =
+                Self::build_sapmsg_stealing(sdu_facch, self.dltime, dest_addr, call.carrier_num, call.ts, None);
+            queue.push_back(facch_msg);
+        }
+
         // Close the circuit in CircuitMgr and notify Brew
         if let Some(call) = self.active_calls.get(&call_id) {
             let ts = call.ts;
