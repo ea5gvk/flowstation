@@ -371,8 +371,16 @@ impl UmacBs {
             cell_change_flag: false,
             carrier_num,
             ext: None,
-            mon_pattern: 0,
-            frame18_mon_pattern: Some(0),
+            // Explicitly assign Monitoring Pattern Number (MPN) 1 (ETSI EN 300 392-2 clause 9.6) instead
+            // of the mon_pattern=0 special case. With mon_pattern=0 (paired with frame18_mon_pattern=0),
+            // some MSs — observed on Sepura SRP2000 — apply a more aggressive control-channel monitoring
+            // regime while transmitting, interrupting their own uplink synchronization enough that a
+            // sustained continuous PTT (~8-9s+) degrades until the BS's UL-inactivity watchdog fires and
+            // forces TX ceased. Motorola radios were not observed to be affected by the mon_pattern=0 case.
+            // Assigning an explicit MPN (1) resolves this; confirmed stable over 60+ second continuous
+            // transmissions with Sepura SRP2000.
+            mon_pattern: 1,
+            frame18_mon_pattern: None,
         })
     }
 
