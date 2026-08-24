@@ -1,0 +1,17 @@
+This directory vendors source code from:
+
+  MidnightBlueLabs/TETRA_crypto
+  https://github.com/MidnightBlueLabs/TETRA_crypto
+  Copyright 2023, Midnight Blue.
+  Licensed under the Apache License, Version 2.0 (see LICENSE in this directory).
+
+Files vendored unmodified: taa1.c, taa1.h, hurdle.c, hurdle.h, common.c, common.h.
+
+These are Midnight Blue's reverse-engineered, publicly-released implementations of the TETRA
+Authentication Algorithm suite (TAA1) and the HURDLE block cipher it is built on, produced as
+part of the RE:TETRA / TETRA:BURST research (NLnet-funded, NGI0 PET fund). See
+https://www.midnightblue.nl/research/tetraburst and
+https://github.com/MidnightBlueLabs/TETRA_crypto for background.
+
+flowstation does not modify these files; `build.rs` in the parent crate compiles them as-is and
+`src/lib.rs` provides safe Rust bindings on top.
