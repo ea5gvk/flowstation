@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 
+use crate::mm::components::authentication::{AuthOutcome, AuthenticationManager};
 use crate::mm::components::recovery_cache::{RecoveryCache, TerminalRecord};
 use crate::net_control::{ControlCommand, ControlEndpoint};
 use crate::net_telemetry::channel::TelemetrySink;
@@ -26,7 +27,9 @@ use tetra_pdus::mm::fields::group_identity_attachment::GroupIdentityAttachment;
 use tetra_pdus::mm::fields::group_identity_downlink::GroupIdentityDownlink;
 use tetra_pdus::mm::fields::group_identity_location_accept::GroupIdentityLocationAccept;
 use tetra_pdus::mm::fields::group_identity_uplink::GroupIdentityUplink;
+use tetra_pdus::mm::enums::authentication_subtype::AuthenticationSubtype;
 use tetra_pdus::mm::pdus::d_attach_detach_group_identity::DAttachDetachGroupIdentity;
+use tetra_pdus::mm::pdus::d_authentication::DAuthentication;
 use tetra_pdus::mm::pdus::d_attach_detach_group_identity_acknowledgement::DAttachDetachGroupIdentityAcknowledgement;
 use tetra_pdus::mm::pdus::d_location_update_accept::DLocationUpdateAccept;
 use tetra_pdus::mm::pdus::d_location_update_command::DLocationUpdateCommand;
@@ -34,6 +37,7 @@ use tetra_pdus::mm::pdus::d_location_update_reject::DLocationUpdateReject;
 use tetra_pdus::mm::pdus::d_mm_status::DMmStatus;
 use tetra_pdus::mm::pdus::u_attach_detach_group_identity::UAttachDetachGroupIdentity;
 use tetra_pdus::mm::pdus::u_attach_detach_group_identity_acknowledgement::UAttachDetachGroupIdentityAcknowledgement;
+use tetra_pdus::mm::pdus::u_authentication::UAuthentication;
 use tetra_pdus::mm::pdus::u_itsi_detach::UItsiDetach;
 use tetra_pdus::mm::pdus::u_location_update_demand::ULocationUpdateDemand;
 use tetra_pdus::mm::pdus::u_mm_status::UMmStatus;
@@ -62,6 +66,10 @@ pub struct MmBs {
     /// ghost while it re-registers (see `maybe_reactive_recovery`). Independent of `recovery`
     /// above â€” populated even when the proactive cache is disabled.
     reactive_recovery_cooldown: HashMap<u32, std::time::Instant>,
+
+    /// One-way (SwMI-authenticates-MS) air-interface authentication state, EN 300 392-7 clause
+    /// 4.1.2. Only used when `[security] authentication_enabled = true`.
+    auth: AuthenticationManager,
 }
 
 /// Safety cap on `reactive_recovery_cooldown` so a churn of distinct unknown ISSIs can't grow it
@@ -79,9 +87,19 @@ impl MmBs {
             // TOML alone (an empty issi_whitelist means "open" under the legacy default), and the
             // air interface is unauthenticated regardless — so say both, once, unmissably.
             tracing::warn!(
-                "MM: access control posture: {} | air-interface authentication (EN 300 392-7 TEA) is NOT implemented — any radio can claim any ISSI; the whitelist is the only gate",
+                "MM: access control posture: {}",
                 sec.access_control_posture()
             );
+            if sec.authentication_enabled {
+                tracing::warn!(
+                    "MM: air-interface authentication is ENABLED (one-way, SwMI authenticates MS only — mutual authentication and encryption are not implemented) for {} ISSI(s) with a configured key",
+                    sec.issi_keys.len()
+                );
+            } else {
+                tracing::warn!(
+                    "MM: air-interface authentication (EN 300 392-7 TAA1) is NOT enabled — any radio can claim any ISSI; the whitelist is the only gate. Set [security] authentication_enabled = true and provide issi_keys to enable it"
+                );
+            }
             if sec.honour_unauthenticated_detach {
                 tracing::warn!(
                     "MM: honouring unauthenticated U-ITSI-DETACH / migration teardown (only from an ISSI registered on the same link) — set [security] honour_unauthenticated_detach = false to refuse it entirely"
@@ -98,6 +116,7 @@ impl MmBs {
             recovery_attempts: HashMap::new(),
             recovery_last_frame: None,
             reactive_recovery_cooldown: HashMap::new(),
+            auth: AuthenticationManager::new(),
         }
     }
 
@@ -864,6 +883,10 @@ impl MmBs {
         };
         queue.push_back(msg);
 
+        // Kick off one-way authentication (if enabled and this ISSI has a configured key) now
+        // that registration has been accepted. See `maybe_begin_authentication`.
+        self.maybe_begin_authentication(queue, issi, handle);
+
         // Send D-LOCATION-UPDATE-COMMAND to prompt a full re-registration (TEI + group
         // identity report) ONLY for a genuinely new (unknown) radio that didn't ITSI-attach
         // and didn't already include a group report.
@@ -1301,7 +1324,7 @@ impl MmBs {
         };
 
         match pdu_type {
-            MmPduTypeUl::UAuthentication => unimplemented_log!("UAuthentication"),
+            MmPduTypeUl::UAuthentication => self.rx_u_authentication(queue, message),
             MmPduTypeUl::UItsiDetach => self.rx_u_itsi_detach(queue, message),
             MmPduTypeUl::ULocationUpdateDemand => self.rx_u_location_update_demand(queue, message),
             MmPduTypeUl::UMmStatus => self.rx_u_mm_status(queue, message),
@@ -1871,6 +1894,165 @@ impl MmBs {
         )
     }
 
+    /// If `[security] authentication_enabled` is set and `issi` has a configured K, start a
+    /// one-way authentication exchange (EN 300 392-7 clause 4.1.2) and send the
+    /// D-AUTHENTICATION demand. No-op otherwise â€” an ISSI with no configured key is simply
+    /// never authenticated, so enabling this flag is safe to roll out gradually.
+    fn maybe_begin_authentication(&mut self, queue: &mut MessageQueue, issi: u32, handle: u32) {
+        let (enabled, k) = {
+            let cfg = self.config.config();
+            (cfg.security.authentication_enabled, cfg.security.issi_keys.get(&issi).copied())
+        };
+        if !enabled {
+            return;
+        }
+        let Some(k) = k else {
+            return;
+        };
+        let demand = self.auth.begin(issi, &k);
+        tracing::info!("MM: ISSI {} â€” starting one-way authentication (D-AUTHENTICATION demand)", issi);
+        Self::send_d_authentication_demand(queue, issi, handle, demand.rand1, demand.rs);
+    }
+
+    fn send_d_authentication_demand(queue: &mut MessageQueue, issi: u32, handle: u32, rand1: [u8; 10], rs: [u8; 10]) {
+        let pdu = DAuthentication {
+            sub_type: AuthenticationSubtype::Demand,
+            rand1: Some(u128::from_be_bytes([
+                0, 0, 0, 0, 0, 0, rand1[0], rand1[1], rand1[2], rand1[3], rand1[4], rand1[5], rand1[6], rand1[7], rand1[8],
+                rand1[9],
+            ])),
+            rs: Some(u128::from_be_bytes([
+                0, 0, 0, 0, 0, 0, rs[0], rs[1], rs[2], rs[3], rs[4], rs[5], rs[6], rs[7], rs[8], rs[9],
+            ])),
+            mutual_authentication_flag: Some(false),
+            reject_reason: None,
+            res2: None,
+            result: None,
+            address_extension: None,
+            proprietary: None,
+        };
+
+        let mut sdu = BitBuffer::new_autoexpand(4 + 2 + 80 + 80 + 1);
+        pdu.to_bitbuf(&mut sdu).unwrap();
+        sdu.seek(0);
+        tracing::debug!("-> {} sdu {}", pdu, sdu.dump_bin());
+
+        let msg = SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+                sdu,
+                handle,
+                address: TetraAddress::issi(issi),
+                layer2service: Layer2Service::Acknowledged,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                encryption_flag: false,
+                is_null_pdu: false,
+                tx_reporter: None,
+            }),
+        };
+        queue.push_back(msg);
+    }
+
+    fn send_d_authentication_result(queue: &mut MessageQueue, issi: u32, handle: u32, success: bool) {
+        let pdu = DAuthentication {
+            sub_type: AuthenticationSubtype::Result,
+            rand1: None,
+            rs: None,
+            mutual_authentication_flag: None,
+            reject_reason: None,
+            res2: None,
+            result: Some(success),
+            address_extension: None,
+            proprietary: None,
+        };
+
+        let mut sdu = BitBuffer::new_autoexpand(4 + 2 + 1 + 1);
+        pdu.to_bitbuf(&mut sdu).unwrap();
+        sdu.seek(0);
+        tracing::debug!("-> {} sdu {}", pdu, sdu.dump_bin());
+
+        let msg = SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+                sdu,
+                handle,
+                address: TetraAddress::issi(issi),
+                layer2service: Layer2Service::Acknowledged,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                encryption_flag: false,
+                is_null_pdu: false,
+                tx_reporter: None,
+            }),
+        };
+        queue.push_back(msg);
+    }
+
+    /// Handle a received U-AUTHENTICATION PDU. Only the `Response` sub-type is meaningful for
+    /// the one-way (SwMI-authenticates-MS) flow implemented so far; `Demand` (MS wants to
+    /// authenticate the SwMI, i.e. mutual auth), `Reject` and `Result` are logged and otherwise
+    /// ignored until mutual authentication is implemented.
+    fn rx_u_authentication(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
+        let SapMsgInner::LmmMleUnitdataInd(prim) = &mut message.msg else {
+            tracing::error!("BUG: unexpected message or state -- routing error");
+            return;
+        };
+
+        let pdu = match UAuthentication::from_bitbuf(&mut prim.sdu) {
+            Ok(pdu) => {
+                tracing::debug!("<- {:?}", pdu);
+                pdu
+            }
+            Err(e) => {
+                tracing::warn!("Failed parsing UAuthentication: {:?} {}", e, prim.sdu.dump_bin());
+                return;
+            }
+        };
+
+        let issi = prim.received_address.ssi;
+        let handle = prim.handle;
+
+        match pdu.sub_type {
+            AuthenticationSubtype::Response => {
+                let Some(res1_u64) = pdu.res1 else {
+                    tracing::warn!("MM: ISSI {} sent UAuthentication Response with no RES1 â€” ignoring", issi);
+                    return;
+                };
+                let res1 = (res1_u64 as u32).to_be_bytes();
+                match self.auth.handle_response(issi, res1) {
+                    AuthOutcome::Accepted(_dck) => {
+                        // DCK is derived but not yet wired into AIE (encryption is not
+                        // implemented) â€” authentication result only, no ciphering starts.
+                        tracing::info!("MM: ISSI {} authenticated successfully", issi);
+                        Self::send_d_authentication_result(queue, issi, handle, true);
+                    }
+                    AuthOutcome::Rejected => {
+                        tracing::warn!("MM: ISSI {} FAILED authentication (RES1 mismatch)", issi);
+                        Self::send_d_authentication_result(queue, issi, handle, false);
+                    }
+                    AuthOutcome::NoSession => {
+                        tracing::warn!(
+                            "MM: ISSI {} sent an authentication response with no pending demand (expired, replayed, or never asked) â€” ignoring",
+                            issi
+                        );
+                    }
+                }
+            }
+            other => {
+                tracing::warn!(
+                    "MM: ISSI {} sent UAuthentication sub-type {} â€” not handled yet (only Response, for one-way SwMI-authenticates-MS, is implemented)",
+                    issi,
+                    other
+                );
+            }
+        }
+    }
+
     fn send_d_location_update_reject_cause(
         queue: &mut MessageQueue,
         issi: u32,
@@ -2089,6 +2271,13 @@ impl TetraEntityTrait for MmBs {
                     }
                 }
             }
+        }
+
+        // T354 (authentication protocol timer, EN 300 392-7 Annex C.1): drop any authentication
+        // session the MS never answered. No reject is sent on expiry yet â€” the ISSI simply
+        // remains unauthenticated, same as before this feature existed.
+        for issi in self.auth.collect_expired() {
+            tracing::warn!("MM: ISSI {} did not answer D-AUTHENTICATION demand within T354 â€” giving up", issi);
         }
 
         // Periodic registration expiry check (T351 equivalent, ETSI EN 300 392-2 Â§16.9).
