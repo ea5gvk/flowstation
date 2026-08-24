@@ -64,7 +64,7 @@ Built in Rust on top of [tetra-bluestation](https://github.com/MidnightBlueLabs/
 |---|---|
 | ISSI whitelist (only registered ISSIs can use the cell) | ✅ |
 | Local SSI ranges (local-only traffic isolation) | ✅ |
-| Authentication (TEA) | 🔜 |
+| Authentication (TEA) | ✅️ |
 | AIE encryption | 🔜 |
 
 ### Management & Dashboard
