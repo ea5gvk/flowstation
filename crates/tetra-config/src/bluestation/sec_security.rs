@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::Deserialize;
 
 /// How `issi_whitelist` is interpreted. A bare `Vec` cannot express "deny everyone": an operator
@@ -54,6 +56,19 @@ pub struct CfgSecurity {
     pub max_registered_clients: usize,
     /// Accepted registrations per minute per source ISSI (0 = disabled).
     pub registration_rate_limit_per_min: u32,
+    /// Send a D-AUTHENTICATION demand (one-way, SwMI authenticates the MS â€” EN 300 392-7
+    /// clause 4.1.2) after every successful registration of an ISSI that has a key in
+    /// `issi_keys`. ISSIs with no configured key are left unauthenticated regardless of this
+    /// flag, so it is safe to enable while only some radios have been provisioned with a K.
+    pub authentication_enabled: bool,
+    /// Per-ISSI TETRA authentication key K (128 bits), used only for [`authentication_enabled`].
+    ///
+    /// SECURITY NOTE: this stores K in plaintext in `config.toml`. Anyone who can read that file
+    /// (or the dashboard's config editor / backups) can impersonate the corresponding radio's
+    /// authentication response and derive its DCK. Treat this file with the same care as an SSH
+    /// private key: restrict its filesystem permissions, and if you use the dashboard's remote
+    /// config editor, be aware it may transit and be stored wherever that connection is proxied.
+    pub issi_keys: HashMap<u32, [u8; 16]>,
 }
 
 impl Default for CfgSecurity {
@@ -64,6 +79,8 @@ impl Default for CfgSecurity {
             honour_unauthenticated_detach: true,
             max_registered_clients: DEFAULT_MAX_REGISTERED_CLIENTS,
             registration_rate_limit_per_min: DEFAULT_REGISTRATION_RATE_LIMIT_PER_MIN,
+            authentication_enabled: false,
+            issi_keys: HashMap::new(),
         }
     }
 }
@@ -115,6 +132,46 @@ pub struct CfgSecurityDto {
     pub max_registered_clients: Option<usize>,
     #[serde(default)]
     pub registration_rate_limit_per_min: Option<u32>,
+    #[serde(default)]
+    pub authentication_enabled: Option<bool>,
+    /// `{ issi = "hex32chars" }`, e.g. `issi_keys = { 2260571 = "0123456789abcdef0123456789abcdef" }`.
+    #[serde(default)]
+    pub issi_keys: HashMap<u32, String>,
+}
+
+/// Parse a 32-hex-character K into 16 bytes. Logs and skips (rather than failing config load
+/// entirely) on a malformed entry, so one typo doesn't lock the operator out of an otherwise
+/// valid config via the fallback-config mechanism.
+fn parse_issi_keys(raw: HashMap<u32, String>) -> HashMap<u32, [u8; 16]> {
+    let mut out = HashMap::with_capacity(raw.len());
+    for (issi, hex) in raw {
+        let hex = hex.trim();
+        if hex.len() != 32 {
+            tracing::error!(
+                "security.issi_keys: K for ISSI {} is {} hex chars, expected 32 (16 bytes) â€” skipping, this ISSI will not be authenticated",
+                issi,
+                hex.len()
+            );
+            continue;
+        }
+        let mut k = [0u8; 16];
+        let mut ok = true;
+        for (i, byte_out) in k.iter_mut().enumerate() {
+            match u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16) {
+                Ok(b) => *byte_out = b,
+                Err(_) => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            tracing::error!("security.issi_keys: K for ISSI {} is not valid hex â€” skipping, this ISSI will not be authenticated", issi);
+            continue;
+        }
+        out.insert(issi, k);
+    }
+    out
 }
 
 pub fn apply_security_patch(dto: CfgSecurityDto) -> CfgSecurity {
@@ -134,6 +191,8 @@ pub fn apply_security_patch(dto: CfgSecurityDto) -> CfgSecurity {
         registration_rate_limit_per_min: dto
             .registration_rate_limit_per_min
             .unwrap_or(defaults.registration_rate_limit_per_min),
+        authentication_enabled: dto.authentication_enabled.unwrap_or(defaults.authentication_enabled),
+        issi_keys: parse_issi_keys(dto.issi_keys),
     }
 }
 
@@ -170,5 +229,22 @@ mod tests {
 
         cfg.whitelist_mode = WhitelistMode::Enforce;
         assert!(!cfg.allows(9, Some(&[])), "empty override under enforce = deny-all");
+    }
+
+    #[test]
+    fn issi_keys_parses_valid_hex_and_skips_malformed_entries() {
+        let mut raw = HashMap::new();
+        raw.insert(1001, "0123456789abcdef0123456789abcdef".to_string());
+        raw.insert(1002, "tooshort".to_string()); // wrong length
+        raw.insert(1003, "zz23456789abcdef0123456789abcdef".to_string()); // not hex
+
+        let parsed = parse_issi_keys(raw);
+        assert_eq!(parsed.len(), 1, "only the well-formed entry should survive");
+        assert_eq!(
+            parsed.get(&1001),
+            Some(&[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef])
+        );
+        assert!(!parsed.contains_key(&1002));
+        assert!(!parsed.contains_key(&1003));
     }
 }
