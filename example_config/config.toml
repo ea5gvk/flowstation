@@ -390,8 +390,27 @@ voice_service = true
 # All others receive D-LOCATION-UPDATE-REJECT and cannot make or receive calls.
 # Leave empty or omit the section entirely to accept any terminal (open network).
 #
-# [security]
-# issi_whitelist = [2260571, 2260572, 2260575]
+# OPTIONAL: Air-interface authentication (FlowStation, EN 300 392-7 §4.1.2)
+#
+# One-way only: the SwMI (this BS) authenticates the MS. The MS does NOT authenticate the
+# SwMI, and derived keys are not used for air-interface encryption (no AIE/TEA yet).
+#
+# authentication_enabled = true turns it on cell-wide, but an ISSI is only actually
+# challenged if it also has an entry in issi_keys below — so this can be rolled out
+# gradually, radio by radio, without breaking anyone not yet provisioned.
+#
+# issi_keys: map of ISSI -> K, where K is 32 hex characters (16 bytes / 128 bits).
+#
+# SECURITY: K is stored here in PLAINTEXT. Treat this file like an SSH private key —
+# restrict its filesystem permissions (e.g. chmod 600), and if you edit it through the
+# dashboard's remote config editor, be aware K may transit wherever that connection is
+# proxied.
+#
+[security]
+issi_whitelist = [2260571, 2260572, 2260575]
+
+authentication_enabled = true
+issi_keys = { 2260571 = "0123456789abcdef0123456789abcdef" }
 
 ###############################################################################
 
