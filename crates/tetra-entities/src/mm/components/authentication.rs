@@ -9,9 +9,13 @@
 //!      RAND1). Stores the pending session and returns the fields for a D-AUTHENTICATION demand.
 //!   2. MS replies with U-AUTHENTICATION response, RES1.
 //!   3. `handle_response` compares RES1 to the stored XRES1. On match, the session becomes
-//!      `Authenticated` and the derived DCK (`TB4(DCK1, 0)` for one-way) is returned to the
-//!      caller. On mismatch, the session is dropped and `Rejected` is returned.
+//!      `Authenticated`, the derived DCK (`TB4(DCK1, 0)` for one-way) is returned to the caller
+//!      AND retained per-ISSI (see `dck_for`). On mismatch, the session is dropped, any
+//!      previously established DCK for that ISSI is revoked, and `Rejected` is returned.
 //!   4. `collect_expired` is polled periodically (T354) to drop sessions the MS never answered.
+//!
+//! NOTE: retaining the DCK does not by itself encrypt anything — air-interface encryption is not
+//! wired into the MAC layer, so traffic is unaffected regardless of whether a DCK exists here.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -51,6 +55,11 @@ pub struct DemandFields {
 #[derive(Default)]
 pub struct AuthenticationManager {
     sessions: HashMap<u32, AuthSession>,
+    /// DCKs of ISSIs that have completed authentication. Populated on a successful
+    /// `handle_response`; this is what air-interface encryption would draw from once the AIE
+    /// engine is wired into the MAC layer. Replaced wholesale on re-authentication (a new
+    /// exchange supersedes the old key) and cleared by `forget`.
+    dcks: HashMap<u32, DckComponent>,
 }
 
 fn random_80() -> Challenge80 {
@@ -99,10 +108,37 @@ impl AuthenticationManager {
         if res1 == session.xres1 {
             // One-way authentication: DCK2 = 0 (EN 300 392-7 clause 4.2.1).
             let dck = tetra_crypto::tb4(&session.dck1, &[0u8; 10]);
+            self.dcks.insert(issi, dck);
             AuthOutcome::Accepted(dck)
         } else {
+            // A failed exchange must not leave a previously-established DCK in place: the ISSI
+            // has just failed to prove it holds K, so any key we still hold for it is suspect.
+            self.dcks.remove(&issi);
             AuthOutcome::Rejected
         }
+    }
+
+    /// The DCK established for `issi` by a successful authentication, if any.
+    ///
+    /// NOTE: nothing consumes this yet — air-interface encryption is not wired into the MAC
+    /// layer, so holding a DCK has no effect on traffic. It exists so the key survives the
+    /// authentication exchange instead of being discarded.
+    pub fn dck_for(&self, issi: u32) -> Option<&DckComponent> {
+        self.dcks.get(&issi)
+    }
+
+    /// True if `issi` currently holds an established DCK (i.e. it authenticated successfully and
+    /// has not since failed or been forgotten).
+    pub fn is_authenticated(&self, issi: u32) -> bool {
+        self.dcks.contains_key(&issi)
+    }
+
+    /// Drop all authentication state for `issi` — both any pending challenge and any established
+    /// DCK. Call this when the terminal deregisters or is removed from the registry, so a key
+    /// does not outlive the registration it belongs to.
+    pub fn forget(&mut self, issi: u32) {
+        self.sessions.remove(&issi);
+        self.dcks.remove(&issi);
     }
 
     /// Drop sessions the MS never answered within T354, returning their ISSIs so the caller can
@@ -151,6 +187,83 @@ mod tests {
             other => panic!("expected Accepted, got {other:?}"),
         }
         assert!(!mgr.has_pending(2260571), "session must be single-use");
+    }
+
+    /// Drive a full successful exchange for `issi` and return the DCK the manager settled on.
+    fn authenticate_ok(mgr: &mut AuthenticationManager, issi: u32) -> DckComponent {
+        let demand = mgr.begin(issi, &TEST_K);
+        let ks = tetra_crypto::ta11(&TEST_K, &demand.rs);
+        let (res1, _) = tetra_crypto::ta12(&ks, &demand.rand1);
+        match mgr.handle_response(issi, res1) {
+            AuthOutcome::Accepted(dck) => dck,
+            other => panic!("expected Accepted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dck_is_retained_after_successful_authentication() {
+        let mut mgr = AuthenticationManager::new();
+        assert!(mgr.dck_for(2260571).is_none(), "no key before authenticating");
+        assert!(!mgr.is_authenticated(2260571));
+
+        let dck = authenticate_ok(&mut mgr, 2260571);
+
+        assert!(mgr.is_authenticated(2260571));
+        assert_eq!(mgr.dck_for(2260571), Some(&dck), "stored DCK must match the one returned");
+    }
+
+    #[test]
+    fn reauthentication_replaces_the_stored_dck() {
+        let mut mgr = AuthenticationManager::new();
+        let first = authenticate_ok(&mut mgr, 2260571);
+        let second = authenticate_ok(&mut mgr, 2260571);
+
+        // RAND1/RS are freshly random each time, so the two DCKs should differ; whatever the
+        // values, the stored one must be the newer.
+        assert_ne!(first, second, "a new exchange must derive a fresh DCK");
+        assert_eq!(mgr.dck_for(2260571), Some(&second), "the newer DCK must win");
+    }
+
+    #[test]
+    fn failed_reauthentication_revokes_the_existing_dck() {
+        let mut mgr = AuthenticationManager::new();
+        authenticate_ok(&mut mgr, 2260571);
+        assert!(mgr.is_authenticated(2260571));
+
+        // A fresh challenge that the terminal answers wrongly must not leave the old key usable.
+        mgr.begin(2260571, &TEST_K);
+        assert_eq!(mgr.handle_response(2260571, [0xAA, 0xBB, 0xCC, 0xDD]), AuthOutcome::Rejected);
+
+        assert!(!mgr.is_authenticated(2260571), "a failed exchange must revoke the previous DCK");
+        assert!(mgr.dck_for(2260571).is_none());
+    }
+
+    #[test]
+    fn forget_clears_both_pending_session_and_dck() {
+        let mut mgr = AuthenticationManager::new();
+        authenticate_ok(&mut mgr, 2260571);
+        mgr.begin(2260571, &TEST_K); // a new challenge outstanding on top of the established key
+        assert!(mgr.has_pending(2260571));
+        assert!(mgr.is_authenticated(2260571));
+
+        mgr.forget(2260571);
+
+        assert!(!mgr.has_pending(2260571));
+        assert!(!mgr.is_authenticated(2260571));
+    }
+
+    #[test]
+    fn dcks_are_tracked_per_issi() {
+        let mut mgr = AuthenticationManager::new();
+        let a = authenticate_ok(&mut mgr, 1001);
+        let b = authenticate_ok(&mut mgr, 1002);
+
+        assert_eq!(mgr.dck_for(1001), Some(&a));
+        assert_eq!(mgr.dck_for(1002), Some(&b));
+
+        mgr.forget(1001);
+        assert!(!mgr.is_authenticated(1001));
+        assert!(mgr.is_authenticated(1002), "forgetting one ISSI must not affect another");
     }
 
     #[test]
