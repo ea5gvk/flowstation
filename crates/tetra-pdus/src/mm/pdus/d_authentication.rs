@@ -21,7 +21,7 @@ use crate::mm::enums::type34_elem_id_dl::MmType34ElemIdDl;
 /// bit-for-bit layout (and the reject-reason / result flag widths) should be checked against the
 /// Annex A.8 element tables in EN 300 392-7 before this is relied on against real hardware — this
 /// PDU has not yet been validated on air.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct DAuthentication {
     /// Type1, 2 bits, which of the four authentication messages this is
     pub sub_type: AuthenticationSubtype,
