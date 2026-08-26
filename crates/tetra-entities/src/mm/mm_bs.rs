@@ -70,6 +70,11 @@ pub struct MmBs {
     /// One-way (SwMI-authenticates-MS) air-interface authentication state, EN 300 392-7 clause
     /// 4.1.2. Only used when `[security] authentication_enabled = true`.
     auth: AuthenticationManager,
+    /// D-LOCATION-UPDATE-ACCEPT messages held back while their ISSI is being authenticated.
+    /// Per Table A.1 the challenge is the response to U-LOCATION-UPDATE-DEMAND, so the accept
+    /// must not be sent until the exchange finishes. Released by `release_pending_accept`, or
+    /// dropped on T354 expiry under `authentication_required`.
+    pending_accepts: HashMap<u32, SapMsg>,
 }
 
 /// Safety cap on `reactive_recovery_cooldown` so a churn of distinct unknown ISSIs can't grow it
@@ -124,6 +129,7 @@ impl MmBs {
             recovery_last_frame: None,
             reactive_recovery_cooldown: HashMap::new(),
             auth: AuthenticationManager::new(),
+            pending_accepts: HashMap::new(),
         }
     }
 
@@ -919,11 +925,21 @@ impl MmBs {
                 tx_reporter: None,
             }),
         };
-        queue.push_back(msg);
 
-        // Kick off one-way authentication (if enabled and this ISSI has a configured key) now
-        // that registration has been accepted. See `maybe_begin_authentication`.
-        self.maybe_begin_authentication(queue, issi, handle);
+        // ORDER MATTERS. Table A.1 lists D-AUTHENTICATION DEMAND as the "Response to:
+        // U-LOCATION UPDATE DEMAND" — the challenge takes the place of the accept, and the
+        // accept only follows once authentication has completed. Sending the accept first
+        // closes the MM transaction, and a conformant terminal then has nothing to attach a
+        // later challenge to and simply ignores it.
+        //
+        // So: if we are going to challenge this ISSI, hold the accept and let
+        // `rx_u_authentication` (or the T354 expiry) release it.
+        if self.maybe_begin_authentication(queue, issi, handle) {
+            tracing::debug!("MM: ISSI {} — holding D-LOCATION-UPDATE-ACCEPT until authentication completes", issi);
+            self.pending_accepts.insert(issi, msg);
+        } else {
+            queue.push_back(msg);
+        }
 
         // Send D-LOCATION-UPDATE-COMMAND to prompt a full re-registration (TEI + group
         // identity report) ONLY for a genuinely new (unknown) radio that didn't ITSI-attach
@@ -1936,20 +1952,37 @@ impl MmBs {
     /// one-way authentication exchange (EN 300 392-7 clause 4.1.2) and send the
     /// D-AUTHENTICATION demand. No-op otherwise â€” an ISSI with no configured key is simply
     /// never authenticated, so enabling this flag is safe to roll out gradually.
-    fn maybe_begin_authentication(&mut self, queue: &mut MessageQueue, issi: u32, handle: u32) {
+    /// Returns true if a challenge was sent, meaning the caller must hold back the
+    /// D-LOCATION-UPDATE-ACCEPT until the exchange completes.
+    fn maybe_begin_authentication(&mut self, queue: &mut MessageQueue, issi: u32, handle: u32) -> bool {
         let (enabled, k) = {
             let cfg = self.config.config();
             (cfg.security.authentication_enabled, cfg.security.issi_keys.get(&issi).copied())
         };
         if !enabled {
-            return;
+            return false;
         }
         let Some(k) = k else {
-            return;
+            return false;
         };
         let demand = self.auth.begin(issi, &k);
         tracing::info!("MM: ISSI {} â€” starting one-way authentication (D-AUTHENTICATION demand)", issi);
         Self::send_d_authentication_demand(queue, issi, handle, demand.rand1, demand.rs);
+        true
+    }
+
+    /// Send the D-LOCATION-UPDATE-ACCEPT that was held back for `issi` while it authenticated.
+    /// No-op if there is nothing pending (e.g. the ISSI was never challenged).
+    fn release_pending_accept(&mut self, queue: &mut MessageQueue, issi: u32) {
+        if let Some(msg) = self.pending_accepts.remove(&issi) {
+            tracing::debug!("MM: ISSI {} — releasing held D-LOCATION-UPDATE-ACCEPT", issi);
+            queue.push_back(msg);
+        }
+    }
+
+    /// Drop a held accept without sending it: the terminal does not get registered.
+    fn drop_pending_accept(&mut self, issi: u32) -> bool {
+        self.pending_accepts.remove(&issi).is_some()
     }
 
     fn send_d_authentication_demand(queue: &mut MessageQueue, issi: u32, handle: u32, rand1: [u8; 10], rs: [u8; 10]) {
@@ -2048,17 +2081,32 @@ impl MmBs {
                         // into the MAC layer, so traffic for this ISSI stays in the clear.
                         tracing::info!("MM: ISSI {} authenticated successfully", issi);
                         Self::send_d_authentication_result(queue, issi, handle, true);
+                        // The exchange is over: the registration the terminal asked for can now
+                        // be accepted.
+                        self.release_pending_accept(queue, issi);
                     }
                     AuthOutcome::Rejected => {
                         tracing::warn!("MM: ISSI {} FAILED authentication (RES1 mismatch)", issi);
                         Self::send_d_authentication_result(queue, issi, handle, false);
                         if self.config.config().security.authentication_required {
+                            // Strict mode: the held accept is never sent, so the terminal is
+                            // simply not registered, and anything already in the registry from
+                            // an earlier session is torn down.
+                            self.drop_pending_accept(issi);
                             self.deregister_failed_authentication(queue, issi);
+                        } else {
+                            // Permissive mode: authentication is advisory, so registration still
+                            // completes — but say plainly in the log that it was NOT verified.
+                            tracing::warn!(
+                                "MM: ISSI {} registering ANYWAY (authentication_required is not set) — this radio is NOT authenticated",
+                                issi
+                            );
+                            self.release_pending_accept(queue, issi);
                         }
                     }
                     AuthOutcome::NoSession => {
                         tracing::warn!(
-                            "MM: ISSI {} sent an authentication response with no pending demand (expired, replayed, or never asked) â€” ignoring",
+                            "MM: ISSI {} sent an authentication response with no pending demand (expired, replayed, or never asked) — ignoring",
                             issi
                         );
                     }
@@ -2085,6 +2133,7 @@ impl MmBs {
     fn deregister_failed_authentication(&mut self, queue: &mut MessageQueue, issi: u32) {
         // Drop any retained DCK/pending challenge first, so nothing survives the deregistration.
         self.auth.forget(issi);
+        self.drop_pending_accept(issi);
 
         if let Some(client) = self.client_mgr.remove_client(issi) {
             self.config.state_write().subscribers.deregister(issi);
@@ -2321,10 +2370,33 @@ impl TetraEntityTrait for MmBs {
         }
 
         // T354 (authentication protocol timer, EN 300 392-7 Annex C.1): drop any authentication
-        // session the MS never answered. No reject is sent on expiry yet â€” the ISSI simply
-        // remains unauthenticated, same as before this feature existed.
+        // session the MS never answered, and decide what to do with the D-LOCATION-UPDATE-ACCEPT
+        // being held for it.
         for issi in self.auth.collect_expired() {
-            tracing::warn!("MM: ISSI {} did not answer D-AUTHENTICATION demand within T354 â€” giving up", issi);
+            let required = self.config.config().security.authentication_required;
+            if required {
+                if self.drop_pending_accept(issi) {
+                    tracing::warn!(
+                        "MM: ISSI {} did not answer D-AUTHENTICATION demand within T354 — registration REFUSED (authentication_required)",
+                        issi
+                    );
+                } else {
+                    tracing::warn!("MM: ISSI {} did not answer D-AUTHENTICATION demand within T354 — giving up", issi);
+                }
+            } else {
+                // Permissive mode: don't strand a terminal that cannot or will not authenticate.
+                // Release the accept so it registers as it did before this feature existed, but
+                // make it unmistakable in the log that it is unauthenticated.
+                if self.pending_accepts.contains_key(&issi) {
+                    tracing::warn!(
+                        "MM: ISSI {} did not answer D-AUTHENTICATION demand within T354 — registering it UNAUTHENTICATED (set authentication_required to refuse instead)",
+                        issi
+                    );
+                    self.release_pending_accept(queue, issi);
+                } else {
+                    tracing::warn!("MM: ISSI {} did not answer D-AUTHENTICATION demand within T354 — giving up", issi);
+                }
+            }
         }
 
         // Periodic registration expiry check (T351 equivalent, ETSI EN 300 392-2 Â§16.9).
