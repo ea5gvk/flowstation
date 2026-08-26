@@ -19,7 +19,7 @@ use crate::mm::enums::type34_elem_id_ul::MmType34ElemIdUl;
 /// NOTE ON FIELD WIDTHS: see the equivalent note on `DAuthentication` — RAND2 is modelled as 80
 /// bits and RES1 as 32 bits based on common TETRA reference material, not yet checked bit-for-bit
 /// against the Annex A.8 element tables in EN 300 392-7. Not yet validated on air.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct UAuthentication {
     /// Type1, 2 bits, which of the four authentication messages this is
     pub sub_type: AuthenticationSubtype,
