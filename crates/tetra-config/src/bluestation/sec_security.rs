@@ -56,7 +56,7 @@ pub struct CfgSecurity {
     pub max_registered_clients: usize,
     /// Accepted registrations per minute per source ISSI (0 = disabled).
     pub registration_rate_limit_per_min: u32,
-    /// Send a D-AUTHENTICATION demand (one-way, SwMI authenticates the MS â€” EN 300 392-7
+    /// Send a D-AUTHENTICATION demand (one-way, SwMI authenticates the MS — EN 300 392-7
     /// clause 4.1.2) after every successful registration of an ISSI that has a key in
     /// `issi_keys`. ISSIs with no configured key are left unauthenticated regardless of this
     /// flag, so it is safe to enable while only some radios have been provisioned with a K.
@@ -135,20 +135,30 @@ pub struct CfgSecurityDto {
     #[serde(default)]
     pub authentication_enabled: Option<bool>,
     /// `{ issi = "hex32chars" }`, e.g. `issi_keys = { 2260571 = "0123456789abcdef0123456789abcdef" }`.
+    /// NOTE: the map key comes in as a string here (TOML table/inline-table keys are always text
+    /// in the data model, quoted or not) — the ISSI itself is parsed to u32 in `parse_issi_keys`.
     #[serde(default)]
-    pub issi_keys: HashMap<u32, String>,
+    pub issi_keys: HashMap<String, String>,
 }
 
-/// Parse a 32-hex-character K into 16 bytes. Logs and skips (rather than failing config load
-/// entirely) on a malformed entry, so one typo doesn't lock the operator out of an otherwise
-/// valid config via the fallback-config mechanism.
-fn parse_issi_keys(raw: HashMap<u32, String>) -> HashMap<u32, [u8; 16]> {
+/// Parse a 32-hex-character K into 16 bytes, and its ISSI key (a string, per TOML's data model —
+/// see the note on `RawSecurityDto::issi_keys`) into a u32. Logs and skips (rather than failing
+/// config load entirely) on a malformed entry, so one typo doesn't lock the operator out of an
+/// otherwise valid config via the fallback-config mechanism.
+fn parse_issi_keys(raw: HashMap<String, String>) -> HashMap<u32, [u8; 16]> {
     let mut out = HashMap::with_capacity(raw.len());
-    for (issi, hex) in raw {
+    for (issi_str, hex) in raw {
+        let issi: u32 = match issi_str.trim().parse() {
+            Ok(v) => v,
+            Err(_) => {
+                tracing::error!("security.issi_keys: \"{}\" is not a valid ISSI (u32) — skipping this entry", issi_str);
+                continue;
+            }
+        };
         let hex = hex.trim();
         if hex.len() != 32 {
             tracing::error!(
-                "security.issi_keys: K for ISSI {} is {} hex chars, expected 32 (16 bytes) â€” skipping, this ISSI will not be authenticated",
+                "security.issi_keys: K for ISSI {} is {} hex chars, expected 32 (16 bytes) — skipping, this ISSI will not be authenticated",
                 issi,
                 hex.len()
             );
@@ -166,7 +176,7 @@ fn parse_issi_keys(raw: HashMap<u32, String>) -> HashMap<u32, [u8; 16]> {
             }
         }
         if !ok {
-            tracing::error!("security.issi_keys: K for ISSI {} is not valid hex â€” skipping, this ISSI will not be authenticated", issi);
+            tracing::error!("security.issi_keys: K for ISSI {} is not valid hex — skipping, this ISSI will not be authenticated", issi);
             continue;
         }
         out.insert(issi, k);
@@ -234,9 +244,10 @@ mod tests {
     #[test]
     fn issi_keys_parses_valid_hex_and_skips_malformed_entries() {
         let mut raw = HashMap::new();
-        raw.insert(1001, "0123456789abcdef0123456789abcdef".to_string());
-        raw.insert(1002, "tooshort".to_string()); // wrong length
-        raw.insert(1003, "zz23456789abcdef0123456789abcdef".to_string()); // not hex
+        raw.insert("1001".to_string(), "0123456789abcdef0123456789abcdef".to_string());
+        raw.insert("1002".to_string(), "tooshort".to_string()); // wrong length
+        raw.insert("1003".to_string(), "zz23456789abcdef0123456789abcdef".to_string()); // not hex
+        raw.insert("not_a_number".to_string(), "0123456789abcdef0123456789abcdef".to_string()); // bad ISSI
 
         let parsed = parse_issi_keys(raw);
         assert_eq!(parsed.len(), 1, "only the well-formed entry should survive");
