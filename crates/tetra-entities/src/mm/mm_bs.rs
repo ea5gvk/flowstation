@@ -2012,6 +2012,21 @@ impl MmBs {
         queue.push_back(Self::mm_unitdata_req(sdu, issi, handle));
     }
 
+    /// Send D-AUTHENTICATION RESULT with mutual_authentication_flag = 1 and RES2 attached
+    /// (Table A.4) — our answer to the MS's own RAND2, combined with the accept (R1 = true; a
+    /// mutual answer is only ever sent after RES1 has already been verified).
+    fn send_d_authentication_result_mutual(queue: &mut MessageQueue, issi: u32, handle: u32, res2: u32) {
+        let pdu = DAuthentication::result_mutual(true, res2);
+
+        // 4 + 2 + 1 (R1) + 1 (mutual flag) + 32 (RES2) + 1 (o-bit) = 41 bits
+        let mut sdu = BitBuffer::new_autoexpand(41);
+        pdu.to_bitbuf(&mut sdu).unwrap();
+        sdu.seek(0);
+        tracing::debug!("-> {} sdu {}", pdu, sdu.dump_bin());
+
+        queue.push_back(Self::mm_unitdata_req(sdu, issi, handle));
+    }
+
     /// Build the MLE unitdata request that carries an MM PDU down to a single ISSI.
     fn mm_unitdata_req(sdu: BitBuffer, issi: u32, handle: u32) -> SapMsg {
         SapMsg {
@@ -2032,10 +2047,22 @@ impl MmBs {
         }
     }
 
-    /// Handle a received U-AUTHENTICATION PDU. Only the `Response` sub-type is meaningful for
-    /// the one-way (SwMI-authenticates-MS) flow implemented so far; `Demand` (MS wants to
-    /// authenticate the SwMI, i.e. mutual auth), `Reject` and `Result` are logged and otherwise
-    /// ignored until mutual authentication is implemented.
+    /// Convert an 80-bit challenge received as a u128 (low 80 bits) back into the 10-byte form
+    /// `tetra_crypto` expects. Mirrors `be_bytes_to_u128_80`.
+    fn u128_80_to_be_bytes(v: u128) -> [u8; 10] {
+        let mut out = [0u8; 10];
+        for (i, byte_out) in out.iter_mut().enumerate() {
+            let shift = (9 - i) * 8;
+            *byte_out = ((v >> shift) & 0xFF) as u8;
+        }
+        out
+    }
+
+    /// Handle a received U-AUTHENTICATION PDU. `Response` is the only sub-type meaningful for
+    /// the flow implemented here — the SwMI always initiates (via `maybe_begin_authentication`),
+    /// so a `Demand` from the MS (Table A.5 — the MS challenging the SwMI unprompted) is not
+    /// something we asked for and is not handled. `Reject` and `Result` (the MS's verdict on our
+    /// mutual answer) are logged.
     fn rx_u_authentication(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         let SapMsgInner::LmmMleUnitdataInd(prim) = &mut message.msg else {
             tracing::error!("BUG: unexpected message or state -- routing error");
@@ -2062,31 +2089,84 @@ impl MmBs {
                     tracing::warn!("MM: ISSI {} sent U-AUTHENTICATION Response with no RES1 — ignoring", issi);
                     return;
                 };
-                // Table A.7: if the MS set the mutual authentication flag it is also challenging
-                // the SwMI with RAND2 and expects a D-AUTHENTICATION RESPONSE back. The SwMI side
-                // of mutual authentication is not implemented, so flag it rather than silently
-                // completing only half the exchange.
-                if pdu.mutual_authentication_flag == Some(true) {
+                // RES1 is 32 bits (Table A.7); it arrives in the low half of a u64.
+                let res1 = (res1_raw as u32).to_be_bytes();
+
+                // K is needed for the RES1-mismatch diagnostic AND, on success, to answer a
+                // mutual challenge (TA21) — fetch it once up front.
+                let k = self.config.config().security.issi_keys.get(&issi).copied();
+
+                // Capture the outstanding challenge BEFORE handle_response consumes the session,
+                // so a mismatch can be diagnosed and a mutual answer (which reuses the demand's
+                // RS) can be computed.
+                let challenge = self.auth.pending_challenge(issi);
+
+                // Table A.7: mutual_authentication_flag = 1 means RAND2 is present and the MS
+                // wants the SwMI to answer its challenge too.
+                let mutual_rand2 = if pdu.mutual_authentication_flag == Some(true) {
+                    pdu.rand2.map(Self::u128_80_to_be_bytes)
+                } else {
+                    None
+                };
+                if pdu.mutual_authentication_flag == Some(true) && mutual_rand2.is_none() {
                     tracing::warn!(
-                        "MM: ISSI {} requested MUTUAL authentication (RAND2 present) — the SwMI side is not implemented; only the MS will be authenticated",
+                        "MM: ISSI {} set the mutual authentication flag but sent no RAND2 — proceeding one-way",
                         issi
                     );
                 }
-                // RES1 is 32 bits (Table A.7); it arrives in the low half of a u64.
-                let res1 = (res1_raw as u32).to_be_bytes();
-                match self.auth.handle_response(issi, res1) {
-                    AuthOutcome::Accepted(_dck) => {
+                let mutual_challenge = match (&k, &mutual_rand2) {
+                    (Some(k), Some(rand2)) => Some((k, rand2)),
+                    _ => None,
+                };
+
+                match self.auth.handle_response(issi, res1, mutual_challenge) {
+                    AuthOutcome::Accepted { dck: _dck, mutual_res2 } => {
                         // The DCK is now retained by the AuthenticationManager (see `dck_for`),
                         // but nothing consumes it yet: air-interface encryption is not wired
                         // into the MAC layer, so traffic for this ISSI stays in the clear.
-                        tracing::info!("MM: ISSI {} authenticated successfully", issi);
-                        Self::send_d_authentication_result(queue, issi, handle, true);
+                        match mutual_res2 {
+                            Some(res2) => {
+                                tracing::info!("MM: ISSI {} authenticated successfully (MUTUAL — answering its RAND2)", issi);
+                                Self::send_d_authentication_result_mutual(queue, issi, handle, u32::from_be_bytes(res2));
+                            }
+                            None => {
+                                tracing::info!("MM: ISSI {} authenticated successfully", issi);
+                                Self::send_d_authentication_result(queue, issi, handle, true);
+                            }
+                        }
                         // The exchange is over: the registration the terminal asked for can now
                         // be accepted.
                         self.release_pending_accept(queue, issi);
                     }
                     AuthOutcome::Rejected => {
                         tracing::warn!("MM: ISSI {} FAILED authentication (RES1 mismatch)", issi);
+
+                        // Work out WHY, so this is actionable instead of just "it doesn't work".
+                        if let (Some((rand1, rs)), Some(k)) = (challenge, &k) {
+                            tracing::warn!(
+                                "MM: ISSI {} auth diagnostic — RAND1={} RS={} expected_XRES1={} received_RES1={}",
+                                issi,
+                                hex_bytes(&rand1),
+                                hex_bytes(&rs),
+                                hex_bytes(&{
+                                    let ks = tetra_crypto::ta11(k, &rs);
+                                    tetra_crypto::ta12(&ks, &rand1).0
+                                }),
+                                hex_bytes(&res1),
+                            );
+                            match AuthenticationManager::diagnose_mismatch(k, &rs, &rand1, res1) {
+                                Some(variant) => tracing::warn!(
+                                    "MM: ISSI {} auth diagnostic — the terminal's RES1 MATCHES under: \"{}\". This is an input-encoding bug, not an algorithm mismatch — fix the encoding and authentication should succeed.",
+                                    issi,
+                                    variant
+                                ),
+                                None => tracing::warn!(
+                                    "MM: ISSI {} auth diagnostic — no key/challenge byte-order variant reproduces the terminal's RES1. Either the configured K does not match the one in the radio, or the radio uses a non-standard (operator-specific) TA11/TA12 instead of TAA1, which this implementation cannot reproduce.",
+                                    issi
+                                ),
+                            }
+                        }
+
                         Self::send_d_authentication_result(queue, issi, handle, false);
                         if self.config.config().security.authentication_required {
                             // Strict mode: the held accept is never sent, so the terminal is
@@ -2112,9 +2192,21 @@ impl MmBs {
                     }
                 }
             }
+            AuthenticationSubtype::Result => {
+                // The MS's verdict on OUR mutual answer (R2 in Table A.8): did it accept the
+                // SwMI as authenticated?
+                match pdu.result {
+                    Some(true) => tracing::info!("MM: ISSI {} confirms the SwMI is authenticated (U-AUTHENTICATION Result, R2=success)", issi),
+                    Some(false) => tracing::warn!(
+                        "MM: ISSI {} REJECTED the SwMI's mutual response (U-AUTHENTICATION Result, R2=fail) — it does not trust this network, even though its own RES1 was accepted",
+                        issi
+                    ),
+                    None => tracing::warn!("MM: ISSI {} sent U-AUTHENTICATION Result with no R2 value", issi),
+                }
+            }
             other => {
                 tracing::warn!(
-                    "MM: ISSI {} sent UAuthentication sub-type {} â€” not handled yet (only Response, for one-way SwMI-authenticates-MS, is implemented)",
+                    "MM: ISSI {} sent U-AUTHENTICATION sub-type {} — not handled (standalone MS-initiated Demand and Reject are not implemented)",
                     issi,
                     other
                 );
@@ -2780,4 +2872,9 @@ mod auth_packing_tests {
         assert_eq!(be_bytes_to_u128_80(&[0xFF; 10]), (1u128 << 80) - 1, "all-ones fills exactly 80 bits");
         assert_eq!(be_bytes_to_u128_80(&[0x00; 10]), 0);
     }
+}
+
+/// Render bytes as lowercase hex, for diagnostic logging.
+fn hex_bytes(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
