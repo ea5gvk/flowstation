@@ -91,10 +91,17 @@ impl MmBs {
                 sec.access_control_posture()
             );
             if sec.authentication_enabled {
-                tracing::warn!(
-                    "MM: air-interface authentication is ENABLED (one-way, SwMI authenticates MS only — mutual authentication and encryption are not implemented) for {} ISSI(s) with a configured key",
-                    sec.issi_keys.len()
-                );
+                if sec.authentication_required {
+                    tracing::warn!(
+                        "MM: air-interface authentication ENABLED and REQUIRED — only the {} ISSI(s) with a configured key can register; every other radio is refused",
+                        sec.issi_keys.len()
+                    );
+                } else {
+                    tracing::warn!(
+                        "MM: air-interface authentication is ENABLED but NOT enforced ({} ISSI(s) have a key). Radios without a configured key still register unchallenged, and a radio that FAILS the challenge stays registered — this verifies identity, it does not gate access. Set [security] authentication_required = true to enforce",
+                        sec.issi_keys.len()
+                    );
+                }
             } else {
                 tracing::warn!(
                     "MM: air-interface authentication (EN 300 392-7 TAA1) is NOT enabled — any radio can claim any ISSI; the whitelist is the only gate. Set [security] authentication_enabled = true and provide issi_keys to enable it"
@@ -516,6 +523,37 @@ impl MmBs {
                 RejectCause::ItsiAtsiUnknown,
             );
             return;
+        }
+
+        // STRICT AUTHENTICATION GATE — after the whitelist, before any registry mutation.
+        // With [security] authentication_required, an ISSI with no configured K can never prove
+        // who it is, so it is refused here instead of being let in unchallenged. This rejects at
+        // registration time; a terminal that HAS a key but FAILS its challenge is dealt with
+        // separately, in rx_u_authentication, since the failure only becomes known later.
+        {
+            let (enabled, required, has_key) = {
+                let cfg = self.config.config();
+                (
+                    cfg.security.authentication_enabled,
+                    cfg.security.authentication_required,
+                    cfg.security.issi_keys.contains_key(&issi),
+                )
+            };
+            if enabled && required && !has_key {
+                tracing::warn!(
+                    "MM: ISSI {} has no authentication key configured and [security] authentication_required is set — rejecting registration",
+                    issi
+                );
+                Self::send_d_location_update_reject_cause(
+                    queue,
+                    issi,
+                    handle,
+                    pdu.location_update_type,
+                    pdu.address_extension,
+                    RejectCause::ItsiAtsiUnknown,
+                );
+                return;
+            }
         }
 
         // The terminal answered with a location update â€” stop the restart-recovery replay to it
@@ -2026,14 +2064,18 @@ impl MmBs {
                 let res1 = (res1_u64 as u32).to_be_bytes();
                 match self.auth.handle_response(issi, res1) {
                     AuthOutcome::Accepted(_dck) => {
-                        // DCK is derived but not yet wired into AIE (encryption is not
-                        // implemented) â€” authentication result only, no ciphering starts.
+                        // The DCK is now retained by the AuthenticationManager (see `dck_for`),
+                        // but nothing consumes it yet: air-interface encryption is not wired
+                        // into the MAC layer, so traffic for this ISSI stays in the clear.
                         tracing::info!("MM: ISSI {} authenticated successfully", issi);
                         Self::send_d_authentication_result(queue, issi, handle, true);
                     }
                     AuthOutcome::Rejected => {
                         tracing::warn!("MM: ISSI {} FAILED authentication (RES1 mismatch)", issi);
                         Self::send_d_authentication_result(queue, issi, handle, false);
+                        if self.config.config().security.authentication_required {
+                            self.deregister_failed_authentication(queue, issi);
+                        }
                     }
                     AuthOutcome::NoSession => {
                         tracing::warn!(
@@ -2051,6 +2093,32 @@ impl MmBs {
                 );
             }
         }
+    }
+
+    /// Remove a terminal from the registry after it failed its authentication challenge, under
+    /// [security] authentication_required. Mirrors the U-ITSI-DETACH teardown so Brew, the
+    /// dashboard subscriber list and any group affiliations are all cleaned up — a half-removed
+    /// client would otherwise keep receiving group traffic it just failed to authenticate for.
+    ///
+    /// The terminal is not told to detach beyond the D-AUTHENTICATION result(false) already sent;
+    /// a conformant MS treats a failed authentication as a loss of service and re-registers,
+    /// which will fail the same way as long as its K is wrong.
+    fn deregister_failed_authentication(&mut self, queue: &mut MessageQueue, issi: u32) {
+        // Drop any retained DCK/pending challenge first, so nothing survives the deregistration.
+        self.auth.forget(issi);
+
+        if let Some(client) = self.client_mgr.remove_client(issi) {
+            self.config.state_write().subscribers.deregister(issi);
+            if !client.groups.is_empty() {
+                let groups: Vec<u32> = client.groups.iter().copied().collect();
+                self.emit_subscriber_update(queue, issi, groups, BrewSubscriberAction::Deaffiliate);
+            }
+            self.emit_subscriber_update(queue, issi, Vec::new(), BrewSubscriberAction::Deregister);
+            tracing::warn!("MM: ISSI {} deregistered after failed authentication", issi);
+        } else {
+            tracing::debug!("MM: ISSI {} failed authentication but was not in the registry", issi);
+        }
+        self.recovery_mark_dirty();
     }
 
     fn send_d_location_update_reject_cause(
