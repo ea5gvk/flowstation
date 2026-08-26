@@ -94,6 +94,23 @@ impl DAuthentication {
         }
     }
 
+    /// Build a RESULT PDU (Table A.4) that also carries the SwMI's own response RES2 to the
+    /// MS's mutual challenge (mutual_authentication_flag = 1). Per Table A.7, mutual
+    /// authentication is only meaningful alongside a successful RES1 check, so `success` here
+    /// should always be `true` in practice — a failed RES1 has nothing to be mutual about.
+    pub fn result_mutual(success: bool, res2: u32) -> Self {
+        DAuthentication {
+            sub_type: AuthenticationSubtype::Result,
+            rand1: None,
+            rs: None,
+            reject_reason: None,
+            res2: Some(res2 as u64),
+            result: Some(success),
+            mutual_authentication_flag: Some(true),
+            proprietary: None,
+        }
+    }
+
     /// Build a REJECT PDU (Table A.2).
     pub fn reject(reason: u8) -> Self {
         DAuthentication {
@@ -322,6 +339,26 @@ mod tests {
         assert_eq!(parsed.rs, Some(RS));
         assert_eq!(parsed.res2, Some(0x1234_5678));
         assert_eq!(parsed.rand1, Some(RAND1));
+    }
+
+    /// Table A.4, mutual = 1: R1(1) mutual(1) RES2(32) must all be present, in that order.
+    #[test]
+    fn result_mutual_layout() {
+        let pdu = DAuthentication::result_mutual(true, 0x1234_5678);
+        let mut out = BitBuffer::new_autoexpand(64);
+        pdu.to_bitbuf(&mut out).unwrap();
+        let bits = out.to_bitstr();
+        assert_eq!(bits.len(), 4 + 2 + 1 + 1 + 32 + 1);
+        assert_eq!(&bits[4..6], "10", "sub-type must be RESULT (10)");
+        assert_eq!(&bits[6..7], "1", "R1 = 1 (success)");
+        assert_eq!(&bits[7..8], "1", "mutual flag must be 1");
+        assert_eq!(u32::from_str_radix(&bits[8..40], 2).unwrap(), 0x1234_5678, "RES2 must follow the flags");
+
+        let mut inb = BitBuffer::from_bitstr(&bits);
+        let parsed = DAuthentication::from_bitbuf(&mut inb).unwrap();
+        assert_eq!(parsed.result, Some(true));
+        assert_eq!(parsed.mutual_authentication_flag, Some(true));
+        assert_eq!(parsed.res2, Some(0x1234_5678));
     }
 
     /// Table A.2 + Table A.38.
