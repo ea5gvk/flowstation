@@ -69,6 +69,27 @@ pub struct CfgSecurity {
     /// private key: restrict its filesystem permissions, and if you use the dashboard's remote
     /// config editor, be aware it may transit and be stored wherever that connection is proxied.
     pub issi_keys: HashMap<u32, [u8; 16]>,
+    /// STRICT MODE: refuse registration to any ISSI that has no key in [`Self::issi_keys`], and
+    /// deregister a terminal that fails its authentication challenge.
+    ///
+    /// Requires [`Self::authentication_enabled`]; ignored on its own. OFF by default.
+    ///
+    /// ⚠️ Enabling this locks out every radio that has not been provisioned with a matching K —
+    /// there is no grace period and no self-service enrolment. Provision the keys FIRST, confirm
+    /// in the log that each terminal authenticates successfully, and only then turn this on.
+    pub authentication_required: bool,
+    /// Enable TETRA air-interface encryption (AIE) using TEA2 with a cell-wide Static Cipher Key
+    /// — a security class 2 setup (ETSI EN 300 392-7 clause 6). OFF by default.
+    ///
+    /// EXPERIMENTAL / NOT INTEROPERABLE: the TB5 key-modification step (raw SCK + public network
+    /// information -> the ECK actually fed to TEA2) is NOT implemented, so `sck` is used directly
+    /// as the ECK. A compliant radio derives a different ECK from the same SCK and will therefore
+    /// produce garbage in both directions. Only enable this for BS-to-BS testing against another
+    /// FlowStation build carrying this same code — not on a cell serving real terminals.
+    pub encryption_enabled: bool,
+    /// Cell-wide Static Cipher Key (80 bits), used only when [`Self::encryption_enabled`] is set.
+    /// Same plaintext-in-config caveat as `issi_keys` applies.
+    pub sck: Option<[u8; 10]>,
 }
 
 impl Default for CfgSecurity {
@@ -81,6 +102,9 @@ impl Default for CfgSecurity {
             registration_rate_limit_per_min: DEFAULT_REGISTRATION_RATE_LIMIT_PER_MIN,
             authentication_enabled: false,
             issi_keys: HashMap::new(),
+            authentication_required: false,
+            encryption_enabled: false,
+            sck: None,
         }
     }
 }
@@ -139,6 +163,42 @@ pub struct CfgSecurityDto {
     /// in the data model, quoted or not) — the ISSI itself is parsed to u32 in `parse_issi_keys`.
     #[serde(default)]
     pub issi_keys: HashMap<String, String>,
+    #[serde(default)]
+    pub authentication_required: Option<bool>,
+    #[serde(default)]
+    pub encryption_enabled: Option<bool>,
+    /// 20 hex characters (80-bit SCK), e.g. `sck = "00112233445566778899"`.
+    #[serde(default)]
+    pub sck: Option<String>,
+}
+
+/// Decode exactly `N` bytes from a hex string, or `None` if the length or characters are wrong.
+fn parse_hex_key<const N: usize>(hex: &str) -> Option<[u8; N]> {
+    let hex = hex.trim();
+    if hex.len() != N * 2 {
+        return None;
+    }
+    let mut out = [0u8; N];
+    for (i, byte_out) in out.iter_mut().enumerate() {
+        *byte_out = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Parse the cell-wide SCK. Logs and returns None on a malformed value rather than failing the
+/// whole config load — a bad key leaves encryption off (see `AieContext`), it never falls back to
+/// a zero key.
+fn parse_sck(raw: Option<String>) -> Option<[u8; 10]> {
+    let raw = raw?;
+    match parse_hex_key::<10>(&raw) {
+        Some(k) => Some(k),
+        None => {
+            tracing::error!(
+                "security.sck: must be exactly 20 hex characters (80-bit key) — encryption will stay DISABLED"
+            );
+            None
+        }
+    }
 }
 
 /// Parse a 32-hex-character K into 16 bytes, and its ISSI key (a string, per TOML's data model —
@@ -203,6 +263,9 @@ pub fn apply_security_patch(dto: CfgSecurityDto) -> CfgSecurity {
             .unwrap_or(defaults.registration_rate_limit_per_min),
         authentication_enabled: dto.authentication_enabled.unwrap_or(defaults.authentication_enabled),
         issi_keys: parse_issi_keys(dto.issi_keys),
+        authentication_required: dto.authentication_required.unwrap_or(defaults.authentication_required),
+        encryption_enabled: dto.encryption_enabled.unwrap_or(defaults.encryption_enabled),
+        sck: parse_sck(dto.sck),
     }
 }
 
@@ -257,5 +320,50 @@ mod tests {
         );
         assert!(!parsed.contains_key(&1002));
         assert!(!parsed.contains_key(&1003));
+    }
+
+    #[test]
+    fn authentication_required_defaults_to_off() {
+        let cfg = CfgSecurity::default();
+        assert!(!cfg.authentication_required, "strict mode must never be the default");
+        assert!(!cfg.authentication_enabled);
+    }
+
+    /// The gate in mm_bs requires BOTH flags; assert the config can express that combination and
+    /// that `required` alone does not imply `enabled`.
+    #[test]
+    fn required_alone_does_not_enable_authentication() {
+        let mut cfg = CfgSecurity::default();
+        cfg.authentication_required = true;
+        assert!(!cfg.authentication_enabled, "required must not silently switch authentication on");
+    }
+
+    #[test]
+    fn sck_parses_only_a_well_formed_20_hex_char_key() {
+        assert_eq!(
+            parse_sck(Some("00112233445566778899".to_string())),
+            Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99])
+        );
+        assert_eq!(parse_sck(None), None);
+        assert_eq!(parse_sck(Some("001122".to_string())), None, "too short must not be accepted");
+        assert_eq!(
+            parse_sck(Some("00112233445566778899AABB".to_string())),
+            None,
+            "too long must not be accepted"
+        );
+        assert_eq!(
+            parse_sck(Some("zz112233445566778899".to_string())),
+            None,
+            "non-hex must not be accepted"
+        );
+    }
+
+    /// A malformed or absent key must leave encryption off rather than silently using zeros.
+    #[test]
+    fn bad_sck_does_not_produce_a_usable_key() {
+        let mut cfg = CfgSecurity::default();
+        cfg.encryption_enabled = true;
+        cfg.sck = parse_sck(Some("not-a-valid-key".to_string()));
+        assert!(cfg.sck.is_none(), "a rejected key must not become Some([0u8; 10])");
     }
 }
