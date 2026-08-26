@@ -1953,66 +1953,35 @@ impl MmBs {
     }
 
     fn send_d_authentication_demand(queue: &mut MessageQueue, issi: u32, handle: u32, rand1: [u8; 10], rs: [u8; 10]) {
-        let pdu = DAuthentication {
-            sub_type: AuthenticationSubtype::Demand,
-            rand1: Some(u128::from_be_bytes([
-                0, 0, 0, 0, 0, 0, rand1[0], rand1[1], rand1[2], rand1[3], rand1[4], rand1[5], rand1[6], rand1[7], rand1[8],
-                rand1[9],
-            ])),
-            rs: Some(u128::from_be_bytes([
-                0, 0, 0, 0, 0, 0, rs[0], rs[1], rs[2], rs[3], rs[4], rs[5], rs[6], rs[7], rs[8], rs[9],
-            ])),
-            mutual_authentication_flag: Some(false),
-            reject_reason: None,
-            res2: None,
-            result: None,
-            address_extension: None,
-            proprietary: None,
-        };
+        // Table A.1: RAND1 then RS, 80 bits each. Nothing else — no mutual flag in a DEMAND.
+        let pdu = DAuthentication::demand(be_bytes_to_u128_80(&rand1), be_bytes_to_u128_80(&rs));
 
-        let mut sdu = BitBuffer::new_autoexpand(4 + 2 + 80 + 80 + 1);
+        // 4 (type) + 2 (sub-type) + 80 (RAND1) + 80 (RS) + 1 (o-bit) = 167 bits
+        let mut sdu = BitBuffer::new_autoexpand(167);
         pdu.to_bitbuf(&mut sdu).unwrap();
         sdu.seek(0);
         tracing::debug!("-> {} sdu {}", pdu, sdu.dump_bin());
 
-        let msg = SapMsg {
-            sap: Sap::LmmSap,
-            src: TetraEntity::Mm,
-            dest: TetraEntity::Mle,
-            msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
-                sdu,
-                handle,
-                address: TetraAddress::issi(issi),
-                layer2service: Layer2Service::Acknowledged,
-                stealing_permission: false,
-                stealing_repeats_flag: false,
-                encryption_flag: false,
-                is_null_pdu: false,
-                tx_reporter: None,
-            }),
-        };
-        queue.push_back(msg);
+        queue.push_back(Self::mm_unitdata_req(sdu, issi, handle));
     }
 
     fn send_d_authentication_result(queue: &mut MessageQueue, issi: u32, handle: u32, success: bool) {
-        let pdu = DAuthentication {
-            sub_type: AuthenticationSubtype::Result,
-            rand1: None,
-            rs: None,
-            mutual_authentication_flag: None,
-            reject_reason: None,
-            res2: None,
-            result: Some(success),
-            address_extension: None,
-            proprietary: None,
-        };
+        // Table A.4: R1 then the mandatory mutual authentication flag (0 here — one-way only),
+        // so no RES2 follows.
+        let pdu = DAuthentication::result(success);
 
-        let mut sdu = BitBuffer::new_autoexpand(4 + 2 + 1 + 1);
+        // 4 + 2 + 1 (R1) + 1 (mutual flag) + 1 (o-bit) = 9 bits
+        let mut sdu = BitBuffer::new_autoexpand(9);
         pdu.to_bitbuf(&mut sdu).unwrap();
         sdu.seek(0);
         tracing::debug!("-> {} sdu {}", pdu, sdu.dump_bin());
 
-        let msg = SapMsg {
+        queue.push_back(Self::mm_unitdata_req(sdu, issi, handle));
+    }
+
+    /// Build the MLE unitdata request that carries an MM PDU down to a single ISSI.
+    fn mm_unitdata_req(sdu: BitBuffer, issi: u32, handle: u32) -> SapMsg {
+        SapMsg {
             sap: Sap::LmmSap,
             src: TetraEntity::Mm,
             dest: TetraEntity::Mle,
@@ -2027,8 +1996,7 @@ impl MmBs {
                 is_null_pdu: false,
                 tx_reporter: None,
             }),
-        };
-        queue.push_back(msg);
+        }
     }
 
     /// Handle a received U-AUTHENTICATION PDU. Only the `Response` sub-type is meaningful for
@@ -2057,11 +2025,22 @@ impl MmBs {
 
         match pdu.sub_type {
             AuthenticationSubtype::Response => {
-                let Some(res1_u64) = pdu.res1 else {
-                    tracing::warn!("MM: ISSI {} sent UAuthentication Response with no RES1 â€” ignoring", issi);
+                let Some(res1_raw) = pdu.res1 else {
+                    tracing::warn!("MM: ISSI {} sent U-AUTHENTICATION Response with no RES1 — ignoring", issi);
                     return;
                 };
-                let res1 = (res1_u64 as u32).to_be_bytes();
+                // Table A.7: if the MS set the mutual authentication flag it is also challenging
+                // the SwMI with RAND2 and expects a D-AUTHENTICATION RESPONSE back. The SwMI side
+                // of mutual authentication is not implemented, so flag it rather than silently
+                // completing only half the exchange.
+                if pdu.mutual_authentication_flag == Some(true) {
+                    tracing::warn!(
+                        "MM: ISSI {} requested MUTUAL authentication (RAND2 present) — the SwMI side is not implemented; only the MS will be authenticated",
+                        issi
+                    );
+                }
+                // RES1 is 32 bits (Table A.7); it arrives in the low half of a u64.
+                let res1 = (res1_raw as u32).to_be_bytes();
                 match self.auth.handle_response(issi, res1) {
                     AuthOutcome::Accepted(_dck) => {
                         // The DCK is now retained by the AuthenticationManager (see `dck_for`),
@@ -2705,5 +2684,28 @@ mod ee_tests {
         for mode in [EnergySavingMode::Eg1, EnergySavingMode::Eg2, EnergySavingMode::Eg3] {
             assert_eq!(MmBs::grant_energy_saving(42, mode).energy_saving_mode, mode);
         }
+    }
+}
+
+/// Pack the 10 bytes of an 80-bit TETRA challenge/seed into the low 80 bits of a u128,
+/// most-significant byte first (EN 300 392-7 Annex A.8.0: "the most significant bit of the
+/// values shown in the tables is transmitted first").
+fn be_bytes_to_u128_80(b: &[u8; 10]) -> u128 {
+    b.iter().fold(0u128, |acc, &byte| (acc << 8) | byte as u128)
+}
+
+#[cfg(test)]
+mod auth_packing_tests {
+    use super::*;
+
+    #[test]
+    fn be_bytes_packing_is_msb_first_and_fits_in_80_bits() {
+        let b = [0x01u8, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x12, 0x34];
+        let v = be_bytes_to_u128_80(&b);
+        assert_eq!(v, 0x0123_4567_89AB_CDEF_1234u128);
+        assert!(v < (1u128 << 80), "must occupy at most 80 bits");
+
+        assert_eq!(be_bytes_to_u128_80(&[0xFF; 10]), (1u128 << 80) - 1, "all-ones fills exactly 80 bits");
+        assert_eq!(be_bytes_to_u128_80(&[0x00; 10]), 0);
     }
 }
