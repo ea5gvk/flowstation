@@ -19,7 +19,7 @@
 mod ffi {
     use std::os::raw::c_uchar;
 
-    extern "C" {
+    unsafe extern "C" {
         pub fn ta11_ta41(lpKeyK: *const c_uchar, lpChallengeRs: *const c_uchar, lpKsOut: *mut c_uchar);
         pub fn ta21(lpKeyK: *const c_uchar, lpChallengeRs: *const c_uchar, lpKspOut: *mut c_uchar);
         pub fn ta12_ta22(lpKeyKs: *const c_uchar, lpRand: *const c_uchar, lpResOut: *mut c_uchar, lpDckOut: *mut c_uchar);
