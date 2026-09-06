@@ -278,7 +278,10 @@ impl BsChannelScheduler {
             .unwrap_or(false)
     }
 
-    fn supports_assigned_traffic_ts(&self, ts: u8) -> bool {
+    /// Whether `ts` is an ASSIGNED TRAFFIC slot on this carrier: ts 2..=4 always; ts1 only when
+    /// this carrier has no MCCH on it (a secondary carrier). Circuit closes on such slots are
+    /// deferred by the UMAC so queued FACCH/STCH signalling can leave first.
+    pub fn supports_assigned_traffic_ts(&self, ts: u8) -> bool {
         match ts {
             1 => self.downlink_mode.allow_assigned_traffic_ts1(),
             2..=4 => true,

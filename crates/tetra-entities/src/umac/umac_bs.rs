@@ -1917,7 +1917,13 @@ impl UmacBs {
             }
         };
 
-        if (2..=4).contains(&ts) {
+        // Defer the close of any ASSIGNED TRAFFIC slot of that carrier so queued FACCH/STCH
+        // signalling — the on-channel D-RELEASE — gets a scheduler turn first. On the primary
+        // that is ts 2..=4 (ts1 is the MCCH); on a secondary carrier ts1 carries traffic too.
+        // Closing a secondary ts1 immediately discarded its D-RELEASE (only the MCCH copy went
+        // out, which a terminal parked on that traffic channel never hears): the terminal sat
+        // on the dead channel until its own timer expired, then rescanned and re-registered.
+        if self.scheduler_for(carrier_num).supports_assigned_traffic_ts(ts) {
             let pending = self.pending_circuit_closes.entry((carrier_num, ts)).or_default();
             match dir {
                 Direction::Both => {

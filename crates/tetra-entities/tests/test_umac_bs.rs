@@ -1293,3 +1293,107 @@ fn test_dl_block_queue_is_bounded_under_burst() {
         marker
     );
 }
+
+#[test]
+fn test_secondary_ts1_close_is_deferred_so_facch_release_goes_out_on_channel() {
+    // On a secondary carrier ts1 is an assigned traffic slot. At the end of a call CMCE queues the
+    // on-channel D-RELEASE (FACCH/STCH) for the call's own timeslot and then the circuit close, and
+    // the close reaches the UMAC first (one hop vs three). It must be deferred like the primary's
+    // ts 2..=4, or the STCH finds no active DL circuit and falls back to the MCCH — which a terminal
+    // parked on the secondary traffic channel never hears: it sits on the dead channel until its
+    // own timer expires, then rescans and re-registers.
+    debug::setup_logging_verbose();
+
+    let mut test = new_secondary_umac_test(TdmaTime { h: 0, m: 1, f: 1, t: 1 });
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    let mut open = open_shared_voice_circuit(1);
+    if let SapMsgInner::CmceCallControl(CallControl::Open(circuit)) = &mut open.msg {
+        circuit.carrier_num = SECONDARY_CARRIER;
+    }
+    test.submit_message(open);
+    test.run_stack(Some(1));
+    test.dump_sinks();
+    assert!(
+        umac_of(&mut test).circuit_is_active_on(SECONDARY_CARRIER, Direction::Dl, 1),
+        "the secondary ts1 circuit should be open"
+    );
+
+    // End of call: close first, FACCH copy of the D-RELEASE right behind it, same tick.
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Cmce,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::CmceCallControl(CallControl::CloseSlot {
+            direction: Direction::Both,
+            carrier_num: SECONDARY_CARRIER,
+            ts: 1,
+        }),
+    });
+    let dest = TetraAddress {
+        ssi: 9012001,
+        ssi_type: SsiType::Issi,
+    };
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+            req_handle: 0,
+            pdu: BitBuffer::from_bitstr("1010101010101010"),
+            main_address: dest,
+            link_id: 1,
+            endpoint_id: 0,
+            stealing_permission: true,
+            subscriber_class: 0,
+            air_interface_encryption: None,
+            stealing_repeats_flag: None,
+            data_category: None,
+            carrier_num: Some(SECONDARY_CARRIER),
+            chan_alloc: Some(CmceChanAllocReq {
+                usage: Some(26),
+                carrier: Some(SECONDARY_CARRIER),
+                timeslots: [true, false, false, false],
+                alloc_type: ChanAllocType::Replace,
+                ul_dl_assigned: UlDlAssignment::Both,
+            }),
+            tx_reporter: None,
+        }),
+    });
+    test.run_stack(Some(12));
+
+    let mut stch_on_secondary_ts1 = false;
+    let mut fell_back_to_primary_mcch = false;
+    for msg in test.dump_sinks() {
+        let slots = match msg.msg {
+            SapMsgInner::TmvUnitdataReq(slot) => vec![slot],
+            SapMsgInner::TmvUnitdataReqSlots(slots) => slots.slots,
+            _ => continue,
+        };
+        for slot in slots {
+            let is_stch = slot.blk1.as_ref().is_some_and(|b| b.logical_channel == LogicalChannel::Stch);
+            if slot.carrier_num == SECONDARY_CARRIER && slot.ts.t == 1 && is_stch {
+                stch_on_secondary_ts1 = true;
+            }
+            if slot.carrier_num == MAIN_CARRIER
+                && slot.ts.t == 1
+                && (block_mac_resource_for(&slot.blk1, dest).is_some() || block_mac_resource_for(&slot.blk2, dest).is_some())
+            {
+                fell_back_to_primary_mcch = true;
+            }
+        }
+    }
+    assert!(stch_on_secondary_ts1, "the FACCH D-RELEASE must go out as an STCH on the secondary ts1");
+    assert!(!fell_back_to_primary_mcch, "it must not have fallen back to the primary MCCH");
+
+    // ...and the deferred close still ran once the STCH drained.
+    let umac = umac_of(&mut test);
+    assert!(
+        !umac.circuit_is_active_on(SECONDARY_CARRIER, Direction::Dl, 1),
+        "the deferred DL close must still run"
+    );
+    assert!(
+        !umac.circuit_is_active_on(SECONDARY_CARRIER, Direction::Ul, 1),
+        "the deferred UL close must still run"
+    );
+}
