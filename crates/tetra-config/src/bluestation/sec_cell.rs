@@ -186,7 +186,7 @@ pub struct CfgCellInfo {
     /// (D-RELEASE to both parties). Radios give such a silent call up on their own after
     /// ~10-15 s WITHOUT telling the network, which left the circuit (and the dashboard) with a
     /// call that no longer existed until T310. 0 = never (only T310 / U-DISCONNECT end it).
-    /// Default: 5 seconds. Range: 0–300.
+    /// Default: 30 seconds. Range: 0–300.
     pub individual_hangtime_secs: u32,
 
     /// Maximum active call duration in seconds (ETSI T310 equivalent, EN 300 392-2 §14.9.1).
@@ -291,7 +291,7 @@ pub struct CellInfoDto {
     /// Group call hangtime in seconds. Default: 5.
     pub hangtime_secs: Option<u32>,
 
-    /// Simplex individual call hangtime in seconds. 0 = disabled. Default: 5.
+    /// Simplex individual call hangtime in seconds. 0 = disabled. Default: 30.
     pub individual_hangtime_secs: Option<u32>,
 
     /// Active call timeout (T310) in seconds. Default: 120.
@@ -381,7 +381,7 @@ pub fn cell_dto_to_cfg(ci: CellInfoDto) -> CfgCellInfo {
         }),
         neighbor_cells_ca: ci.neighbor_cells_ca,
         hangtime_secs: ci.hangtime_secs.unwrap_or(5).clamp(0, 300),
-        individual_hangtime_secs: ci.individual_hangtime_secs.unwrap_or(5).clamp(0, 300),
+        individual_hangtime_secs: ci.individual_hangtime_secs.unwrap_or(30).clamp(0, 300),
         call_timeout_secs: {
             let v = ci.call_timeout_secs.unwrap_or(120);
             if v == 0 { 0 } else { v.clamp(30, 86400) }
