@@ -8,6 +8,7 @@ use tetra_pdus::phy::traits::rxtx_dev::RxSlotBits;
 use tetra_pdus::phy::traits::rxtx_dev::RxTxDev;
 use tetra_pdus::phy::traits::rxtx_dev::RxTxDevError;
 use tetra_pdus::phy::traits::rxtx_dev::TxSlotBits;
+use tetra_core::TdmaTime;
 
 use crate::net_telemetry::channel::TelemetrySink;
 use crate::net_telemetry::events::TelemetryEvent;
@@ -432,7 +433,11 @@ struct TxDsp {
     fcfb: fcfb::SynthesisOutputProcessor,
     block_count: fcfb::BlockCount,
     initial_time: i64,
-    modulators: Vec<ModulatorChannel>,
+    /// One modulator per BS carrier, tagged with its carrier number: every downlink burst goes
+    /// to the modulator of ITS carrier (matched by number, never by position in the batch).
+    modulators: Vec<(u16, ModulatorChannel)>,
+    /// Carriers already warned about (bursts received for a carrier without a modulator).
+    unknown_carriers_warned: std::collections::HashSet<u16>,
     monitor: Option<TxSignalMonitor>,
     /// Scratch buffer reused for cloning the fcfb output when the TX monitor
     /// wants to inspect it. Kept on the struct so we don't allocate on every
@@ -452,9 +457,9 @@ impl TxDsp {
 
         let fcfb = fcfb::SynthesisOutputProcessor::new(fft_planner, fcfb_params);
 
-        let mut modulators = Vec::<ModulatorChannel>::new();
-        for dl_freq in phy_config.bs_dl_frequencies {
-            modulators.push(ModulatorChannel::new(fft_planner, fcfb_params, *dl_freq, modulator::Mode::Dl));
+        let mut modulators = Vec::<(u16, ModulatorChannel)>::new();
+        for (carrier_num, dl_freq) in phy_config.bs_carrier_numbers.iter().copied().zip(phy_config.bs_dl_frequencies.iter().copied()) {
+            modulators.push((carrier_num, ModulatorChannel::new(fft_planner, fcfb_params, dl_freq, modulator::Mode::Dl)));
         }
 
         let carriers = phy_config
@@ -478,6 +483,7 @@ impl TxDsp {
             block_count: 0,
             initial_time: 0, // TODO: get it from RX
             modulators,
+            unknown_carriers_warned: std::collections::HashSet::new(),
             monitor,
             tx_signal_scratch: Vec::new(),
         }
@@ -525,8 +531,22 @@ impl TxDsp {
             }
         }
 
-        for (modulator, tx_slot) in self.modulators.iter_mut().zip(tx_slot) {
-            if !modulator.process(&mut self.fcfb, self.block_count, tx_slot) {
+        // Every modulator gets the burst of ITS carrier. A carrier whose burst is missing from
+        // this batch transmits silence for that slot (a silent TxSlotBits keeps its modulator in
+        // step); matching by position instead radiated the NEXT carrier's burst on its frequency
+        // whenever an earlier burst had been dropped upstream.
+        for slot in tx_slot {
+            if !self.modulators.iter().any(|(c, _)| *c == slot.carrier_num) && self.unknown_carriers_warned.insert(slot.carrier_num) {
+                tracing::warn!(
+                    "TX burst for carrier {} but no modulator is configured for it — dropped",
+                    slot.carrier_num
+                );
+            }
+        }
+        let fallback_time = tx_slot.first().map(|s| s.time);
+        for (carrier_num, modulator) in self.modulators.iter_mut() {
+            let Some(slot) = slot_for_carrier(tx_slot, *carrier_num, fallback_time) else { continue };
+            if !modulator.process(&mut self.fcfb, self.block_count, &slot) {
                 return Ok(false);
             }
         }
@@ -1275,5 +1295,50 @@ impl SdrHealthMonitor {
             tx_gains,
             rx_gains,
         });
+    }
+}
+
+/// The burst for `carrier_num` in this batch, or a silent slot at the batch's time when that
+/// carrier's burst is missing (its modulator then stays in step and transmits nothing). `None`
+/// only for an empty batch, where there is no slot time to synthesise.
+fn slot_for_carrier<'a>(tx_slot: &[TxSlotBits<'a>], carrier_num: u16, fallback_time: Option<TdmaTime>) -> Option<TxSlotBits<'a>> {
+    if let Some(s) = tx_slot.iter().find(|s| s.carrier_num == carrier_num) {
+        return Some(TxSlotBits { carrier_num, time: s.time, slot: s.slot, ..Default::default() });
+    }
+    fallback_time.map(|time| TxSlotBits { carrier_num, time, slot: None, ..Default::default() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t() -> TdmaTime {
+        TdmaTime { t: 1, f: 1, m: 1, h: 0 }
+    }
+
+    #[test]
+    fn burst_goes_to_its_own_carrier_even_when_another_is_missing() {
+        let sec = [1u8; 8];
+        // A batch without the primary's burst: positional matching used to hand the secondary's
+        // burst to the first (primary) modulator, i.e. radiate it on the wrong frequency.
+        let batch = [TxSlotBits { carrier_num: 1598, time: t(), slot: Some(&sec), ..Default::default() }];
+        let primary = slot_for_carrier(&batch, 1600, Some(t())).expect("silent slot for the primary");
+        assert_eq!(primary.carrier_num, 1600);
+        assert!(primary.slot.is_none(), "missing burst -> silence on the primary, not someone else's burst");
+        let secondary = slot_for_carrier(&batch, 1598, Some(t())).expect("secondary burst");
+        assert_eq!(secondary.slot.map(|b| b.len()), Some(8));
+    }
+
+    #[test]
+    fn matching_is_by_carrier_number_not_position() {
+        let a = [1u8; 4];
+        let b = [2u8; 4];
+        let batch = [
+            TxSlotBits { carrier_num: 1598, time: t(), slot: Some(&b), ..Default::default() },
+            TxSlotBits { carrier_num: 1600, time: t(), slot: Some(&a), ..Default::default() },
+        ];
+        assert_eq!(slot_for_carrier(&batch, 1600, None).unwrap().slot, Some(&a[..]));
+        assert_eq!(slot_for_carrier(&batch, 1598, None).unwrap().slot, Some(&b[..]));
+        assert!(slot_for_carrier(&[], 1600, None).is_none(), "an empty batch has no slot time to synthesise");
     }
 }
