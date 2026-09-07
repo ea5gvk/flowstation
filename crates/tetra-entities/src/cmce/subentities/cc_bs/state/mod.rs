@@ -449,7 +449,7 @@ pub(super) struct IndividualCall {
     /// One pending simplex floor request while another party is transmitting.
     pub(super) queued_tx_demand: Option<TetraAddress>,
     /// When the simplex floor was last left free (None while a party holds it). Drives the
-    /// individual-call hangtime (`cell.individual_hangtime_secs`).
+    /// individual-call hangtime (`INDIVIDUAL_HANGTIME_SECS`).
     pub(super) floor_released_at: Option<TdmaTime>,
 }
 

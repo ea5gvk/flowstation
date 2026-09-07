@@ -21,6 +21,13 @@ pub(super) const EE_DSETUP_FALLBACK_TS: i32 = 423;
 /// 72 = 18 frames × 4 slots.)
 pub(super) const NETWORK_MEDIA_INACTIVITY_TS: i32 = 10 * 18 * 4;
 
+/// Hangtime of a simplex individual call, in seconds: how long it stays up with NOBODY holding
+/// the floor before the BS releases it (D-RELEASE to both parties). Field radios give such a
+/// silent call up on their own after 13 s WITHOUT telling the network (measured, two runs), so
+/// this is deliberately fixed — not configurable — at that same value: a longer time would only
+/// keep a circuit (and a dashboard entry) for a call the radios have already dropped.
+pub(super) const INDIVIDUAL_HANGTIME_SECS: u32 = 13;
+
 impl CcBsSubentity {
     pub fn tick_start(&mut self, queue: &mut MessageQueue, dltime: TdmaTime) {
         self.dltime = dltime;
@@ -519,10 +526,10 @@ impl CcBsSubentity {
             self.release_group_call(queue, call_id, DisconnectCause::SwmiRequestedDisconnection);
         }
 
-        // Simplex individual calls: radios drop a call nobody has spoken in for ~10-15 s on their
-        // own, WITHOUT a U-DISCONNECT, so without this the circuit (and the dashboard) kept a call
-        // that no longer existed until T310. 0 disables it.
-        let individual_hangtime_secs = self.config.config().cell.individual_hangtime_secs;
+        // Simplex individual calls: radios drop a call nobody has spoken in for 13 s on their own,
+        // WITHOUT a U-DISCONNECT, so without this the circuit (and the dashboard) kept a call that
+        // no longer existed until T310. See INDIVIDUAL_HANGTIME_SECS.
+        let individual_hangtime_secs = INDIVIDUAL_HANGTIME_SECS;
         let individual_limit_ts: i32 = individual_hangtime_secs as i32 * 18 * 4;
         let expired_individual: Vec<u16> = self
             .individual_calls

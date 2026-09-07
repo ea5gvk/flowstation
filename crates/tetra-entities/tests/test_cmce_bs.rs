@@ -2592,9 +2592,9 @@ fn test_second_group_setup_to_active_gssi_is_late_entry() {
 }
 
 /// A simplex individual call nobody speaks in is released by the BS after the individual
-/// hangtime (`cell.individual_hangtime_secs`, 5 s here): radios drop such a call on their own
-/// after ~10-15 s WITHOUT a U-DISCONNECT, which left the circuit and the dashboard with a call
-/// that no longer existed until T310 (5 min).
+/// hangtime (13 s, fixed): radios drop such a call on their own after 13 s WITHOUT a
+/// U-DISCONNECT, which left the circuit and the dashboard with a call that no longer existed
+/// until T310 (5 min).
 #[test]
 fn test_simplex_individual_call_released_after_individual_hangtime() {
     debug::setup_logging_verbose();
@@ -2612,8 +2612,8 @@ fn test_simplex_individual_call_released_after_individual_hangtime() {
         "no release right after U-TX CEASED"
     );
 
-    // Just under the hangtime (5 s = 360 timeslots): still up.
-    test.run_stack(Some(300));
+    // Just under the hangtime (13 s = 936 timeslots): still up.
+    test.run_stack(Some(900));
     let early = test.dump_sinks();
     assert!(
         find_lcmc_req(&early, calling_issi, CmcePduTypeDl::DRelease).is_none(),
@@ -2621,7 +2621,7 @@ fn test_simplex_individual_call_released_after_individual_hangtime() {
     );
 
     // Past it: D-RELEASE to both parties, SwMI-requested (not ExpiryOfTimer, which radios show as "No answer").
-    test.run_stack(Some(120));
+    test.run_stack(Some(100));
     let late = test.dump_sinks();
     let (mut calling_sdu, _) =
         find_lcmc_req(&late, calling_issi, CmcePduTypeDl::DRelease).expect("Expected D-RELEASE to calling ISSI");
