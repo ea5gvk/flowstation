@@ -448,6 +448,9 @@ pub(super) struct IndividualCall {
     pub(super) floor_holder: Option<u32>,
     /// One pending simplex floor request while another party is transmitting.
     pub(super) queued_tx_demand: Option<TetraAddress>,
+    /// When the simplex floor was last left free (None while a party holds it). Drives the
+    /// individual-call hangtime (`cell.individual_hangtime_secs`).
+    pub(super) floor_released_at: Option<TdmaTime>,
 }
 
 impl IndividualCall {
@@ -488,11 +491,22 @@ impl IndividualCall {
     pub(super) fn grant_floor(&mut self, holder: TetraAddress) {
         self.floor_holder = Some(holder.ssi);
         self.queued_tx_demand = None;
+        self.floor_released_at = None;
     }
 
-    pub(super) fn release_floor(&mut self) {
+    pub(super) fn release_floor(&mut self, now: TdmaTime) {
         self.floor_holder = None;
         self.queued_tx_demand = None;
+        self.floor_released_at = Some(now);
+    }
+
+    /// True for an active simplex call whose floor has been free for more than `limit_ts`
+    /// timeslots (the individual-call hangtime); `limit_ts <= 0` disables the check.
+    pub(super) fn individual_hangtime_expired(&self, now: TdmaTime, limit_ts: i32) -> bool {
+        if limit_ts <= 0 || !self.is_active() || !self.is_simplex() || self.floor_holder.is_some() {
+            return false;
+        }
+        self.floor_released_at.is_some_and(|since| since.age(now) > limit_ts)
     }
 
     pub(super) fn queue_tx_demand(&mut self, requester: TetraAddress) -> TxDemandQueueResult {
@@ -530,6 +544,10 @@ impl IndividualCall {
         self.setup_timeout = None;
         self.active_timer_started = Some(now);
         self.connect_request_sent = false;
+        // A call that connects with the floor free starts its hangtime right away.
+        if self.floor_holder.is_none() {
+            self.floor_released_at = Some(now);
+        }
     }
 
     pub(super) fn begin_disconnect(&mut self) {

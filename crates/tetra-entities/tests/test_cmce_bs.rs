@@ -2590,3 +2590,48 @@ fn test_second_group_setup_to_active_gssi_is_late_entry() {
         "the ongoing speaker keeps the floor"
     );
 }
+
+/// A simplex individual call nobody speaks in is released by the BS after the individual
+/// hangtime (`cell.individual_hangtime_secs`, 5 s here): radios drop such a call on their own
+/// after ~10-15 s WITHOUT a U-DISCONNECT, which left the circuit and the dashboard with a call
+/// that no longer existed until T310 (5 min).
+#[test]
+fn test_simplex_individual_call_released_after_individual_hangtime() {
+    debug::setup_logging_verbose();
+
+    let calling_issi = 1000001;
+    let called_issi = 1000002;
+    let (mut test, call_id, _) = connected_simplex_individual_call(calling_issi, called_issi);
+
+    // The caller releases the floor and nobody takes it.
+    test.submit_message(build_u_tx_ceased_msg(calling_issi, call_id));
+    test.run_stack(Some(1));
+    let ceased_msgs = test.dump_sinks();
+    assert!(
+        find_lcmc_req(&ceased_msgs, calling_issi, CmcePduTypeDl::DRelease).is_none(),
+        "no release right after U-TX CEASED"
+    );
+
+    // Just under the hangtime (5 s = 360 timeslots): still up.
+    test.run_stack(Some(300));
+    let early = test.dump_sinks();
+    assert!(
+        find_lcmc_req(&early, calling_issi, CmcePduTypeDl::DRelease).is_none(),
+        "released before the individual hangtime elapsed"
+    );
+
+    // Past it: D-RELEASE to both parties, SwMI-requested (not ExpiryOfTimer, which radios show as "No answer").
+    test.run_stack(Some(120));
+    let late = test.dump_sinks();
+    let (mut calling_sdu, _) =
+        find_lcmc_req(&late, calling_issi, CmcePduTypeDl::DRelease).expect("Expected D-RELEASE to calling ISSI");
+    let calling_release = DRelease::from_bitbuf(&mut calling_sdu).expect("Failed to parse calling DRelease");
+    assert_eq!(calling_release.call_identifier, call_id);
+    assert_eq!(calling_release.disconnect_cause, DisconnectCause::SwmiRequestedDisconnection);
+
+    let (mut called_sdu, _) =
+        find_lcmc_req(&late, called_issi, CmcePduTypeDl::DRelease).expect("Expected D-RELEASE to called ISSI");
+    let called_release = DRelease::from_bitbuf(&mut called_sdu).expect("Failed to parse called DRelease");
+    assert_eq!(called_release.call_identifier, call_id);
+    assert_eq!(called_release.disconnect_cause, DisconnectCause::SwmiRequestedDisconnection);
+}

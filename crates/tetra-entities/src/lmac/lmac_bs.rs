@@ -299,22 +299,28 @@ impl LmacBs {
         let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago. 
         let key = (prim.carrier_num, msg_dltime.t);
         let pchan = self.uplink_phy_chan.get(&key).copied().unwrap_or(PhysicalChannel::Unallocated);
-        let blk2_stolen = self.blk2_stolen.get(&key).copied().unwrap_or(false);
-        let lchan = Self::determine_logical_channel_ul(&prim, pchan == PhysicalChannel::Tp, blk2_stolen);
+        let mut blk2_stolen = self.blk2_stolen.get(&key).copied().unwrap_or(false);
 
         // Sanity checks
         if prim.block_num == PhyBlockNum::Block1 && blk2_stolen {
-            tracing::warn!("lmac_bs: blk2_stolen set when receiving block1, resetting");
+            tracing::debug!("lmac_bs: blk2_stolen set when receiving block1, resetting");
             self.blk2_stolen.insert(key, false);
+            blk2_stolen = false;
         }
         if pchan != PhysicalChannel::Tp && blk2_stolen {
-            tracing::warn!(
-                "lmac_bs: blk2_stolen set on non-traffic burst (pchan={:?}), resetting — likely late STCH after circuit close",
+            // A stolen flag left over from the last STCH of a call whose slot has since dropped to
+            // signalling mode (hangtime) or closed. The burst itself is an ordinary control burst
+            // on a control-mode slot (a radio's random access on the hang slot, typically its
+            // U-TX DEMAND or U-DISCONNECT), so decode it as such instead of discarding it, which
+            // silently ate the first access attempt after every floor release.
+            tracing::debug!(
+                "lmac_bs: stale blk2_stolen on a non-traffic slot (pchan={:?}), clearing it and decoding the burst as control",
                 pchan
             );
             self.blk2_stolen.insert(key, false);
-            return;
+            blk2_stolen = false;
         }
+        let lchan = Self::determine_logical_channel_ul(&prim, pchan == PhysicalChannel::Tp, blk2_stolen);
 
         match lchan {
             LogicalChannel::Clch => {}

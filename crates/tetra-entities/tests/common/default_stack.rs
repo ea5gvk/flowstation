@@ -91,6 +91,7 @@ pub fn default_cell_info(freq_info: FreqInfo) -> CfgCellInfo {
         sds_broadcast: None,
         neighbor_cells_ca: Vec::new(),
         hangtime_secs: 5,
+        individual_hangtime_secs: 5,
         call_timeout_secs: 120,
         ul_inactivity_secs: 3,
         periodic_registration_secs: 3600,

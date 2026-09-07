@@ -382,7 +382,7 @@ impl CcBsSubentity {
                     requester.ssi
                 );
                 if let Some(call) = self.individual_calls.get_mut(&call_id) {
-                    call.release_floor();
+                    call.release_floor(self.dltime);
                 }
                 self.send_individual_d_tx_ceased(queue, &call_snapshot, call_id, local_party);
                 self.notify_floor_released(
@@ -425,7 +425,7 @@ impl CcBsSubentity {
         }
 
         if let Some(call) = self.individual_calls.get_mut(&call_id) {
-            call.release_floor();
+            call.release_floor(self.dltime);
         }
         self.send_individual_d_tx_ceased(queue, &call_snapshot, call_id, local_party);
         self.notify_floor_released(
@@ -535,7 +535,7 @@ impl CcBsSubentity {
                         requester.ssi
                     );
                     if let Some(call) = self.individual_calls.get_mut(&call_id) {
-                        call.release_floor();
+                        call.release_floor(self.dltime);
                     }
                     self.send_individual_d_tx_ceased(queue, &call_snapshot, call_id, sender_party);
                     self.send_individual_d_tx_ceased(queue, &call_snapshot, call_id, peer_party);
@@ -572,7 +572,7 @@ impl CcBsSubentity {
             self.send_individual_d_tx_ceased(queue, &call_snapshot, call_id, sender_party);
             self.send_individual_d_tx_ceased(queue, &call_snapshot, call_id, peer_party);
             if let Some(call) = self.individual_calls.get_mut(&call_id) {
-                call.release_floor();
+                call.release_floor(self.dltime);
             }
             self.notify_individual_floor_released(queue, &call_snapshot, call_id, sender_party);
             return;

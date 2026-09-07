@@ -237,6 +237,7 @@ impl CcBsSubentity {
                 connect_request_sent: false,
                 floor_holder: None,
                 queued_tx_demand: None,
+                floor_released_at: None,
             },
         ) {
             match err {
@@ -668,7 +669,7 @@ impl CcBsSubentity {
                 }
                 TransmissionGrant::RequestQueued | TransmissionGrant::NotGranted => {
                     if let Some(call_state) = self.individual_calls.get_mut(&call_id) {
-                        call_state.release_floor();
+                        call_state.release_floor(self.dltime);
                     }
                 }
             }

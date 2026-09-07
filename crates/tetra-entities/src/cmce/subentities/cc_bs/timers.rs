@@ -518,6 +518,26 @@ impl CcBsSubentity {
             tracing::info!("Hangtime expired for call_id={}, releasing", call_id);
             self.release_group_call(queue, call_id, DisconnectCause::SwmiRequestedDisconnection);
         }
+
+        // Simplex individual calls: radios drop a call nobody has spoken in for ~10-15 s on their
+        // own, WITHOUT a U-DISCONNECT, so without this the circuit (and the dashboard) kept a call
+        // that no longer existed until T310. 0 disables it.
+        let individual_hangtime_secs = self.config.config().cell.individual_hangtime_secs;
+        let individual_limit_ts: i32 = individual_hangtime_secs as i32 * 18 * 4;
+        let expired_individual: Vec<u16> = self
+            .individual_calls
+            .iter()
+            .filter_map(|(&call_id, call)| call.individual_hangtime_expired(self.dltime, individual_limit_ts).then_some(call_id))
+            .collect();
+
+        for call_id in expired_individual {
+            tracing::info!(
+                "Individual call hangtime expired for call_id={} (floor free for >{}s), releasing",
+                call_id,
+                individual_hangtime_secs
+            );
+            self.release_individual_call(queue, call_id, DisconnectCause::SwmiRequestedDisconnection);
+        }
     }
 
     /// Reclaim a network group-call traffic slot whose backhaul media has gone silent without a

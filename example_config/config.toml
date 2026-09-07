@@ -165,6 +165,14 @@ voice_service = true
 # Default: 5 seconds. Valid range: 0–300.
 # hangtime_secs = 5
 
+# Individual (point-to-point) half-duplex call hangtime in seconds.
+# How long an active private simplex call stays up with nobody holding the floor before the
+# BS releases it (D-RELEASE to both radios). Radios drop such a silent call on their own after
+# roughly 10-15 s without telling the network; without this the circuit stayed allocated (and the
+# dashboard showed the call) until the 5-minute T310 timer. 0 = disabled.
+# Default: 5 seconds. Valid range: 0–300.
+# individual_hangtime_secs = 5
+
 # Legacy-radio workaround: tear a group call down on a SAME-SPEAKER floor retake during hangtime
 # instead of reusing the open circuit, so the next PTT runs a full U-SETUP/D-CONNECT/D-SETUP
 # cycle. Old Motorola sets (MR5/MR19 era) ACK a fast retake grant but never key up the TCH/S,
