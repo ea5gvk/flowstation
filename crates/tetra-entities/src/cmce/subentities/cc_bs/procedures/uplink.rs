@@ -584,11 +584,28 @@ impl CcBsSubentity {
                     tracing::warn!("U-TX CEASED for unknown call_id={}", call_id);
                 }
                 GroupTransitionError::InvalidTransition { state, .. } => {
-                    tracing::debug!(
-                        "U-TX CEASED ignored for call_id={} due to invalid transition in state {:?}",
-                        call_id,
-                        state
-                    );
+                    // A radio that already released the floor repeats U-TX CEASED once per frame
+                    // until it is answered. Silently dropping the repeats left it unanswered: it
+                    // gave up on the cell and came back with a service-restoration location
+                    // update, seen by the user as the radio disconnecting the moment the PTT was
+                    // released (observed 2026-09-13, eighteen ignored repeats then the update).
+                    // The floor is already free, so just confirm it again.
+                    if matches!(state, GroupCallState::NoActiveSpeaker { .. }) {
+                        if let Some(call) = self.active_calls.get(&call_id) {
+                            let (dest_gssi, carrier_num, ts) = (call.dest_gssi, call.carrier_num, call.ts);
+                            tracing::debug!(
+                                "U-TX CEASED repeat on call_id={} (floor already free) — re-sending D-TX CEASED",
+                                call_id
+                            );
+                            self.send_d_tx_ceased_facch(queue, call_id, dest_gssi, carrier_num, ts);
+                        }
+                    } else {
+                        tracing::debug!(
+                            "U-TX CEASED ignored for call_id={} due to invalid transition in state {:?}",
+                            call_id,
+                            state
+                        );
+                    }
                 }
                 GroupTransitionError::NotCurrentSpeaker {
                     sender_issi,
