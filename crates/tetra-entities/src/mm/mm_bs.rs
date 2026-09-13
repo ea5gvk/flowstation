@@ -2381,26 +2381,34 @@ impl TetraEntityTrait for MmBs {
 }
 
 impl MmBs {
-    /// Called when Brew backhaul reconnects. Sends D-LOCATION-UPDATE-COMMAND to all
-    /// locally registered MS to force them to re-affiliate. This fixes the PTT-denied
-    /// symptom where MS units registered before a Brew disconnect never re-register.
+    /// Called when the Brew backhaul reconnects. The Brew server has forgotten who is
+    /// registered and affiliated here, so replay every known terminal's registration and group
+    /// list to it straight from the MM registry. This fixes the PTT-denied symptom after a
+    /// backhaul blip without touching the air interface: the terminals stay registered and
+    /// never notice. (It used to send D-LOCATION-UPDATE-COMMAND to every terminal instead, so
+    /// each backhaul blip made the whole fleet re-register at once — a visible "network
+    /// problem" on every radio for something that only concerned the backhaul.)
     fn rx_brew_reconnected(&mut self, queue: &mut MessageQueue) {
         let issis = self.client_mgr.all_known_issis();
         if issis.is_empty() {
-            tracing::info!("mm_bs: BrewReconnected â€” no registered MS to re-register");
+            tracing::info!("mm_bs: BrewReconnected â€” no registered MS to replay");
             return;
         }
         tracing::info!(
-            "mm_bs: BrewReconnected â€” sending D-LOCATION-UPDATE-COMMAND to {} MS unit(s)",
+            "mm_bs: BrewReconnected â€” replaying registration and groups of {} MS unit(s) to Brew",
             issis.len()
         );
         for issi in issis {
-            // handle = 0: addressed by ISSI on the MCCH (the handle is inert â€” see
-            // all_known_issis). This path was previously dead because it filtered on
-            // last_handle != 0, which is never true, so no MS was ever re-registered after a
-            // Brew reconnect â€” the cause of "PTT denied after the backhaul blips".
-            tracing::debug!("mm_bs: re-registering ISSI {}", issi);
-            Self::send_d_location_update_command(queue, issi, 0);
+            let groups: Vec<u32> = self
+                .client_mgr
+                .get_client_by_issi(issi)
+                .map(|c| c.groups.iter().copied().collect())
+                .unwrap_or_default();
+            tracing::debug!("mm_bs: replaying ISSI {} with {} group(s) to Brew", issi, groups.len());
+            self.emit_subscriber_update(queue, issi, Vec::new(), BrewSubscriberAction::Register);
+            if !groups.is_empty() {
+                self.emit_subscriber_update(queue, issi, groups, BrewSubscriberAction::Affiliate);
+            }
         }
     }
 }
