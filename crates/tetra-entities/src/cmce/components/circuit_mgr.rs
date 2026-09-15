@@ -9,6 +9,16 @@ use tetra_saps::{
 
 const D_SETUP_REPEATS: i32 = 1;
 const LATE_ENTRY_INTERVAL_TIMESLOTS: i32 = multiframes!(5);
+/// Minimum spacing between late-entry D-SETUP repeats of DIFFERENT calls, cell-wide.
+///
+/// Every repeat is an invitation for a scanning terminal to switch to that call. With two or
+/// three group calls live on different timeslots the repeats landed within a second or two of
+/// each other, so a terminal scanning both groups was told "come to ts 2" and then "come to
+/// ts 3" 1.4 s later; two terminals gave up on the cell 2-4 s after that and re-registered
+/// (measured 2026-09-15 10:07:37-42). Spacing the invitations out costs a late entrant a few
+/// seconds and removes the contradictory back-to-back invitations. The per-call period
+/// (`LATE_ENTRY_INTERVAL_TIMESLOTS`) is unchanged.
+const LATE_ENTRY_MIN_GAP_TIMESLOTS: i32 = 5 * 18 * 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CircuitErr {
@@ -35,6 +45,11 @@ pub struct CircuitMgr {
 
     /// 14-bit call identifier. Zero value is reserved.
     pub next_call_identifier: u16,
+
+    /// When the last late-entry repeat (of any call) went out, for `LATE_ENTRY_MIN_GAP_TIMESLOTS`.
+    last_late_entry_at: Option<TdmaTime>,
+    /// Calls whose late-entry repeat came due while that gap was still running, in order.
+    late_entry_pending: VecDeque<CallId>,
     /// 5-bit usage number. Values 0-3 are reserved.
     pub next_usage_number: u8,
 }
@@ -47,6 +62,8 @@ impl CircuitMgr {
             ul_only: Vec::new(),
             tx_data: HashMap::new(),
             next_call_identifier: 4,
+            last_late_entry_at: None,
+            late_entry_pending: VecDeque::new(),
             next_usage_number: 4,
         }
     }
@@ -373,13 +390,35 @@ impl CircuitMgr {
 
             for circuit in self.dl.iter() {
                 let age = circuit.ts_created.age(dltime);
-                if age < frames!(D_SETUP_REPEATS) || (age / 4) % (LATE_ENTRY_INTERVAL_TIMESLOTS / 4) == 0 {
+                if age < frames!(D_SETUP_REPEATS) {
+                    // Call start: the initial announcement goes out at once, as always.
                     tasks.get_or_insert_with(Vec::new).push(CircuitMgrCmd::SendDSetup(
                         circuit.call_id,
                         circuit.usage,
                         circuit.carrier_num,
                         circuit.ts,
                     ));
+                } else if (age / 4) % (LATE_ENTRY_INTERVAL_TIMESLOTS / 4) == 0 && !self.late_entry_pending.contains(&circuit.call_id) {
+                    // Late-entry repeat: queue it, sent below once the cell-wide gap allows.
+                    self.late_entry_pending.push_back(circuit.call_id);
+                }
+            }
+            let gap_over = self
+                .last_late_entry_at
+                .is_none_or(|t| t.age(dltime) >= LATE_ENTRY_MIN_GAP_TIMESLOTS);
+            if gap_over {
+                while let Some(call_id) = self.late_entry_pending.pop_front() {
+                    // The circuit may have closed while waiting: then there is nothing to announce.
+                    if let Some(circuit) = self.dl.iter().find(|c| c.call_id == call_id) {
+                        tasks.get_or_insert_with(Vec::new).push(CircuitMgrCmd::SendDSetup(
+                            circuit.call_id,
+                            circuit.usage,
+                            circuit.carrier_num,
+                            circuit.ts,
+                        ));
+                        self.last_late_entry_at = Some(dltime);
+                        break;
+                    }
                 }
             }
             return tasks;
