@@ -1218,10 +1218,11 @@ impl MmBs {
         // response â€” that desynced the MS and the BS: the BS thought N groups were
         // active, but the MS only saw confirmations for the first 12. Inbound calls
         // on the un-confirmed groups would deliver to the BS but never notify the MS
-        // (FH-BUG-022 reopened, FH-BUG-025). Now the BS only affiliates what it can
-        // confirm; the MS will keep re-requesting the remaining groups in subsequent
-        // attach cycles per ETSI clause 16.4.3.
-        const MAX_GROUPS_PER_ATTACH: usize = 12;
+        // (FH-BUG-022 reopened, FH-BUG-025). The BS still only affiliates what it can
+        // confirm, but it now confirms EVERY requested group by sending one ACK PDU per
+        // chunk instead of dropping the excess (see the loop below), so the cap bounds
+        // one PDU rather than the radio's scan list.
+        const MAX_GROUPS_PER_ACK: usize = 12;
         // feature_check_u_attach_detach_group_identity above guarantees this is Some,
         // but use let-else instead of .unwrap() so a future refactor that loosens that
         // check doesn't crash the MM worker on a malformed PDU.
@@ -1229,58 +1230,72 @@ impl MmBs {
             tracing::warn!("rx_u_attach_detach_group_identity: group_identity_uplink missing after feature_check; ignoring");
             return;
         };
-        let (giu_clamped, dropped) = if giu.len() > MAX_GROUPS_PER_ATTACH {
-            tracing::warn!(
-                "ISSI {} requested attach/detach for {} groups; capped at {} per ETSI PDU size limit. MS will retry remaining in next cycle.",
+        // Confirm the WHOLE request, one ACK PDU per chunk of at most MAX_GROUPS_PER_ACK.
+        //
+        // Capping at 12 and dropping the excess left the MS waiting for confirmations that never
+        // arrived: it timed out, re-sent the same oversized request, and eventually re-attached
+        // from scratch, looping forever. Measured on the live cell on 2026-09-12: a radio with a
+        // 16-group scan list re-registered 7 times in 12 minutes while a 10-group radio on the
+        // same cell never did. And on 2026-09-22 ISSI 2145007 announced 17 groups, the station
+        // kept the first 12, and PTT on 214901/214902/214903 answered "unit not attached" because
+        // the station had no record of it in those groups at all.
+        //
+        // The invariant the cap existed for is preserved, and it is the one that matters: each
+        // chunk is affiliated by try_attach_detach_groups and then immediately confirmed, so the
+        // BS never claims a group the MS has not seen acknowledged (FH-BUG-022 / FH-BUG-025).
+        // What changes is only how many PDUs it takes to say it.
+        let handle = prim.handle;
+        let total_groups = giu.len();
+        if total_groups > MAX_GROUPS_PER_ACK {
+            tracing::info!(
+                "ISSI {} requested attach/detach for {} groups; confirming all of them in {} PDUs of up to {}",
                 issi,
-                giu.len(),
-                MAX_GROUPS_PER_ATTACH
+                total_groups,
+                total_groups.div_ceil(MAX_GROUPS_PER_ACK),
+                MAX_GROUPS_PER_ACK
             );
-            let (head, _tail) = giu.split_at(MAX_GROUPS_PER_ATTACH);
-            (head.to_vec(), giu.len() - MAX_GROUPS_PER_ATTACH)
-        } else {
-            (giu, 0)
-        };
-        let _ = dropped; // silence unused warning if logging is compiled out
+        }
 
-        // Try to attach to requested groups, and retrieve list of accepted GroupIdentityDownlink elements
-        let accepted_gid = self.try_attach_detach_groups(queue, issi, &giu_clamped);
+        for chunk in giu.chunks(MAX_GROUPS_PER_ACK) {
+            // Try to attach to this chunk, and retrieve its accepted GroupIdentityDownlink elements
+            let accepted_gid = self.try_attach_detach_groups(queue, issi, &chunk.to_vec());
 
-        // Group affiliations changed â€” persist for restart recovery (debounced).
+            // Build reply PDU for this chunk
+            let pdu_response = DAttachDetachGroupIdentityAcknowledgement {
+                group_identity_accept_reject: 0, // Accept
+                reserved: false,                 // TODO FIXME Guessed proper value of reserved field
+                proprietary: None,
+                group_identity_downlink: Some(accepted_gid),
+                group_identity_security_related_information: None,
+            };
+
+            // Write to PDU
+            let mut sdu = BitBuffer::new_autoexpand(32);
+            pdu_response.to_bitbuf(&mut sdu).unwrap(); // We want to know when this happens
+            sdu.seek(0);
+            tracing::debug!("-> {:?} sdu {}", pdu_response, sdu.dump_bin());
+
+            queue.push_back(SapMsg {
+                sap: Sap::LmmSap,
+                src: TetraEntity::Mm,
+                dest: TetraEntity::Mle,
+                msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+                    sdu,
+                    handle,
+                    address: TetraAddress::issi(issi),
+                    layer2service: Layer2Service::Acknowledged,
+                    stealing_permission: false,
+                    stealing_repeats_flag: false,
+                    encryption_flag: false,
+                    is_null_pdu: false,
+                    tx_reporter: None,
+                }),
+            });
+        }
+
+        // Group affiliations changed — persist for restart recovery (debounced). Once for the
+        // whole request, not once per chunk: the debounce is global and the chunks are one event.
         self.recovery_mark_dirty();
-
-        // Build reply PDU
-        let pdu_response = DAttachDetachGroupIdentityAcknowledgement {
-            group_identity_accept_reject: 0, // Accept
-            reserved: false,                 // TODO FIXME Guessed proper value of reserved field
-            proprietary: None,
-            group_identity_downlink: Some(accepted_gid),
-            group_identity_security_related_information: None,
-        };
-
-        // Write to PDU
-        let mut sdu = BitBuffer::new_autoexpand(32);
-        pdu_response.to_bitbuf(&mut sdu).unwrap(); // We want to know when this happens
-        sdu.seek(0);
-        tracing::debug!("-> {:?} sdu {}", pdu_response, sdu.dump_bin());
-
-        let msg = SapMsg {
-            sap: Sap::LmmSap,
-            src: TetraEntity::Mm,
-            dest: TetraEntity::Mle,
-            msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
-                sdu,
-                handle: prim.handle,
-                address: TetraAddress::issi(issi),
-                layer2service: Layer2Service::Acknowledged,
-                stealing_permission: false,
-                stealing_repeats_flag: false,
-                encryption_flag: false,
-                is_null_pdu: false,
-                tx_reporter: None,
-            }),
-        };
-        queue.push_back(msg);
     }
 
     fn rx_lmm_mle_unitdata_ind(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
