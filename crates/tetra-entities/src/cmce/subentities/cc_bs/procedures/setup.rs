@@ -77,19 +77,29 @@ impl CcBsSubentity {
         pdu: &USetup,
         calling_party: TetraAddress,
     ) {
+        // Every rejection below answers with D-RELEASE (TS 100 392-2 14.5.2.3.2). Dropping the
+        // U-SETUP silently left the radio "calling" until its T303 (60 s) ran out, with no cause.
         // Get destination GSSI (called party)
         let Some(dest_gssi) = pdu.called_party_ssi else {
-            tracing::warn!("U-SETUP without called_party_ssi, ignoring");
+            self.reject_setup_request(
+                queue,
+                message,
+                calling_party,
+                DisconnectCause::RequestedServiceNotAvailable,
+                "group U-SETUP without called party SSI",
+            );
             return;
         };
         let dest_gssi = dest_gssi as u32;
         let dest_addr = TetraAddress::new(dest_gssi, SsiType::Gssi);
 
         if !self.has_listener(dest_gssi) {
-            tracing::info!(
-                "CMCE: rejecting U-SETUP from issi={} to gssi={} (no listeners)",
-                calling_party.ssi,
-                dest_gssi
+            self.reject_setup_request(
+                queue,
+                message,
+                calling_party,
+                DisconnectCause::CalledPartyNotReachable,
+                &format!("no listeners on gssi={}", dest_gssi),
             );
             return;
         }
