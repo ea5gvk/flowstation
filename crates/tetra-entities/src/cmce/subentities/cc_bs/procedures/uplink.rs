@@ -760,6 +760,18 @@ impl CcBsSubentity {
         pdu: UInfo,
     ) {
         let call_id = pdu.call_identifier;
+        // A U-INFO inside a group call (facility, DTMF, proprietary element) or with the dummy call
+        // identifier 0 (no call at all) is not a reason to release anything: it was answered with
+        // D-RELEASE "invalid call identifier", and the radio left a perfectly valid group call.
+        if call_id == 0 || self.active_calls.contains_key(&call_id) {
+            tracing::info!(
+                "U-INFO from ISSI {} for {} call_id={} - not acted upon",
+                sender.ssi,
+                if call_id == 0 { "no" } else { "group" },
+                call_id
+            );
+            return;
+        }
         let Some(call) = self.individual_calls.get(&call_id).cloned() else {
             tracing::warn!("U-INFO for unknown/non-individual call_id={}, rejecting", call_id);
             let sdu = Self::build_d_release(call_id, DisconnectCause::InvalidCallIdentifier);
