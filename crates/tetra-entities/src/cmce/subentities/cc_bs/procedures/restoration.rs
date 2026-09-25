@@ -27,8 +27,19 @@ impl CcBsSubentity {
             // the U-TX DEMAND path). Granting while the peer is talking gives two simultaneous
             // transmitters and a stale floor_holder the UL-inactivity watchdog never ceases.
             // Duplex calls keep floor_holder = None, so they still always grant.
-            let grant = if !pdu.request_to_transmit_send_data {
-                TransmissionGrant::NotGranted
+            //
+            // Table 14.74: the bit is 0 when the MS asks to transmit and 1 when it lets the other
+            // party talk. It was read the other way round: a radio asking to talk was refused and
+            // one only listening was handed the floor.
+            let wants_to_transmit = !pdu.request_to_transmit_send_data;
+            let grant = if !call.is_simplex() {
+                TransmissionGrant::Granted
+            } else if !wants_to_transmit {
+                if call.floor_holder.is_some() {
+                    TransmissionGrant::GrantedToOtherUser
+                } else {
+                    TransmissionGrant::NotGranted
+                }
             } else if call.floor_holder.is_none() || call.is_floor_held_by(sender.ssi) {
                 if call.is_simplex() {
                     call.grant_floor(sender);
@@ -47,8 +58,14 @@ impl CcBsSubentity {
                 self.reject_call_restore(queue, sender, handle, link_id, endpoint_id, call_id);
                 return;
             }
-            let grant = if !pdu.request_to_transmit_send_data {
-                TransmissionGrant::NotGranted
+            // Table 14.74: bit 0 = asks to transmit, 1 = lets another member talk (see above).
+            let wants_to_transmit = !pdu.request_to_transmit_send_data;
+            let grant = if !wants_to_transmit {
+                if call.tx_active {
+                    TransmissionGrant::GrantedToOtherUser
+                } else {
+                    TransmissionGrant::NotGranted
+                }
             } else if !call.tx_active || call.source_issi == sender.ssi {
                 call.grant_floor(sender.ssi, Some(sender));
                 TransmissionGrant::Granted

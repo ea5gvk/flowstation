@@ -329,7 +329,8 @@ fn build_u_disconnect_msg(sender_issi: u32, call_id: u16) -> SapMsg {
 fn build_u_call_restore_msg(sender_issi: u32, call_id: u16, other_party_ssi: u32, request_to_transmit: bool) -> SapMsg {
     let u_call_restore = UCallRestore {
         call_identifier: call_id,
-        request_to_transmit_send_data: request_to_transmit,
+        // Table 14.74: the bit is 0 to ask to transmit, 1 to let the other party talk.
+        request_to_transmit_send_data: !request_to_transmit,
         other_party_type_identifier: 1, // SSI
         other_party_short_number_address: None,
         other_party_ssi: Some(other_party_ssi as u64),
