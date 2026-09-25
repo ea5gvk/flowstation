@@ -7,6 +7,9 @@ use tetra_pdus::cmce::enums::cmce_pdu_type_dl::CmcePduTypeDl;
 use tetra_pdus::cmce::pdus::d_facility::DFacility;
 use tetra_pdus::cmce::ss_dgna::enums::results::GroupIdentityAttachmentMode;
 use tetra_pdus::cmce::ss_dgna::ss_dgna_pdu::SsDgnaPdu;
+use tetra_pdus::llc::enums::llc_pdu_type::LlcPduType;
+use tetra_pdus::llc::pdus::bl_data::BlData;
+use tetra_pdus::mle::enums::mle_protocol_discriminator::MleProtocolDiscriminator;
 use tetra_pdus::mm::enums::location_update_type::LocationUpdateType;
 use tetra_pdus::mm::enums::mm_pdu_type_dl::MmPduTypeDl;
 use tetra_pdus::mm::pdus::d_attach_detach_group_identity::DAttachDetachGroupIdentity;
@@ -16,6 +19,7 @@ use tetra_pdus::mm::pdus::u_location_update_demand::ULocationUpdateDemand;
 use tetra_saps::control::brew::BrewSubscriberAction;
 use tetra_saps::lmm::LmmMleUnitdataInd;
 use tetra_saps::sapmsg::{SapMsg, SapMsgInner};
+use tetra_saps::tma::{TmaUnitdataInd, TmaUnitdataReq};
 
 use tetra_entities::cmce::cmce_bs::CmceBs;
 use tetra_entities::mm::mm_bs::MmBs;
@@ -1279,4 +1283,100 @@ fn test_restart_recovery_honours_whitelist() {
     );
 
     let _ = std::fs::remove_file(&path);
+}
+
+/// Deliver a U-LOCATION-UPDATE-DEMAND from `issi` to the LLC as a BL-DATA received on
+/// `carrier`, two timeslots before the test's current downlink time (as an uplink is).
+fn submit_location_update_via_llc(test: &mut ComponentTest, issi: u32, carrier: u16) {
+    let demand = ULocationUpdateDemand {
+        location_update_type: LocationUpdateType::RoamingLocationUpdating,
+        request_to_append_la: false,
+        cipher_control: false,
+        ciphering_parameters: None,
+        class_of_ms: None,
+        energy_saving_mode: None,
+        la_information: None,
+        ssi: Some(issi as u64),
+        address_extension: None,
+        group_identity_location_demand: None,
+        group_report_response: None,
+        authentication_uplink: None,
+        extended_capabilities: None,
+        proprietary: None,
+    };
+    let mut pdu = BitBuffer::new_autoexpand(64);
+    BlData { has_fcs: false, ns: 0 }.to_bitbuf(&mut pdu);
+    pdu.write_bits(MleProtocolDiscriminator::Mm.into_raw(), 3);
+    demand.to_bitbuf(&mut pdu).expect("serialize U-LOCATION-UPDATE-DEMAND");
+    pdu.seek(0);
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Umac,
+        dest: TetraEntity::Llc,
+        msg: SapMsgInner::TmaUnitdataInd(TmaUnitdataInd {
+            carrier_num: carrier,
+            pdu: Some(pdu),
+            main_address: TetraAddress::new(issi, SsiType::Issi),
+            scrambling_code: 0,
+            link_id: 0,
+            endpoint_id: 0,
+            new_endpoint_id: None,
+            css_endpoint_id: None,
+            air_interface_encryption: 0,
+            chan_change_response_req: false,
+            chan_change_handle: None,
+            chan_info: None,
+        }),
+    });
+    test.run_stack(Some(2));
+}
+
+/// The acknowledged LLC PDU (BL-ADATA) that carries MM's answer to `issi` down to the UMAC.
+fn find_mm_answer_to_umac(msgs: &[SapMsg], issi: u32) -> Option<TmaUnitdataReq> {
+    msgs.iter().find_map(|m| match &m.msg {
+        SapMsgInner::TmaUnitdataReq(req) if req.main_address.ssi == issi => {
+            let mut pdu = BitBuffer::from_bitstr(&req.pdu.to_bitstr());
+            let llc_type = pdu.read_field(4, "llc_pdu_type").ok()?;
+            (LlcPduType::try_from(llc_type).ok()? == LlcPduType::BlAdata).then(|| req.clone())
+        }
+        _ => None,
+    })
+}
+
+/// A radio in a call listens to its traffic slot, not to the MCCH: MM's answer to an uplink that
+/// came in on a traffic slot is stolen on that slot, with the BL-ACK for the uplink inside it,
+/// and the link id makes the UMAC drop the slot hint if it has to fall back to the MCCH. An
+/// uplink that came in on the MCCH is still answered there.
+#[test]
+fn test_mm_answer_follows_the_radio_to_its_traffic_slot() {
+    debug::setup_logging_verbose();
+    const ISSI: u32 = 2260813;
+
+    // Downlink time TS4: the uplink was received two slots earlier, on TS2.
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { h: 0, m: 1, f: 1, t: 4 }));
+    let main_carrier = test.get_shared_config().config().cell.main_carrier;
+    test.populate_entities(vec![TetraEntity::Llc, TetraEntity::Mle], vec![TetraEntity::Umac, TetraEntity::Cmce]);
+    let mm = MmBs::new(test.get_shared_config(), None, None);
+    test.register_entity(mm);
+
+    submit_location_update_via_llc(&mut test, ISSI, main_carrier);
+    let req = find_mm_answer_to_umac(&test.dump_sinks(), ISSI).expect("MM answer with the BL-ACK inside it");
+    assert!(req.stealing_permission, "the answer must be stolen on the radio's traffic slot");
+    assert_eq!(req.link_id, 2);
+    let hint = req.chan_alloc.expect("slot hint for the UMAC");
+    assert_eq!(hint.timeslots, [false, true, false, false]);
+    assert_eq!(hint.carrier, Some(main_carrier));
+    assert_eq!(req.carrier_num, Some(main_carrier));
+
+    // Downlink time TS3: this uplink came in on TS1, the MCCH.
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { h: 0, m: 1, f: 1, t: 3 }));
+    test.populate_entities(vec![TetraEntity::Llc, TetraEntity::Mle], vec![TetraEntity::Umac, TetraEntity::Cmce]);
+    let mm = MmBs::new(test.get_shared_config(), None, None);
+    test.register_entity(mm);
+
+    submit_location_update_via_llc(&mut test, ISSI, main_carrier);
+    let req = find_mm_answer_to_umac(&test.dump_sinks(), ISSI).expect("MM answer with the BL-ACK inside it");
+    assert!(!req.stealing_permission, "an uplink from the MCCH is answered on the MCCH");
+    assert_eq!(req.link_id, 0);
+    assert!(req.chan_alloc.is_none());
 }

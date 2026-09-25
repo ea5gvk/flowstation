@@ -238,6 +238,7 @@ impl MleBs {
                 req_handle: 0, // TODO FIXME; should we pass the same handle here?
                 graceful_degradation: None,
                 chan_alloc: None,
+                follow_uplink_channel: true,
                 tx_reporter: prim.tx_reporter.take(),
             }),
         };
@@ -330,6 +331,7 @@ impl MleBs {
                     req_handle: 0, // TODO FIXME
                     graceful_degradation: None,
                     chan_alloc,
+                    follow_uplink_channel: false,
                     tx_reporter: prim.tx_reporter.take(),
                 }),
             }

@@ -20,6 +20,11 @@ use tetra_pdus::llc::pdus::bl_adata::BlAdata;
 use tetra_pdus::llc::pdus::bl_data::BlData;
 use tetra_pdus::llc::pdus::bl_udata::BlUdata;
 
+/// An MM message follows its radio to the traffic slot it last transmitted on only this long
+/// (5 multiframes, about 5 s): enough for an answer held back for authentication, short enough
+/// that the slot is not yet another call's after the radio has gone back to the MCCH.
+const UPLINK_CHANNEL_FRESH_SLOTS: i32 = 5 * 18 * 4;
+
 /// Struct that maintains state expected acknowledgement data for a transmitted message.
 /// Aka, we still expect an ack for this.
 pub struct ExpectedInAck {
@@ -81,6 +86,9 @@ pub struct Llc {
 
     /// Per-link send sequence variable per SSI. Alternates between 0 and 1.
     link_send_seq: HashMap<u32, u8>,
+
+    /// Carrier, timeslot and time of the last uplink PDU received from each individual SSI.
+    last_uplink: HashMap<u32, (u16, u8, TdmaTime)>,
 }
 
 impl Llc {
@@ -92,11 +100,35 @@ impl Llc {
             outbound_messages: VecDeque::new(),
             outbound_udata_messages: VecDeque::new(),
             link_send_seq: HashMap::new(),
+            last_uplink: HashMap::new(),
         }
     }
 
     fn main_carrier(&self) -> u16 {
         self.config.config().cell.main_carrier
+    }
+
+    /// The traffic slot `ssi` last transmitted on, if that was recent: while in a call the radio
+    /// listens to that slot's ACCH. None when its last uplink came on the MCCH (main carrier TS1).
+    fn recent_uplink_traffic_slot(&self, ssi: u32) -> Option<(u16, u8)> {
+        let &(carrier, ts, t) = self.last_uplink.get(&ssi)?;
+        let on_mcch = carrier == self.main_carrier() && ts == 1;
+        (!on_mcch && t.age(self.dltime) <= UPLINK_CHANNEL_FRESH_SLOTS).then_some((carrier, ts))
+    }
+
+    /// A chan_alloc that only names the traffic slot to steal on. Sent with a non-zero link id, so
+    /// the UMAC drops it rather than encoding a real channel allocation if it has to fall back to
+    /// the MCCH.
+    fn stealing_slot_hint(carrier: u16, ts: u8) -> CmceChanAllocReq {
+        let mut timeslots = [false; 4];
+        timeslots[(ts - 1) as usize] = true;
+        CmceChanAllocReq {
+            usage: None,
+            timeslots,
+            alloc_type: ChanAllocType::Replace,
+            ul_dl_assigned: UlDlAssignment::Both,
+            carrier: Some(carrier),
+        }
     }
 
     /// Schedule an ACK to be sent at a later time
@@ -362,18 +394,35 @@ impl Llc {
             return;
         }
 
-        // If an ack still needs to be sent, get the relevant expected sequence number. This PDU
-        // leaves on the main carrier's MCCH, so only an ACK for an uplink received there can go
-        // with it, and only if the link is free: with a window of 1 a BL-ADATA queued behind an
-        // unacknowledged message waits up to N.252 x T.251, and the ACK inside it waited too - the
-        // radio retransmitted and we delivered duplicates (22.3.2.3 d). Otherwise the ACK leaves
-        // on its own as a BL-ACK this tick.
+        // A radio in a call listens to its traffic slot's ACCH, not to the MCCH: an MM message
+        // follows it to the slot it just transmitted on. The UMAC steals there, or falls back to
+        // the MCCH if that circuit is gone or the PDU does not fit in one slot.
+        let acch = prim
+            .follow_uplink_channel
+            .then(|| self.recent_uplink_traffic_slot(prim.main_address.ssi))
+            .flatten();
+        if let Some((carrier, ts)) = acch {
+            tracing::debug!(
+                "SSI {}: sending on the ACCH of carrier {} ts {}, where its last uplink came in",
+                prim.main_address.ssi,
+                carrier,
+                ts
+            );
+        }
+        let preferred_carrier = acch.map_or(preferred_carrier, |(carrier, _)| carrier);
+        let (channel_carrier, channel_ts) = acch.unwrap_or((self.main_carrier(), 1));
+
+        // If an ack still needs to be sent, get the relevant expected sequence number. Only an ACK
+        // for an uplink received on the channel this PDU leaves on can go with it (22.3.1.1), and
+        // only if the link is free: with a window of 1 a BL-ADATA queued behind an unacknowledged
+        // message waits up to N.252 x T.251, and the ACK inside it waited too - the radio
+        // retransmitted and we delivered duplicates (22.3.2.3 d). Otherwise the ACK leaves on its
+        // own as a BL-ACK this tick.
         let link_busy = self.outbound_messages.iter().any(|m| m.addr.ssi == prim.main_address.ssi);
-        let main_carrier = self.main_carrier();
         let out_ack_n = if link_busy {
             None
         } else {
-            self.get_out_ack_seq_if_any(prim.main_address, main_carrier, 1)
+            self.get_out_ack_seq_if_any(prim.main_address, channel_carrier, channel_ts)
         };
 
         // Get per-link send sequence number N(S) = V(S), then toggle V(S)
@@ -412,11 +461,12 @@ impl Llc {
 
         // Derive the timeslot from chan_alloc (first set timeslot in [bool;4]), defaulting to 1.
         // Must be done before chan_alloc is moved into TmaUnitdataReq below.
-        let derived_ts: u8 = prim
-            .chan_alloc
-            .as_ref()
-            .and_then(|ca| ca.timeslots.iter().enumerate().find(|&(_, &set)| set).map(|(i, _)| (i + 1) as u8))
-            .unwrap_or(1);
+        let derived_ts: u8 = acch.map(|(_, ts)| ts).unwrap_or_else(|| {
+            prim.chan_alloc
+                .as_ref()
+                .and_then(|ca| ca.timeslots.iter().enumerate().find(|&(_, &set)| set).map(|(i, _)| (i + 1) as u8))
+                .unwrap_or(1)
+        });
 
         // Either take tx_reporter passed down or create a new one
         let tx_reporter = prim.tx_reporter.take().unwrap_or_else(|| TxReporter::new());
@@ -430,14 +480,14 @@ impl Llc {
                 req_handle: prim.req_handle,
                 pdu: pdu_buf,
                 main_address: prim.main_address,
-                link_id: 0,
+                link_id: acch.map_or(0, |(_, ts)| ts as u32),
                 endpoint_id: prim.endpoint_id,
-                stealing_permission: prim.stealing_permission,
+                stealing_permission: prim.stealing_permission || acch.is_some(),
                 subscriber_class: prim.subscriber_class,
                 air_interface_encryption: prim.air_interface_encryption,
                 stealing_repeats_flag: prim.stealing_repeats_flag,
                 data_category: prim.data_class_info,
-                chan_alloc: prim.chan_alloc,
+                chan_alloc: acch.map(|(carrier, ts)| Self::stealing_slot_hint(carrier, ts)).or(prim.chan_alloc),
                 tx_reporter: Some(tx_reporter.clone()),
             }),
         };
@@ -615,7 +665,11 @@ impl Llc {
         }
 
         // If ns is present, we need to send an ACK
-        let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago. 
+        let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago.
+        if prim.main_address.ssi_type != SsiType::Gssi {
+            self.last_uplink
+                .insert(prim.main_address.ssi, (prim.carrier_num, msg_dltime.t, msg_dltime));
+        }
         if let Some(ns) = ns {
             // Send ACK
             self.schedule_outgoing_ack(msg_dltime, prim.main_address, prim.carrier_num, msg_dltime.t, ns);
@@ -878,20 +932,7 @@ impl Llc {
             // We're sending an ACK for a received uplink message, however, we don't have that message here
             // Since DL is two slots ahead of UL, we will correct that. We now have the dltime for reception
             // of the original message.
-            let chan_alloc = match steal {
-                true => {
-                    let mut timeslots = [false; 4];
-                    timeslots[(ack.ts - 1) as usize] = true;
-                    Some(CmceChanAllocReq {
-                        usage: None,
-                        timeslots,
-                        alloc_type: ChanAllocType::Replace,
-                        ul_dl_assigned: UlDlAssignment::Both,
-                        carrier: Some(ack.carrier_num),
-                    })
-                }
-                false => None,
-            };
+            let chan_alloc = steal.then(|| Self::stealing_slot_hint(ack.carrier_num, ack.ts));
             let sapmsg = SapMsg {
                 sap: Sap::TmaSap,
                 src: TetraEntity::Llc,

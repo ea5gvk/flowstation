@@ -114,6 +114,11 @@ pub struct TlaTlDataReqBl {
     /// Optional Channel Allocation Request that may be included by CMCE
     pub chan_alloc: Option<CmceChanAllocReq>,
 
+    /// Send this PDU on the ACCH of the traffic slot the addressed MS last transmitted on, if that
+    /// was recent, instead of on the MCCH it does not listen to while in a call. Set by MLE for MM,
+    /// which has no way to name a channel itself.
+    pub follow_uplink_channel: bool,
+
     /// Optional TxReporter that may be included to track transmission and optionally, acknowledgement
     pub tx_reporter: Option<TxReporter>,
 }

@@ -128,6 +128,7 @@ impl Sndcp {
                 req_handle: 0,
                 graceful_degradation: None,
                 chan_alloc: None,
+                follow_uplink_channel: false,
                 tx_reporter: None,
             }),
         });
