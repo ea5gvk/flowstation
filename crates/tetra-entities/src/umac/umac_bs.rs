@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::freqs::FreqInfo;
@@ -67,6 +67,9 @@ pub struct UmacBs {
     /// Local floor owner per traffic carrier/timeslot, used to attribute MAC-U-SIGNAL
     /// uplink signalling that does not carry an address field.
     ul_signal_owner: HashMap<(u16, u8), u32>,
+    /// Slots whose floor owner has actually started transmitting (uplink voice seen since the
+    /// grant). Until then the owner still listens to the whole downlink for its D-TX GRANTED.
+    ul_owner_on_air: HashSet<(u16, u8)>,
     /// Traffic-slot circuit closes are delayed until queued FACCH/STCH signalling
     /// has had a scheduler turn to leave the BS.
     pending_circuit_closes: HashMap<(u16, u8), PendingCircuitClose>,
@@ -113,6 +116,7 @@ impl UmacBs {
             secondary_channel_schedulers,
             last_ul_voice: HashMap::new(),
             ul_signal_owner: HashMap::new(),
+            ul_owner_on_air: HashSet::new(),
             pending_circuit_closes: HashMap::new(),
             telemetry,
         }
@@ -1562,7 +1566,10 @@ impl UmacBs {
                         .scheduler_for_mut(requested_carrier)
                         .take_pending_ra_ack(ts, prim.main_address.ssi);
                     // The MS transmitting on this slot listens only in its monitoring-pattern frames.
-                    let to_talker = self.ul_signal_owner.get(&(requested_carrier, ts)) == Some(&prim.main_address.ssi);
+                    // Just granted and not yet on air, it still hears every frame: its D-TX GRANTED
+                    // must not wait, or the group's "granted to another user" reaches it first.
+                    let to_talker = self.ul_signal_owner.get(&(requested_carrier, ts)) == Some(&prim.main_address.ssi)
+                        && self.ul_owner_on_air.contains(&(requested_carrier, ts));
                     let mac_pdu = MacResource {
                         fill_bits: false,
                         pos_of_grant: 0,
@@ -1719,6 +1726,7 @@ impl UmacBs {
                 // Track last UL voice frame time for inactivity detection
                 if (1..=4).contains(&ts) {
                     self.last_ul_voice.insert((carrier_num, ts), self.dltime);
+                    self.ul_owner_on_air.insert((carrier_num, ts));
                 }
                 if let Some(sink) = &self.telemetry {
                     sink.send(TelemetryEvent::TsVoiceActivity {
@@ -2148,6 +2156,7 @@ impl UmacBs {
                 self.scheduler_for_mut(carrier_num).set_hangtime(ts, true);
                 self.last_ul_voice.remove(&(carrier_num, ts));
                 self.ul_signal_owner.remove(&(carrier_num, ts));
+                self.ul_owner_on_air.remove(&(carrier_num, ts));
             }
             CallControl::FloorGranted {
                 carrier_num,
@@ -2159,16 +2168,19 @@ impl UmacBs {
                 self.scheduler_for_mut(carrier_num).drop_queued_voice(ts);
                 self.last_ul_voice.insert((carrier_num, ts), self.dltime);
                 self.ul_signal_owner.insert((carrier_num, ts), source_issi);
+                self.ul_owner_on_air.remove(&(carrier_num, ts));
             }
             CallControl::RemoteFloorGranted { carrier_num, ts, .. } => {
                 self.scheduler_for_mut(carrier_num).set_hangtime(ts, false);
                 self.last_ul_voice.remove(&(carrier_num, ts));
                 self.ul_signal_owner.remove(&(carrier_num, ts));
+                self.ul_owner_on_air.remove(&(carrier_num, ts));
             }
             CallControl::CallEnded { carrier_num, ts, .. } => {
                 self.scheduler_for_mut(carrier_num).set_hangtime(ts, false);
                 self.last_ul_voice.remove(&(carrier_num, ts));
                 self.ul_signal_owner.remove(&(carrier_num, ts));
+                self.ul_owner_on_air.remove(&(carrier_num, ts));
             }
 
             // UlInactivityTimeout is UMAC→CMCE only, UMAC won't receive it back
