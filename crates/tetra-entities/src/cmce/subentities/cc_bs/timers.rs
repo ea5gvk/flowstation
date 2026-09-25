@@ -384,7 +384,11 @@ impl CcBsSubentity {
         let window_closed = {
             let state = self.config.state_read();
             match state.ee_monitoring_windows.get(&dest_ssi) {
-                Some(&(frame, mframe, cycle_len)) => !self.dltime.in_ee_monitoring_window(frame, mframe, cycle_len),
+                // Checked for the MCCH slot the D-SETUP will actually leave in (see next_mcch_slot).
+                Some(&(frame, mframe, cycle_len)) => !self
+                    .dltime
+                    .next_mcch_slot(crate::umac::subcomp::bs_sched::MACSCHED_TX_AHEAD as i32 + 1)
+                    .in_ee_monitoring_window(frame, mframe, cycle_len),
                 None => false, // not in energy economy — always reachable
             }
         };
@@ -464,7 +468,10 @@ impl CcBsSubentity {
                     match state.ee_monitoring_windows.get(m) {
                         None => newly_covered.push(*m), // StayAlive — already reached
                         Some(&(frame, mframe, cycle_len)) => {
-                            if now.in_ee_monitoring_window(frame, mframe, cycle_len) {
+                            if now
+                                .next_mcch_slot(crate::umac::subcomp::bs_sched::MACSCHED_TX_AHEAD as i32 + 1)
+                                .in_ee_monitoring_window(frame, mframe, cycle_len)
+                            {
                                 newly_covered.push(*m);
                                 any_ee_woke = true;
                             } else {

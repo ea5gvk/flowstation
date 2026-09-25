@@ -128,6 +128,19 @@ impl TdmaTime {
         (self.m as u32).saturating_sub(1) + (self.h as u32) * 60
     }
 
+    /// The MCCH slot (TS1, never frame 18) a PDU decided at this time can go out in, given that
+    /// the scheduler closes slots `earliest_offset_slots` ahead. An energy-economy window has to be
+    /// checked for THIS slot, not for the decision time: a PDU decided during the MS's monitoring
+    /// frame leaves in the next frame's TS1, when an EG1-EG3 radio is already asleep again
+    /// (TS 100 392-2 23.7.6).
+    pub fn next_mcch_slot(self, earliest_offset_slots: i32) -> TdmaTime {
+        let mut t = self.add_timeslots(earliest_offset_slots);
+        while t.t != 1 || t.f == 18 {
+            t = t.add_timeslots(1);
+        }
+        t
+    }
+
     /// True if this slot falls inside an energy-economy MS's downlink monitoring window, i.e. the
     /// MS (granted `EnergySavingMode` Eg1..Eg7) is awake to receive on the MCCH at this instant.
     ///
@@ -169,6 +182,18 @@ impl fmt::Debug for TdmaTime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_next_mcch_slot_is_the_next_usable_ts1() {
+        let t = |m, f, ts| TdmaTime { h: 0, m, f, t: ts };
+        // Decided in TS1 of frame 1: the earliest slot is TS3, so the PDU leaves in frame 2.
+        assert_eq!(t(1, 1, 1).next_mcch_slot(2), t(1, 2, 1));
+        // Decided late in frame 17: frame 18 carries no MCCH, so frame 1 of the next multiframe.
+        assert_eq!(t(1, 17, 3).next_mcch_slot(2), t(2, 1, 1));
+        // Landing exactly on a TS1 keeps it.
+        assert_eq!(t(1, 4, 3).next_mcch_slot(2), t(1, 5, 1));
+    }
+
     #[test]
     fn test_add_timeslots_and_diff() {
         let initial_time = TdmaTime::default();

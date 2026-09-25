@@ -283,7 +283,11 @@ impl SdsBsSubentity {
     fn ee_window_blocks(&self, dest_ssi: u32) -> bool {
         let state = self.config.state_read();
         match state.ee_monitoring_windows.get(&dest_ssi) {
-            Some(&(frame, mframe, cycle_len)) => !self.last_dltime.in_ee_monitoring_window(frame, mframe, cycle_len),
+            // Checked for the MCCH slot the SDS will actually leave in (see next_mcch_slot).
+            Some(&(frame, mframe, cycle_len)) => !self
+                .last_dltime
+                .next_mcch_slot(crate::umac::subcomp::bs_sched::MACSCHED_TX_AHEAD as i32 + 1)
+                .in_ee_monitoring_window(frame, mframe, cycle_len),
             None => false, // not in energy economy — always reachable
         }
     }

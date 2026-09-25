@@ -391,7 +391,10 @@ impl MmClientMgr {
         let reachable_now = match ee_cycle_frames(c.energy_saving_mode) {
             None => true, // StayAlive — always reachable
             Some(cycle_len) => match (c.monitoring_frame, c.monitoring_multiframe) {
-                (Some(f), Some(mf)) => ts.in_ee_monitoring_window(f, mf, cycle_len),
+                // Checked for the MCCH slot the COMMAND will actually leave in (see next_mcch_slot).
+                (Some(f), Some(mf)) => ts
+                    .next_mcch_slot(crate::umac::subcomp::bs_sched::MACSCHED_TX_AHEAD as i32 + 1)
+                    .in_ee_monitoring_window(f, mf, cycle_len),
                 _ => true, // EE but the window is not known yet — don't defer
             },
         };
