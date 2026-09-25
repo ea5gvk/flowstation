@@ -117,7 +117,12 @@ impl Demodulator {
     }
 
     fn set_slot_ready_time(&mut self) {
-        let slot_begin_time = self.reference_time + self.current_slot.to_int() as SampleCount * SAMPLES_SLOT;
+        // Unwrapped across the hyperframe wrap, near the samples being processed now.
+        let slot_begin_time = unwrap_slot_begin(
+            self.reference_time + self.current_slot.to_int() as SampleCount * SAMPLES_SLOT,
+            self.next_input_sample_count,
+            SAMPLES_SLOT,
+        );
         self.slot_ready_time = slot_begin_time + Self::slot_ready_from_begin(self.mode);
     }
 

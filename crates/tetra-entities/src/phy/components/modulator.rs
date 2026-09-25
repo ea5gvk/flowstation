@@ -51,12 +51,14 @@ impl Modulator {
         // Compensate for delay of pulse shaping filter in sample count
         let sample_counter = sample_counter + CHANNEL_FILTER_TAPS.len() as SampleCount;
 
-        // Sample counter at beginning of current slot.
-        // TODO: adjust self.reference_time when hyperframe number wraps to 0.
-        // Now it breaks after 46 days.
+        // Sample counter at beginning of current slot, unwrapped across the hyperframe wrap.
         // This could also be further optimized by computing and storing it
         // only when a new slot becomes available.
-        let slot_begin = self.reference_time + TdmaTime::to_int(tx_slot.time) as SampleCount * SAMPLES_SLOT;
+        let slot_begin = unwrap_slot_begin(
+            self.reference_time + TdmaTime::to_int(tx_slot.time) as SampleCount * SAMPLES_SLOT,
+            sample_counter,
+            SAMPLES_SLOT,
+        );
 
         let mut sample = ComplexSample::ZERO;
         match self.mode {
