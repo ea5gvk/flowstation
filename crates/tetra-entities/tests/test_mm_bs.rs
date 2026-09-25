@@ -1394,3 +1394,54 @@ fn test_mm_answer_follows_the_radio_to_its_traffic_slot() {
     assert_eq!(answer.link_id, 0);
     assert!(answer.chan_alloc.is_none());
 }
+
+/// This cell has no air interface encryption: a radio registering with ciphering on is rejected
+/// with "No cipher KSG" (reject cause 13), not left without an answer to retry forever.
+#[test]
+fn test_location_update_asking_for_ciphering_is_rejected_no_cipher_ksg() {
+    debug::setup_logging_verbose();
+    const ISSI: u32 = 2260814;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+    let mm = MmBs::new(test.get_shared_config(), None, None);
+    test.register_entity(mm);
+
+    let demand = ULocationUpdateDemand {
+        location_update_type: LocationUpdateType::RoamingLocationUpdating,
+        request_to_append_la: false,
+        cipher_control: true,
+        ciphering_parameters: Some(65),
+        class_of_ms: None,
+        energy_saving_mode: None,
+        la_information: None,
+        ssi: Some(ISSI as u64),
+        address_extension: None,
+        group_identity_location_demand: None,
+        group_report_response: None,
+        authentication_uplink: None,
+        extended_capabilities: None,
+        proprietary: None,
+    };
+    let mut sdu = BitBuffer::new_autoexpand(32);
+    demand.to_bitbuf(&mut sdu).expect("serialize U-LOCATION-UPDATE-DEMAND");
+    sdu.seek(0);
+    test.submit_message(SapMsg {
+        sap: Sap::LmmSap,
+        src: TetraEntity::Mle,
+        dest: TetraEntity::Mm,
+        msg: SapMsgInner::LmmMleUnitdataInd(LmmMleUnitdataInd {
+            sdu,
+            handle: 0,
+            received_address: TetraAddress::new(ISSI, SsiType::Issi),
+        }),
+    });
+    test.run_stack(Some(2));
+
+    assert_eq!(
+        find_location_update_reject(&test.dump_sinks()),
+        Some((ISSI, 13)),
+        "a ciphered registration must be rejected with No cipher KSG"
+    );
+    assert!(!test.config.state_read().subscribers.is_registered(ISSI));
+}

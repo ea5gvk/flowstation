@@ -555,6 +555,22 @@ impl MmBs {
             return;
         }
 
+        // This cell has no air interface encryption. A radio registering with ciphering on used to
+        // get no answer at all and retried until its timers gave up: tell it instead
+        // (TS 100 392-2 16.4.1.1, reject cause 13 "No cipher KSG", table 16.81).
+        if pdu.cipher_control {
+            tracing::info!("MM: ISSI {} asked to register with ciphering on - rejecting, no cipher KSG", issi);
+            Self::send_d_location_update_reject_cause(
+                queue,
+                issi,
+                handle,
+                pdu.location_update_type,
+                pdu.address_extension,
+                RejectCause::NoCipherKsg,
+            );
+            return;
+        }
+
         // Check if we can satisfy this request, print unsupported stuff
         if !Self::feature_check_u_location_update_demand(&pdu) {
             tracing::error!("Unsupported critical features in ULocationUpdateDemand");
@@ -2049,7 +2065,7 @@ impl MmBs {
     }
 
     fn feature_check_u_location_update_demand(pdu: &ULocationUpdateDemand) -> bool {
-        let supported = true;
+        let mut supported = true;
         // A migrating update only gets this far when it is case c) (returning home), which is a
         // normal registration; case b) was rejected earlier. A temporarily disabled MS is
         // accepted like any other (16.4.1.1 d), with accept type 7. Neither used to get any
@@ -2058,10 +2074,6 @@ impl MmBs {
             // Not supported, but not critical either: an accept with no New registered area
             // leaves the registered area as the current LA alone (16.4.1.1).
             tracing::debug!("DemandLocationUpdating: request_to_append_la set - accepting without appending");
-        }
-        if pdu.cipher_control == true {
-            unimplemented_log!("Unsupported cipher_control == true");
-            supported = false;
         }
         if pdu.ciphering_parameters.is_some() {
             unimplemented_log!("Unsupported ciphering_parameters present");
