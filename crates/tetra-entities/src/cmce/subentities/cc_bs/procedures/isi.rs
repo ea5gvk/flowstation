@@ -120,8 +120,11 @@ impl CcBsSubentity {
         let usage = circuit_called.usage;
         let call_timeout = CallTimeout::try_from(call.timeout as u64).unwrap_or(CallTimeout::T5m);
         let circuit_mode = CircuitModeType::try_from(call.mode as u64).unwrap_or(CircuitModeType::TchS);
+        // The external number travels only in External subscriber number. It used to be copied
+        // into Calling party extension too, which is the caller's MNI (MCC 10 bits + MNC 14 bits,
+        // TS 100 392-2 14.8.10): SIP caller 1001 was announced as an ITSI of MCC 0 / MNC 1001, and a
+        // number "0" with no SSI made the D-SETUP unencodable and panicked the stack.
         let external_subscriber_number = Self::encode_external_subscriber_number(&call.number);
-        let calling_party_extension = call.number.trim().parse::<u32>().ok().filter(|value| *value <= 0x00ff_ffff);
 
         // Asterisk SIP callers often have no real TETRA ISSI; derive a display SSI from the
         // dialled external number so the local MS sees a sensible calling party. Brew keeps its
@@ -145,15 +148,6 @@ impl CcBsSubentity {
             simplex_duplex,
             call.number
         );
-
-        // Acknowledge setup to the originating network entity first so network call state
-        // progresses while the local MS is alerted.
-        queue.push_back(SapMsg {
-            sap: Sap::Control,
-            src: TetraEntity::Cmce,
-            dest: network_entity,
-            msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupAccept { brew_uuid }),
-        });
 
         let setup_transmission_grant = if simplex_duplex {
             TransmissionGrant::NotGranted
@@ -179,13 +173,49 @@ impl CcBsSubentity {
             notification_indicator: None,
             temporary_address: None,
             calling_party_address_ssi,
-            calling_party_extension,
+            calling_party_extension: None,
             external_subscriber_number,
             facility: None,
             dm_ms_address: None,
             proprietary: None,
         };
         tracing::debug!("-> {:?}", d_setup);
+
+        // Encode before accepting towards the network: a D-SETUP that cannot be encoded rejects
+        // the call and frees its circuit, instead of panicking the stack.
+        let mut setup_sdu = BitBuffer::new_autoexpand(80);
+        if let Err(e) = d_setup.to_bitbuf(&mut setup_sdu) {
+            tracing::error!(
+                "CMCE: cannot encode D-SETUP for {:?} call uuid={} number='{}': {:?} - rejecting it",
+                network_entity,
+                brew_uuid,
+                call.number,
+                e
+            );
+            let carrier_num = circuit_called.carrier_num;
+            let _ = self.circuits.close_circuit_slot(Direction::Both, carrier_num, ts);
+            self.release_timeslot_slot(CarrierSlot { carrier_num, ts });
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Cmce,
+                dest: network_entity,
+                msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupReject {
+                    brew_uuid,
+                    cause: DisconnectCause::CauseNotDefinedOrUnknown.into_raw() as u8,
+                }),
+            });
+            return;
+        }
+        setup_sdu.seek(0);
+
+        // Acknowledge setup to the originating network entity first so network call state
+        // progresses while the local MS is alerted.
+        queue.push_back(SapMsg {
+            sap: Sap::Control,
+            src: TetraEntity::Cmce,
+            dest: network_entity,
+            msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupAccept { brew_uuid }),
+        });
 
         self.cached_setups.insert(
             call_id,
@@ -196,11 +226,6 @@ impl CcBsSubentity {
                 tx_receipt: None,
             },
         );
-
-        let d_setup_ref = &self.cached_setups.get(&call_id).unwrap().pdu;
-        let mut setup_sdu = BitBuffer::new_autoexpand(80);
-        d_setup_ref.to_bitbuf(&mut setup_sdu).expect("Failed to serialize DSetup");
-        setup_sdu.seek(0);
         let setup_msg = Self::build_sapmsg(setup_sdu, None, self.dltime, called_addr, None);
         queue.push_back(setup_msg);
 
@@ -814,9 +839,13 @@ impl CcBsSubentity {
         );
 
         let dest_addr = TetraAddress::new(dest_gssi, SsiType::Gssi);
+        // Announce the priority and call time-out this call really runs with (TS 100 392-2 14.8.12,
+        // 14.8.16): the D-SETUP, also re-sent for late entry, said priority 0 and 5 minutes while
+        // the call was pre-empting with its real priority and timed out at call_timeout_secs.
+        let call_time_out = self.config_call_timeout();
         let d_setup = DSetup {
             call_identifier: call_id,
-            call_time_out: CallTimeout::T5m,
+            call_time_out,
             hook_method_selection: false,
             simplex_duplex_selection: false,
             basic_service_information: BasicServiceInformation {
@@ -828,7 +857,7 @@ impl CcBsSubentity {
             },
             transmission_grant: TransmissionGrant::GrantedToOtherUser,
             transmission_request_permission: false,
-            call_priority: 0,
+            call_priority: priority,
             notification_indicator: None,
             temporary_address: None,
             calling_party_address_ssi: Some(source_issi),
@@ -856,7 +885,7 @@ impl CcBsSubentity {
 
         let d_connect = DConnect {
             call_identifier: call_id,
-            call_time_out: CallTimeout::T5m,
+            call_time_out,
             hook_method_selection: false,
             simplex_duplex_selection: false,
             transmission_grant: TransmissionGrant::GrantedToOtherUser,
