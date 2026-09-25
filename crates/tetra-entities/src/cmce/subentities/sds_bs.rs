@@ -579,9 +579,20 @@ impl SdsBsSubentity {
                 v
             }
         };
+        // The dashboard and DAPNET builders (build_sds_text_payload) already start the payload
+        // with their own coding byte: 0x01 Latin-1, 0x02 for UTF-16BE. Wrapping that behind our
+        // 0x01 put a stray control character at the start of every message and declared UTF-16
+        // text as Latin-1 - and 0x02 is really ISO 8859-2. Take the caller's marker instead: 0x01
+        // stays Latin-1, 0x02 becomes 0x1A (UCS-2/UTF-16BE, TS 100 392-2 table 29.29). A payload
+        // with no marker (plain text, TPG2200 callouts) keeps the Latin-1 header as before.
+        let (coding_scheme, text) = match payload.first() {
+            Some(0x01) => (0x01u8, &payload[1..]),
+            Some(0x02) => (0x1Au8, &payload[1..]),
+            _ => (0x01u8, &payload[..]),
+        };
         let wrapped_payload: Vec<u8> = {
-            let mut v = vec![0x82u8, 0x04u8, mr, 0x01u8];
-            v.extend_from_slice(&payload);
+            let mut v = vec![0x82u8, 0x04u8, mr, coding_scheme];
+            v.extend_from_slice(text);
             v
         };
         // The SDS-TL Type-4 length field is 11 bits (length in bits), so it can encode at most
@@ -844,7 +855,17 @@ impl SdsBsSubentity {
         if self.config.state_read().subscribers.is_registered(dest_ssi) {
             tracing::info!("SDS-STATUS: local delivery: {} -> {}", source_ssi, dest_ssi);
             self.send_d_status(queue, source_ssi, dest_ssi, pdu.pre_coded_status);
-        } else if brew_ok {
+        } else if brew_ok || self.config.state_read().subscribers.has_group_members(dest_ssi) {
+            // A status to a talkgroup (TS 100 392-2 13.2) reaches the group's members in this
+            // cell, like group SDS does. It used to go only to Brew, or nowhere; it still goes
+            // to Brew too, for the members on other sites.
+            if self.config.state_read().subscribers.has_group_members(dest_ssi) {
+                tracing::info!("SDS-STATUS: group delivery: {} -> GSSI {}", source_ssi, dest_ssi);
+                self.send_d_status_group(queue, source_ssi, dest_ssi, pdu.pre_coded_status);
+            }
+            if !brew_ok {
+                return;
+            }
             // Brew forwarding only: when the pre-coded status carries an SDS-TL short report
             // (ETSI 29.4.2.3), convert it to a full SDS-TL REPORT PDU (Type4) so the
             // remote end recognizes it as a delivery confirmation. ETSI 29.3.3.4.4
@@ -852,11 +873,14 @@ impl SdsBsSubentity {
             // Non-SDS-TL pre-coded statuses are forwarded as-is (Type1).
             // Local delivery (D-STATUS) is not affected, it stays as pre-coded status above.
             let user_defined_data = if let PreCodedStatus::SdsTl(report) = &pdu.pre_coded_status {
+                // Table 29.16 equivalents of the short report (29.3.3.4.4 requires the
+                // conversion to mean the same thing). The old mapping turned "consumed" into
+                // "received" and both failures into successes.
                 let delivery_status = match report.short_report_type() {
-                    ShortReportType::MessageReceived => 0x00,
-                    ShortReportType::MessageConsumed => 0x00,
-                    ShortReportType::DestMemFull => 0x02,
-                    ShortReportType::ProtOrEncodingNotSupported => 0x01,
+                    ShortReportType::MessageReceived => 0x00,            // receipt acknowledged by destination
+                    ShortReportType::MessageConsumed => 0x02,            // consumed by destination
+                    ShortReportType::DestMemFull => 0x52,                // destination memory full, message discarded
+                    ShortReportType::ProtOrEncodingNotSupported => 0x50, // protocol not supported
                 };
                 // PID 0x82 = SDS-TL text messaging. Hardcoded because the SDS-SHORT REPORT
                 // PDU does not carry a Protocol Identifier (ETSI 29.4.3.11). In practice
@@ -889,6 +913,64 @@ impl SdsBsSubentity {
                 dest_ssi
             );
         }
+    }
+
+    /// D-STATUS to a talkgroup: GSSI-addressed and unacknowledged (no single peer to ACK), stolen
+    /// on the group's traffic slot while it has a call, on the MCCH otherwise.
+    fn send_d_status_group(&self, queue: &mut MessageQueue, source_issi: u32, gssi: u32, pre_coded_status: PreCodedStatus) {
+        let pdu = DStatus {
+            calling_party_type_identifier: PartyTypeIdentifier::Ssi,
+            calling_party_address_ssi: Some(source_issi as u64),
+            calling_party_extension: None,
+            pre_coded_status,
+            external_subscriber_number: None,
+            dm_ms_address: None,
+        };
+        tracing::debug!("-> D-STATUS {:?}", pdu);
+        let mut sdu = BitBuffer::new_autoexpand(64);
+        if let Err(e) = pdu.to_bitbuf(&mut sdu) {
+            tracing::error!("Failed to serialize D-STATUS: {:?}", e);
+            return;
+        }
+        sdu.seek(0);
+
+        let traffic = self.config.state_read().active_call_ts.get(&gssi).copied();
+        let (stealing_permission, chan_alloc) = match traffic {
+            Some((carrier_num, ts, usage)) if (1..=4).contains(&ts) => {
+                let mut timeslots = [false; 4];
+                timeslots[(ts - 1) as usize] = true;
+                (
+                    true,
+                    Some(CmceChanAllocReq {
+                        usage: Some(usage),
+                        carrier: Some(carrier_num),
+                        timeslots,
+                        alloc_type: ChanAllocType::Replace,
+                        ul_dl_assigned: UlDlAssignment::Dl,
+                    }),
+                )
+            }
+            _ => (false, None),
+        };
+        queue.push_back(SapMsg {
+            sap: Sap::LcmcSap,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
+                sdu,
+                handle: 0,
+                endpoint_id: 0,
+                link_id: 0,
+                layer2service: Layer2Service::Unacknowledged,
+                pdu_prio: 0,
+                layer2_qos: 0,
+                stealing_permission,
+                stealing_repeats_flag: false,
+                chan_alloc,
+                main_address: TetraAddress::new(gssi, SsiType::Gssi),
+                tx_reporter: None,
+            }),
+        });
     }
 
     /// Build and send a D-STATUS PDU to a local MS.
