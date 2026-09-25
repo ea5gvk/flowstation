@@ -171,6 +171,11 @@ impl UmacBs {
         }
     }
 
+    /// Whether a circuit is active on (`carrier_num`, `ts`) in `dir`, on any configured carrier.
+    pub fn circuit_is_active_on(&self, carrier_num: u16, dir: Direction, ts: u8) -> bool {
+        self.scheduler_for(carrier_num).circuit_is_active(dir, ts)
+    }
+
     /// Precomputes SYNC, SYSINFO messages (and subfield variants) for faster TX msg building
     /// Precomputed PDUs are passed to scheduler
     /// Needs to be re-invoked if any network parameter changes
