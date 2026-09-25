@@ -1541,6 +1541,10 @@ impl UmacBs {
                         requested_carrier,
                         ts
                     );
+                    // A link-bound request (the LLC's BL-ACK: link_id names the slot) carries its
+                    // chan_alloc only to name that slot. Encoded on the fallback it became a real
+                    // Replace allocation on the BL-ACK, sending the radio to a slot with no circuit.
+                    chan_alloc_was_stealing_hint = prim.link_id != 0;
                     None
                 }
                 None => (1..=4u8).find(|&t| self.scheduler_for(requested_carrier).can_deliver_stealing(t)),
@@ -1628,7 +1632,10 @@ impl UmacBs {
             (None, None)
         };
 
-        let is_random_access_response = prim.main_address.ssi_type != SsiType::Gssi && prim.link_id != 0;
+        // A stealing request that fell back here has no traffic circuit left to follow: the radio
+        // is back on the MCCH, so drop the link to the slot it came from.
+        let link_id = if chan_alloc_was_stealing_hint { 0 } else { prim.link_id };
+        let is_random_access_response = prim.main_address.ssi_type != SsiType::Gssi && link_id != 0;
         let mut pdu = MacResource {
             fill_bits: false,
             pos_of_grant: 0,
@@ -1649,8 +1656,7 @@ impl UmacBs {
         // BCCH carriers in `SecondaryBcchNoMcch` mode intentionally have no MCCH,
         // so enqueueing call-setup/control PDUs there makes them unschedulable
         // and drops D-CONNECT/D-SETUP for cross-carrier calls.
-        self.channel_scheduler
-            .dl_enqueue_tma_for_link(prim.link_id, pdu, sdu, prim.tx_reporter);
+        self.channel_scheduler.dl_enqueue_tma_for_link(link_id, pdu, sdu, prim.tx_reporter);
     }
 
     fn rx_tma_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {

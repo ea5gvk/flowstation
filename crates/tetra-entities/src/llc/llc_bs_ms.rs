@@ -112,11 +112,14 @@ impl Llc {
 
     /// Returns details for outstanding to-be-sent ACK, if any. Returned u8 is the sequence number.
     /// ETSI 22.3.2.3 case d: when a waiting ACK and outgoing TL-DATA exist for the same link, the
-    /// LLC shall emit a combined BL-ADATA PDU. We match by SSI plus carrier because the ACK must
-    /// stay on the same traffic/signalling carrier as the original uplink.
-    fn get_out_ack_seq_if_any(&mut self, addr: TetraAddress, carrier_num: u16) -> Option<u8> {
+    /// LLC shall emit a combined BL-ADATA PDU. Only an ACK for an uplink received on the channel
+    /// the outgoing PDU goes out on (same carrier AND timeslot) is taken: an ACK for an uplink
+    /// that came in on a traffic slot used to ride a PDU to the MCCH, which a radio in a call does
+    /// not listen to (22.3.1.1), so it never got its ACK and retransmitted.
+    fn get_out_ack_seq_if_any(&mut self, addr: TetraAddress, carrier_num: u16, ts: u8) -> Option<u8> {
         for i in 0..self.scheduled_out_acks.len() {
-            if self.scheduled_out_acks[i].addr.ssi == addr.ssi && self.scheduled_out_acks[i].carrier_num == carrier_num {
+            let a = &self.scheduled_out_acks[i];
+            if a.addr.ssi == addr.ssi && a.carrier_num == carrier_num && a.ts == ts {
                 let n = self.scheduled_out_acks[i].nr;
                 self.scheduled_out_acks.remove(i);
                 return Some(n);
@@ -281,7 +284,13 @@ impl Llc {
         // Traffic-channel responses may carry the TL-SDU on the BL-ACK itself.
         // This is required for U-Alert and other BL response payloads.
         if prim.stealing_permission {
-            if let Some(out_ack_n) = self.get_out_ack_seq_if_any(prim.main_address, preferred_carrier) {
+            // The slot this response is stolen on; only an ACK received there may ride it.
+            let steal_ts = prim
+                .chan_alloc
+                .as_ref()
+                .and_then(|ca| ca.timeslots.iter().position(|&set| set).map(|i| (i + 1) as u8))
+                .unwrap_or(0);
+            if let Some(out_ack_n) = self.get_out_ack_seq_if_any(prim.main_address, preferred_carrier, steal_ts) {
                 let mut pdu_buf = BitBuffer::new_autoexpand(32);
                 let pdu = BlAck {
                     has_fcs: prim.fcs_flag,
@@ -353,8 +362,19 @@ impl Llc {
             return;
         }
 
-        // If an ack still needs to be sent, get the relevant expected sequence number
-        let out_ack_n = self.get_out_ack_seq_if_any(prim.main_address, preferred_carrier);
+        // If an ack still needs to be sent, get the relevant expected sequence number. This PDU
+        // leaves on the main carrier's MCCH, so only an ACK for an uplink received there can go
+        // with it, and only if the link is free: with a window of 1 a BL-ADATA queued behind an
+        // unacknowledged message waits up to N.252 x T.251, and the ACK inside it waited too - the
+        // radio retransmitted and we delivered duplicates (22.3.2.3 d). Otherwise the ACK leaves
+        // on its own as a BL-ACK this tick.
+        let link_busy = self.outbound_messages.iter().any(|m| m.addr.ssi == prim.main_address.ssi);
+        let main_carrier = self.main_carrier();
+        let out_ack_n = if link_busy {
+            None
+        } else {
+            self.get_out_ack_seq_if_any(prim.main_address, main_carrier, 1)
+        };
 
         // Get per-link send sequence number N(S) = V(S), then toggle V(S)
         let ns = self.get_next_send_seq(&prim.main_address);
@@ -841,9 +861,11 @@ impl Llc {
                 ack.ts
             );
 
-            // Send BL-ACK via FACCH (stealing) on the traffic timeslot if the original
-            // message arrived on a traffic channel (TS2-4), otherwise via MCCH (TS1).
-            let steal = matches!(ack.ts, 2..=4);
+            // Send BL-ACK via FACCH (stealing) on the timeslot the original message arrived on,
+            // unless that is the main carrier's MCCH (TS1). On a secondary carrier TS1 is a
+            // traffic slot too: deciding by slot number alone sent those ACKs to the main MCCH,
+            // where the radio in the call never heard them.
+            let steal = (1..=4).contains(&ack.ts) && !(ack.carrier_num == self.main_carrier() && ack.ts == 1);
             let mut pdu_buf = BitBuffer::new_autoexpand(5);
             let pdu = BlAck {
                 has_fcs: false,
