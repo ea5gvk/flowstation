@@ -876,6 +876,49 @@ impl CcBsSubentity {
         queue.push_back(msg);
     }
 
+    /// Send D-TX INTERRUPT via FACCH stealing to the local MS whose floor is being taken
+    /// (TS 100 392-2 14.5.2.2.1 f): transmission granted to another user, `new_speaker_issi`.
+    pub(super) fn send_d_tx_interrupt_facch(
+        &mut self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        interrupted_issi: u32,
+        new_speaker_issi: u32,
+        carrier_num: u16,
+        ts: u8,
+    ) {
+        let pdu = DTxInterrupt {
+            call_identifier: call_id,
+            transmission_grant: TransmissionGrant::GrantedToOtherUser.into_raw() as u8,
+            transmission_request_permission: false,
+            encryption_control: false,
+            reserved: false,
+            notification_indicator: None,
+            transmitting_party_type_identifier: Some(1), // SSI
+            transmitting_party_address_ssi: Some(new_speaker_issi as u64),
+            transmitting_party_extension: None,
+            external_subscriber_number: None,
+            facility: None,
+            dm_ms_address: None,
+            proprietary: None,
+        };
+        tracing::info!(
+            "-> D-TX INTERRUPT (FACCH) call_id={} to ISSI {}: floor taken by network speaker {}",
+            call_id,
+            interrupted_issi,
+            new_speaker_issi
+        );
+        let mut sdu = BitBuffer::new_autoexpand(30);
+        if let Err(e) = pdu.to_bitbuf(&mut sdu) {
+            tracing::error!("Failed to serialize DTxInterrupt: {:?}", e);
+            return;
+        }
+        sdu.seek(0);
+        let dest_addr = TetraAddress::new(interrupted_issi, SsiType::Issi);
+        let msg = Self::build_sapmsg_stealing(sdu, self.dltime, dest_addr, carrier_num, ts, None);
+        queue.push_back(msg);
+    }
+
     /// Send D-TX CEASED via FACCH stealing
     pub(super) fn send_d_tx_ceased_facch(&mut self, queue: &mut MessageQueue, call_id: u16, dest_gssi: u32, carrier_num: u16, ts: u8) {
         let pdu = DTxCeased {

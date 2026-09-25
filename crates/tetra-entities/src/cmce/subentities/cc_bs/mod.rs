@@ -17,8 +17,9 @@ use tetra_pdus::cmce::{
     pdus::{
         d_alert::DAlert, d_call_proceeding::DCallProceeding, d_call_restore::DCallRestore, d_connect::DConnect,
         d_connect_acknowledge::DConnectAcknowledge, d_disconnect::DDisconnect, d_info::DInfo, d_release::DRelease, d_setup::DSetup,
-        d_tx_ceased::DTxCeased, d_tx_granted::DTxGranted, u_alert::UAlert, u_call_restore::UCallRestore, u_connect::UConnect,
-        u_disconnect::UDisconnect, u_info::UInfo, u_release::URelease, u_setup::USetup, u_tx_ceased::UTxCeased, u_tx_demand::UTxDemand,
+        d_tx_ceased::DTxCeased, d_tx_granted::DTxGranted, d_tx_interrupt::DTxInterrupt, u_alert::UAlert, u_call_restore::UCallRestore,
+        u_connect::UConnect, u_disconnect::UDisconnect, u_info::UInfo, u_release::URelease, u_setup::USetup, u_tx_ceased::UTxCeased,
+        u_tx_demand::UTxDemand,
     },
     structs::cmce_circuit::CmceCircuit,
 };

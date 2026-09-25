@@ -213,6 +213,15 @@ impl CcBsSubentity {
         let formal_state = call.formal_state;
         Self::validate_group_transition(call_id, state, formal_state, GroupEvent::TxCeased)?;
 
+        // A U-TX CEASED from the queued requester withdraws its request (TS 100 392-2 14.5.2.2.1
+        // a). It used to be dropped as "not the current speaker", and the radio that had let go of
+        // PTT was later handed a floor it no longer wanted.
+        if call.queued_tx_demand.is_some_and(|q| q.ssi == sender.ssi) {
+            call.queued_tx_demand = None;
+            tracing::info!("CMCE: ISSI {} withdrew its queued floor request on call_id={}", sender.ssi, call_id);
+            return Ok(());
+        }
+
         if !call.is_current_speaker(sender.ssi) {
             return Err(GroupTransitionError::NotCurrentSpeaker {
                 call_id,
@@ -307,6 +316,11 @@ impl CcBsSubentity {
         let formal_state = call.formal_state;
         Self::validate_group_transition(call_id, state, formal_state, GroupEvent::NetworkCallStart)?;
 
+        // A local MS still holding the floor is being pre-empted by the network talker. It ignores
+        // the group D-TX GRANTED below and would keep talking to nobody, so tell it individually
+        // (TS 100 392-2 14.5.2.2.1 f). Collected before grant_floor overwrites the speaker.
+        let interrupted = (call.local_floor && call.is_tx_active() && call.source_issi != source_issi).then_some(call.source_issi);
+
         call.grant_floor(source_issi, None);
         call.touch_activity(self.dltime);
         call.brew_uuid = Some(brew_uuid);
@@ -322,6 +336,9 @@ impl CcBsSubentity {
         let usage = call.usage;
         let dest_gssi = call.dest_gssi;
 
+        if let Some(local_issi) = interrupted {
+            self.send_d_tx_interrupt_facch(queue, call_id, local_issi, source_issi, carrier_num, ts);
+        }
         self.send_d_tx_granted_facch(queue, call_id, source_issi, dest_gssi, carrier_num, ts);
 
         self.notify_remote_floor_granted(queue, CallTimeslot { call_id, carrier_num, ts });
