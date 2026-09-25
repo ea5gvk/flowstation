@@ -621,10 +621,11 @@ mod tests {
         // Eg1 radio (cycle 2 frames) with a known window at frame 1 / multiframe 1.
         mgr.set_client_energy_saving_mode(100, EnergySavingMode::Eg1).unwrap();
         mgr.set_client_monitoring_window(100, Some(1), Some(1)).unwrap();
-        // m=1,f=1 → cur_abs 0, in window (cycle 2) → send.
-        assert!(mgr.should_send_t351_command_now(100, TdmaTime { t: 1, f: 1, m: 1, h: 0 }, 300, 6));
-        // m=1,f=2 → cur_abs 1, out of window, freshly registered (not overdue) → defer.
-        assert!(!mgr.should_send_t351_command_now(100, TdmaTime { t: 1, f: 2, m: 1, h: 0 }, 300, 6));
+        // The window is checked for the MCCH slot the COMMAND leaves in, one frame later here.
+        // Decided at m=1,f=2 → leaves at f=3, cur_abs 2, in window (cycle 2) → send.
+        assert!(mgr.should_send_t351_command_now(100, TdmaTime { t: 1, f: 2, m: 1, h: 0 }, 300, 6));
+        // Decided at m=1,f=1 → leaves at f=2, cur_abs 1, out of window, not overdue → defer.
+        assert!(!mgr.should_send_t351_command_now(100, TdmaTime { t: 1, f: 1, m: 1, h: 0 }, 300, 6));
 
         // EE radio whose monitoring window is unknown is never deferred (sent immediately).
         mgr.set_client_monitoring_window(100, None, None).unwrap();

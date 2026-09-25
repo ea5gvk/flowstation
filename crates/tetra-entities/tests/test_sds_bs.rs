@@ -899,13 +899,14 @@ fn test_sds_to_ee_ms_defers_until_monitoring_window() {
     let dest = 2000001;
     register_subscriber(&mut test, dest); // registered, idle (not in a call)
 
-    // Publish a frame-based EE monitoring window for dest: start point (frame 2, multiframe 1),
-    // cycle 2 (Eg1 — ETSI Table 23.9). The absolute frame index (m-1)*18+(f-1) is odd at the start
-    // point, so the window is CLOSED at frame 1 (abs 0, even) and opens at frame 2 (abs 1, odd).
-    // (MM is not in this test, so the published map is not overwritten.)
-    test.config.state_write().ee_monitoring_windows.insert(dest, (2, 1, 2));
+    // Publish a frame-based EE monitoring window for dest: start point (frame 1, multiframe 1),
+    // cycle 2 (Eg1 — ETSI Table 23.9). The absolute frame index (m-1)*18+(f-1) is even at the start
+    // point, so the window is open at frames 1, 3, 5... and CLOSED at frame 2 (abs 1, odd).
+    // The window is checked for the MCCH slot the PDU leaves in: decided in frame 1, it leaves in
+    // frame 2. (MM is not in this test, so the published map is not overwritten.)
+    test.config.state_write().ee_monitoring_windows.insert(dest, (1, 1, 2));
 
-    // SDS arrives while dest is asleep (frame 1, window closed) -> must be deferred, not emitted.
+    // SDS arrives in frame 1; it would leave in frame 2 (window closed) -> deferred, not emitted.
     test.submit_message(build_u_sds_data_msg(3000001, dest, 0xABCD));
     test.run_stack(Some(2)); // still within frame 1
     let during = test.dump_sinks();
@@ -914,8 +915,8 @@ fn test_sds_to_ee_ms_defers_until_monitoring_window() {
         "SDS to an asleep EE MS must be deferred (not transmitted) outside its monitoring window"
     );
 
-    // Advance to the MS's monitoring window (frame 2). The deferred SDS must now be delivered on
-    // the MCCH (no stealing).
+    // Advance until it can leave in the MS's next monitoring window (frame 3). The deferred SDS
+    // must now be delivered on the MCCH (no stealing).
     test.run_stack(Some(10));
     let after = test.dump_sinks();
     let delivered: Vec<&LcmcMleUnitdataReq> = after
