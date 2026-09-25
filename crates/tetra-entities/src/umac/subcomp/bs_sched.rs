@@ -375,14 +375,27 @@ impl BsChannelScheduler {
                 grant_timeslots
             );
 
-            if candidate_t.is_mandatory_clch() {
-                // Not an opportunity; skip
+            if candidate_t.f == 18 {
+                // Frame 18 is never granted — ACCESS-ASSIGN marks UL as CommonOnly on this frame,
+                // and timing at the multiframe boundary caused grant delivery to fail. But the MS
+                // counts it the way TS 100 392-2 23.5.2.2.2 says, and so must we:
+                // - before the grant starts, every frame 18 slot (linearization ones included) is
+                //   a delay opportunity it counts;
+                // - inside a multi-slot grant it jumps only the linearization slot and would use
+                //   any other frame 18 slot, so a run may not cross one: restart after it.
+                // Skipping them uncounted made the MS transmit a frame before the slots we had
+                // reserved, and its fragments were dropped as "unassigned block".
+                if grant_timeslots.is_empty() {
+                    opportunities_skipped += 1;
+                } else if !candidate_t.is_mandatory_clch() {
+                    opportunities_skipped += grant_timeslots.len() + 1;
+                    grant_timeslots.clear();
+                }
                 continue;
             }
 
-            if candidate_t.f == 18 {
-                // Skip frame 18 — ACCESS-ASSIGN marks UL as CommonOnly on this frame,
-                // and timing at the multiframe boundary causes grant delivery to fail.
+            if candidate_t.is_mandatory_clch() {
+                // Not an opportunity; skip
                 continue;
             }
 
