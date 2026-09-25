@@ -81,12 +81,15 @@ fn ssi_pair_is_valid(what: &str, source_ssi: u32, dest_ssi: u32) -> bool {
     true
 }
 
-/// SDS-TL delivery-report "delivery status" octet signalling a negative outcome (could not be
-/// delivered), sent to the originator when we give up on a deferred SDS. NOTE: confirm on-air that
-/// the field terminals (Motorola MXP600/MTP6750) render this as "not delivered" — it is
-/// codeplug-dependent. If a radio ignores it, it still falls back to its own delivery-report
-/// timeout (also "failed"), and we never deliver the message late, so the two cannot contradict.
-const SDS_TL_STATUS_UNDELIVERABLE: u8 = 0x02;
+/// SDS-TL delivery-report "delivery status" octets (TS 100 392-2 table 29.16) signalling a negative
+/// outcome, sent to the originator when we give up on a deferred SDS. The previous value 0x02 is
+/// "SDS consumed by destination" - a SUCCESS - so the sender's radio showed a dropped message as
+/// read. If a radio ignores these, it still falls back to its own delivery-report timeout (also
+/// "failed"), and we never deliver the message late, so the two cannot contradict.
+/// 010 11111: destination engaged in another service, message discarded (SwMI, temporary).
+const SDS_TL_STATUS_ENGAGED_DISCARDED: u8 = 0x5F;
+/// 010 11010: destination not reachable, message delivery failed (SwMI, temporary).
+const SDS_TL_STATUS_UNREACHABLE_FAILED: u8 = 0x5A;
 
 /// A terminal whose status transaction does not complete retransmits the identical U-STATUS every
 /// few seconds, so the same (source ISSI, status code) arriving again inside this window is a
@@ -312,7 +315,12 @@ impl SdsBsSubentity {
                     p.dest_ssi,
                     SDS_DEFER_DEADLINE.as_secs()
                 );
-                self.report_sds_failure(queue, &p);
+                let status = if self.issi_on_local_traffic(p.dest_ssi) {
+                    SDS_TL_STATUS_ENGAGED_DISCARDED
+                } else {
+                    SDS_TL_STATUS_UNREACHABLE_FAILED
+                };
+                self.report_sds_failure(queue, &p, status);
             } else {
                 self.pending_sds.push(p); // still unreachable — keep waiting until the deadline
             }
@@ -324,16 +332,19 @@ impl SdsBsSubentity {
     /// never contradicted by a late delivery, since the message is dropped here. Only emitted when
     /// the original was an SDS-TL message carrying a message reference (status-only / non-TL SDS have
     /// nothing to report against, and an SDS-TL report itself has no reference, so this never loops).
-    fn report_sds_failure(&mut self, queue: &mut MessageQueue, p: &PendingSds) {
+    fn report_sds_failure(&mut self, queue: &mut MessageQueue, p: &PendingSds, status: u8) {
         let Some(mr) = Self::sds_tl_message_reference(&p.user_defined_data) else {
             return;
         };
-        // SDS-TL SHORT REPORT: [PID 0x82, type 0x10 (report), delivery status, message reference],
-        // addressed FROM the unreachable destination TO the original sender. Sent immediately on the
-        // MCCH (not deferred) — if the sender is itself busy it falls back to its own timeout.
-        let report = SdsUserData::Type4(32, vec![0x82, 0x10, SDS_TL_STATUS_UNDELIVERABLE, mr]);
+        // The report carries the protocol identifier of the SDS-TRANSFER it reports on.
+        let pid = p.user_defined_data.to_arr()[0];
+        // SDS-REPORT: [PID, type 0x10 (report), delivery status, message reference], addressed FROM
+        // the unreachable destination TO the original sender. Sent immediately on the MCCH (not
+        // deferred) — if the sender is itself busy it falls back to its own timeout.
+        let report = SdsUserData::Type4(32, vec![pid, 0x10, status, mr]);
         tracing::info!(
-            "SDS: reporting delivery failure to {} (MR={}) for undeliverable SDS to {}",
+            "SDS: reporting delivery failure (status 0x{:02X}) to {} (MR={}) for undeliverable SDS to {}",
+            status,
             p.source_issi,
             mr,
             p.dest_ssi
