@@ -736,9 +736,13 @@ impl MmBs {
             } else {
                 None
             };
+            // A requested list with nothing accepted is reported as rejected and sent without a
+            // list: a type-4 element with zero repetitions is a reserved value (Annex E.1.1).
+            let requested_any = gild.group_identity_uplink.as_ref().is_some_and(|g| !g.is_empty());
+            let none_accepted = requested_any && accepted_groups.as_ref().is_some_and(|g| g.is_empty());
             let gila = GroupIdentityLocationAccept {
-                group_identity_accept_reject: 0, // Accept
-                group_identity_downlink: accepted_groups,
+                group_identity_accept_reject: if none_accepted { 1 } else { 0 },
+                group_identity_downlink: accepted_groups.filter(|g| !g.is_empty()),
             };
 
             Some(gila)
@@ -829,6 +833,9 @@ impl MmBs {
             // "temporary registration". This field reuses the demand's enum, whose value 5 is
             // ServiceRestorationMigratingLocationUpdating - the same bits on the air.
             LocationUpdateType::ServiceRestorationMigratingLocationUpdating
+        } else if pdu.location_update_type == LocationUpdateType::DisabledMsUpdating {
+            // Accept type 7, "Disabled MS updating" - the same value in both tables.
+            LocationUpdateType::DisabledMsUpdating
         } else if periodic_secs > 0 && pdu.location_update_type != LocationUpdateType::ItsiAttach {
             LocationUpdateType::PeriodicLocationUpdating
         } else {
@@ -1274,13 +1281,17 @@ impl MmBs {
         for chunk in giu.chunks(MAX_GROUPS_PER_ACK) {
             // Try to attach to this chunk, and retrieve its accepted GroupIdentityDownlink elements
             let accepted_gid = self.try_attach_detach_groups(queue, issi, &chunk.to_vec());
+            // Nothing accepted from this chunk (e.g. an unknown terminal amending after a
+            // restart): say so, and send no list at all - a type-4 element with zero repetitions
+            // is a reserved value (Annex E.1.1).
+            let none_accepted = accepted_gid.is_empty();
 
             // Build reply PDU for this chunk
             let pdu_response = DAttachDetachGroupIdentityAcknowledgement {
-                group_identity_accept_reject: 0, // Accept
-                reserved: false,                 // TODO FIXME Guessed proper value of reserved field
+                group_identity_accept_reject: if none_accepted { 1 } else { 0 },
+                reserved: false, // TODO FIXME Guessed proper value of reserved field
                 proprietary: None,
-                group_identity_downlink: Some(accepted_gid),
+                group_identity_downlink: (!none_accepted).then_some(accepted_gid),
                 group_identity_security_related_information: None,
             };
 
@@ -2038,16 +2049,15 @@ impl MmBs {
     }
 
     fn feature_check_u_location_update_demand(pdu: &ULocationUpdateDemand) -> bool {
-        let mut supported = true;
+        let supported = true;
         // A migrating update only gets this far when it is case c) (returning home), which is a
-        // normal registration; case b) was rejected earlier.
-        if pdu.location_update_type == LocationUpdateType::DisabledMsUpdating {
-            unimplemented_log!("Unsupported {}", pdu.location_update_type);
-            supported = false;
-        }
+        // normal registration; case b) was rejected earlier. A temporarily disabled MS is
+        // accepted like any other (16.4.1.1 d), with accept type 7. Neither used to get any
+        // answer, so the radio retried until its own timers gave up.
         if pdu.request_to_append_la == true {
-            unimplemented_log!("Unsupported request_to_append_la == true");
-            supported = false;
+            // Not supported, but not critical either: an accept with no New registered area
+            // leaves the registered area as the current LA alone (16.4.1.1).
+            tracing::debug!("DemandLocationUpdating: request_to_append_la set - accepting without appending");
         }
         if pdu.cipher_control == true {
             unimplemented_log!("Unsupported cipher_control == true");
