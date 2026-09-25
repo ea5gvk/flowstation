@@ -1331,22 +1331,25 @@ fn submit_location_update_via_llc(test: &mut ComponentTest, issi: u32, carrier: 
     test.run_stack(Some(2));
 }
 
-/// The acknowledged LLC PDU (BL-ADATA) that carries MM's answer to `issi` down to the UMAC.
-fn find_mm_answer_to_umac(msgs: &[SapMsg], issi: u32) -> Option<TmaUnitdataReq> {
-    msgs.iter().find_map(|m| match &m.msg {
-        SapMsgInner::TmaUnitdataReq(req) if req.main_address.ssi == issi => {
-            let mut pdu = BitBuffer::from_bitstr(&req.pdu.to_bitstr());
-            let llc_type = pdu.read_field(4, "llc_pdu_type").ok()?;
-            (LlcPduType::try_from(llc_type).ok()? == LlcPduType::BlAdata).then(|| req.clone())
-        }
-        _ => None,
-    })
+/// The TMA-UNITDATA requests to the UMAC for `issi` whose LLC PDU is of type `llc_type`.
+fn llc_pdus_to_umac(msgs: &[SapMsg], issi: u32, llc_type: LlcPduType) -> Vec<TmaUnitdataReq> {
+    msgs.iter()
+        .filter_map(|m| match &m.msg {
+            SapMsgInner::TmaUnitdataReq(req) if req.main_address.ssi == issi => {
+                let mut pdu = BitBuffer::from_bitstr(&req.pdu.to_bitstr());
+                let t = pdu.read_field(4, "llc_pdu_type").ok()?;
+                (LlcPduType::try_from(t).ok()? == llc_type).then(|| req.clone())
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// A radio in a call listens to its traffic slot, not to the MCCH: MM's answer to an uplink that
-/// came in on a traffic slot is stolen on that slot, with the BL-ACK for the uplink inside it,
-/// and the link id makes the UMAC drop the slot hint if it has to fall back to the MCCH. An
-/// uplink that came in on the MCCH is still answered there.
+/// came in on a traffic slot is stolen on that slot, carrying the link id the UMAC needs to drop
+/// the slot hint if it has to fall back to the MCCH. The BL-ACK for the uplink leaves on its own,
+/// stolen on the slot, so a fallback cannot take it to the MCCH. An uplink that came in on the
+/// MCCH is still answered there, with the BL-ACK inside the answer.
 #[test]
 fn test_mm_answer_follows_the_radio_to_its_traffic_slot() {
     debug::setup_logging_verbose();
@@ -1360,13 +1363,23 @@ fn test_mm_answer_follows_the_radio_to_its_traffic_slot() {
     test.register_entity(mm);
 
     submit_location_update_via_llc(&mut test, ISSI, main_carrier);
-    let req = find_mm_answer_to_umac(&test.dump_sinks(), ISSI).expect("MM answer with the BL-ACK inside it");
-    assert!(req.stealing_permission, "the answer must be stolen on the radio's traffic slot");
-    assert_eq!(req.link_id, 2);
-    let hint = req.chan_alloc.expect("slot hint for the UMAC");
+    let msgs = test.dump_sinks();
+    let answer = llc_pdus_to_umac(&msgs, ISSI, LlcPduType::BlData);
+    let answer = answer.first().expect("MM answer as BL-DATA");
+    assert!(answer.stealing_permission, "the answer must be stolen on the radio's traffic slot");
+    assert_eq!(answer.link_id, 2);
+    let hint = answer.chan_alloc.as_ref().expect("slot hint for the UMAC");
     assert_eq!(hint.timeslots, [false, true, false, false]);
     assert_eq!(hint.carrier, Some(main_carrier));
-    assert_eq!(req.carrier_num, Some(main_carrier));
+    assert_eq!(answer.carrier_num, Some(main_carrier));
+    assert!(
+        llc_pdus_to_umac(&msgs, ISSI, LlcPduType::BlAdata).is_empty(),
+        "no ACK inside the answer"
+    );
+    let ack = llc_pdus_to_umac(&msgs, ISSI, LlcPduType::BlAck);
+    let ack = ack.first().expect("BL-ACK for the uplink");
+    assert!(ack.stealing_permission);
+    assert_eq!(ack.link_id, 2);
 
     // Downlink time TS3: this uplink came in on TS1, the MCCH.
     let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { h: 0, m: 1, f: 1, t: 3 }));
@@ -1375,8 +1388,9 @@ fn test_mm_answer_follows_the_radio_to_its_traffic_slot() {
     test.register_entity(mm);
 
     submit_location_update_via_llc(&mut test, ISSI, main_carrier);
-    let req = find_mm_answer_to_umac(&test.dump_sinks(), ISSI).expect("MM answer with the BL-ACK inside it");
-    assert!(!req.stealing_permission, "an uplink from the MCCH is answered on the MCCH");
-    assert_eq!(req.link_id, 0);
-    assert!(req.chan_alloc.is_none());
+    let answer = llc_pdus_to_umac(&test.dump_sinks(), ISSI, LlcPduType::BlAdata);
+    let answer = answer.first().expect("MM answer with the BL-ACK inside it");
+    assert!(!answer.stealing_permission, "an uplink from the MCCH is answered on the MCCH");
+    assert_eq!(answer.link_id, 0);
+    assert!(answer.chan_alloc.is_none());
 }

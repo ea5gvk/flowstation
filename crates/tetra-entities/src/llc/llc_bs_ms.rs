@@ -21,9 +21,10 @@ use tetra_pdus::llc::pdus::bl_data::BlData;
 use tetra_pdus::llc::pdus::bl_udata::BlUdata;
 
 /// An MM message follows its radio to the traffic slot it last transmitted on only this long
-/// (5 multiframes, about 5 s): enough for an answer held back for authentication, short enough
-/// that the slot is not yet another call's after the radio has gone back to the MCCH.
-const UPLINK_CHANNEL_FRESH_SLOTS: i32 = 5 * 18 * 4;
+/// (2 multiframes, about 2 s). Every step of an exchange is an uplink that renews it, including
+/// the authentication answer an accept is held back for; the short window keeps a slot that has
+/// meanwhile gone to another call from being taken for the radio's.
+const UPLINK_CHANNEL_FRESH_SLOTS: i32 = 2 * 18 * 4;
 
 /// Struct that maintains state expected acknowledgement data for a transmitted message.
 /// Aka, we still expect an ack for this.
@@ -113,7 +114,8 @@ impl Llc {
     fn recent_uplink_traffic_slot(&self, ssi: u32) -> Option<(u16, u8)> {
         let &(carrier, ts, t) = self.last_uplink.get(&ssi)?;
         let on_mcch = carrier == self.main_carrier() && ts == 1;
-        (!on_mcch && t.age(self.dltime) <= UPLINK_CHANNEL_FRESH_SLOTS).then_some((carrier, ts))
+        // A very old entry can wrap to a negative age, so both ends of the range are checked.
+        (!on_mcch && (0..=UPLINK_CHANNEL_FRESH_SLOTS).contains(&t.age(self.dltime))).then_some((carrier, ts))
     }
 
     /// A chan_alloc that only names the traffic slot to steal on. Sent with a non-zero link id, so
@@ -169,11 +171,13 @@ impl Llc {
         ns
     }
 
-    /// Returns and removes the expected ACK entry for the given SSI, if any
-    fn take_expected_ack_for_ssi(&mut self, ssi: u32, carrier_num: u16) -> Option<ExpectedInAck> {
+    /// Returns and removes the expected ACK entry for the given SSI, if any. Only one message per
+    /// SSI is ever in flight, so the carrier is not matched: a PDU meant for a secondary carrier's
+    /// ACCH that the UMAC had to send on the main MCCH is acknowledged on the main carrier.
+    fn take_expected_ack_for_ssi(&mut self, ssi: u32) -> Option<ExpectedInAck> {
         for i in 0..self.outbound_messages.len() {
             let msg = &self.outbound_messages[i];
-            if msg.addr.ssi == ssi && msg.carrier_num == carrier_num && msg.t_submitted_to_umac.is_some() {
+            if msg.addr.ssi == ssi && msg.t_submitted_to_umac.is_some() {
                 return self.outbound_messages.remove(i);
             }
         }
@@ -184,7 +188,7 @@ impl Llc {
     /// Matches by SSI and N(R) so that retransmitted BL-DATA entries are matched correctly.
     fn process_incoming_ack(&mut self, addr: TetraAddress, carrier_num: u16, nr: u8) {
         // Get the expected ACK entry
-        let Some(expected_ack) = self.take_expected_ack_for_ssi(addr.ssi, carrier_num) else {
+        let Some(expected_ack) = self.take_expected_ack_for_ssi(addr.ssi) else {
             tracing::warn!("received unexpected ACK for SSI {} carrier {} N(R) {}", addr.ssi, carrier_num, nr);
             return;
         };
@@ -410,19 +414,20 @@ impl Llc {
             );
         }
         let preferred_carrier = acch.map_or(preferred_carrier, |(carrier, _)| carrier);
-        let (channel_carrier, channel_ts) = acch.unwrap_or((self.main_carrier(), 1));
 
-        // If an ack still needs to be sent, get the relevant expected sequence number. Only an ACK
-        // for an uplink received on the channel this PDU leaves on can go with it (22.3.1.1), and
-        // only if the link is free: with a window of 1 a BL-ADATA queued behind an unacknowledged
-        // message waits up to N.252 x T.251, and the ACK inside it waited too - the radio
-        // retransmitted and we delivered duplicates (22.3.2.3 d). Otherwise the ACK leaves on its
-        // own as a BL-ACK this tick.
+        // If an ack still needs to be sent, get the relevant expected sequence number. A PDU on
+        // the MCCH takes only an ACK for an uplink received there (22.3.1.1), and only if the link
+        // is free: with a window of 1 a BL-ADATA queued behind an unacknowledged message waits up
+        // to N.252 x T.251, and the ACK inside it waited too - the radio retransmitted and we
+        // delivered duplicates (22.3.2.3 d). A PDU for a traffic slot takes none: the UMAC may
+        // still send it on the MCCH, and the ACK must stay on the slot. Otherwise the ACK leaves
+        // on its own as a BL-ACK this tick, stolen on the slot its uplink came in on.
         let link_busy = self.outbound_messages.iter().any(|m| m.addr.ssi == prim.main_address.ssi);
-        let out_ack_n = if link_busy {
+        let out_ack_n = if link_busy || acch.is_some() {
             None
         } else {
-            self.get_out_ack_seq_if_any(prim.main_address, channel_carrier, channel_ts)
+            let main_carrier = self.main_carrier();
+            self.get_out_ack_seq_if_any(prim.main_address, main_carrier, 1)
         };
 
         // Get per-link send sequence number N(S) = V(S), then toggle V(S)
@@ -818,7 +823,7 @@ impl Llc {
                 // ssi was just collected from expected_acks above, so the entry exists.
                 // Use if-let rather than unwrap so a future refactor of the collection
                 // logic can't panic the LLC worker here.
-                let Some(ack) = self.take_expected_ack_for_ssi(ssi, carrier_num) else {
+                let Some(ack) = self.take_expected_ack_for_ssi(ssi) else {
                     tracing::debug!(
                         "schedule_retransmissions: expected ACK for SSI {} carrier {} already gone, skipping",
                         ssi,
