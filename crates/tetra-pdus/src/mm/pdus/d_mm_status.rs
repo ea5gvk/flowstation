@@ -1,6 +1,7 @@
 use core::fmt;
 
 use tetra_core::expect_pdu_type;
+use tetra_core::typed_pdu_fields::*;
 use tetra_core::{BitBuffer, pdu_parse_error::PduParseErr};
 
 use crate::mm::enums::mm_pdu_type_dl::MmPduTypeDl;
@@ -44,6 +45,11 @@ impl DMmStatus {
                 unimplemented!("D-MM-STATUS sub-PDU parsing for {:?}", status_downlink);
             }
         };
+        // O-bit ahead of the optional Proprietary element (tables 16.4/16.5); the proprietary
+        // part itself, if flagged, is not decoded.
+        if buffer.get_len_remaining() > 0 {
+            let _obit = delimiters::read_obit(buffer)?;
+        }
 
         Ok(DMmStatus {
             status_downlink,
@@ -62,6 +68,9 @@ impl DMmStatus {
             StatusDownlink::ChangeOfEnergySavingModeRequest | StatusDownlink::ChangeOfEnergySavingModeResponse => {
                 if let Some(ref esi) = self.energy_saving_information {
                     esi.to_bitbuf(buffer)?;
+                    // Table 16.5 has an optional type-3 Proprietary element, so the type-1
+                    // elements are followed by the O-bit (Annex E.1.1); 0 = nothing follows.
+                    delimiters::write_obit(buffer, 0);
                 } else {
                     return Err(PduParseErr::FieldNotPresent {
                         field: Some("energy_saving_information"),
