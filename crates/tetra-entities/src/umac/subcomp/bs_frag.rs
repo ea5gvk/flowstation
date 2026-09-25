@@ -56,7 +56,11 @@ impl BsFragger {
         let num_fill_bits = fillbits::addition::compute_required(hdr_len_bits + sdu_len_bits, slot_cap_bits);
 
         let total_len_bits = hdr_len_bits + sdu_len_bits + num_fill_bits;
-        let total_len_bytes = total_len_bits / 8;
+        // Rounded UP (TS 100 392-2 23.4.3.2): a PDU filling a block that is not a whole number of
+        // octets (SCH/F 268, SCH/HD and STCH 124 bits) is indicated as the next octet, and the
+        // receiver clips it to the block (23.4.3.3). Rounding down left the last 1-4 bits of the
+        // TM-SDU outside the indicated length.
+        let total_len_bytes = total_len_bits.div_ceil(8);
 
         // Check if we can fit all in a single MAC-RESOURCE
         if total_len_bits <= slot_cap_bits {
