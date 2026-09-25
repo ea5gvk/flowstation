@@ -166,7 +166,10 @@ pub enum DlSchedElem {
     /// Pre-built STCH block for FACCH/stealing a half-slot from traffic channel.
     /// Contains MAC-U-SIGNAL (3 bits) + TM-SDU = 124 type1 bits.
     /// Delivers time-critical signaling (D-TX CEASED, D-TX GRANTED) per EN 300 392-2, clause 23.5.
-    Stealing(BitBuffer, Option<TxReporter>),
+    /// The third field, when present, is a second STCH block that steals the second half of the
+    /// SAME slot: a MAC-RESOURCE with LI=111111 in the first half and its MAC-END in the second,
+    /// the only fragmentation TS 100 392-2 23.4.2.1.7 allows on stolen slots.
+    Stealing(BitBuffer, Option<TxReporter>, Option<BitBuffer>),
 }
 
 const EMPTY_SCHED_ELEM: TimeslotSchedule = TimeslotSchedule {
@@ -819,7 +822,19 @@ impl BsChannelScheduler {
     /// The block must be 124 type1 bits containing MAC-U-SIGNAL header + TM-SDU.
     pub fn dl_enqueue_stealing(&mut self, ts: u8, block: BitBuffer, tx_reporter: Option<TxReporter>) {
         tracing::info!("dl_enqueue_stealing: ts {} enqueueing STCH block ({} bits)", ts, block.get_len());
-        self.dltx_queues[ts as usize - 1].push(DlSchedElem::Stealing(block, tx_reporter));
+        self.dltx_queues[ts as usize - 1].push(DlSchedElem::Stealing(block, tx_reporter, None));
+    }
+
+    /// Enqueue two STCH blocks that steal both halves of one traffic slot: a MAC-RESOURCE that
+    /// starts fragmentation (LI=111111) and its MAC-END.
+    pub fn dl_enqueue_stealing_pair(&mut self, ts: u8, first: BitBuffer, second: BitBuffer) {
+        tracing::info!(
+            "dl_enqueue_stealing: ts {} enqueueing both halves of one slot ({} + {} bits)",
+            ts,
+            first.get_len(),
+            second.get_len()
+        );
+        self.dltx_queues[ts as usize - 1].push(DlSchedElem::Stealing(first, None, Some(second)));
     }
 
     fn dl_enqueue_tma_frag_next_frame(&mut self, fragger: BsFragger) {
@@ -1156,7 +1171,7 @@ impl BsChannelScheduler {
                             buf_opt = Some(buf);
                         }
 
-                        DlSchedElem::Stealing(_, tx_reporter) => {
+                        DlSchedElem::Stealing(_, tx_reporter, _) => {
                             // Stealing items should only appear on traffic timeslots; discard if found here
                             tracing::warn!(
                                 "dl_build_block_from_signalling_schedule: Stealing item found on non-traffic ts {}, discarding",
@@ -1195,11 +1210,13 @@ impl BsChannelScheduler {
         buf_opt
     }
 
-    /// Build traffic block for active circuit. Returns (tch_block, optional_stch_block):
+    /// Build traffic block for active circuit. Returns (tch_block, optional_stch_block,
+    /// optional_second_stch_block):
     /// - tch_block: speech/silence (274 bits)
     /// - stch_block: STCH signaling (124 bits) for FACCH stealing (EN 300 392-2, clause 23.5)
+    /// - second_stch_block: when both halves are stolen, the STCH for the second half
     /// Also reports transmission, if a TxReporter was attached to the DlSchedElem::Stealing element
-    fn dl_build_traffic_block(&mut self, ts: TdmaTime) -> (BitBuffer, Option<BitBuffer>) {
+    fn dl_build_traffic_block(&mut self, ts: TdmaTime) -> (BitBuffer, Option<BitBuffer>, Option<BitBuffer>) {
         // Get speech data or silence
         let tch_buf = if let Some(block) = self.circuits.take_block(self.carrier_num, ts.t) {
             // Raw ACELP speech (274 bits for TCH/S). The Vec may be LARGER (e.g. 280
@@ -1227,15 +1244,15 @@ impl BsChannelScheduler {
         };
 
         // Check for FACCH/stealing: take a queued Stealing item (highest priority signaling)
-        let (stch_opt, tx_reporter_opt) = {
+        let (stch_opt, tx_reporter_opt, second_stch) = {
             let q = &mut self.dltx_queues[ts.t as usize - 1];
             if let Some(i) = q.iter().position(|e| matches!(e, DlSchedElem::Stealing(..))) {
                 match q.remove(i) {
-                    DlSchedElem::Stealing(buf, tx_reporter) => (Some(buf), tx_reporter),
+                    DlSchedElem::Stealing(buf, tx_reporter, second) => (Some(buf), tx_reporter, second),
                     _ => unreachable!(),
                 }
             } else {
-                (None, None)
+                (None, None, None)
             }
         };
 
@@ -1249,7 +1266,7 @@ impl BsChannelScheduler {
             tx_reporter.mark_transmitted();
         }
 
-        (tch_buf, stch_opt)
+        (tch_buf, stch_opt, second_stch)
     }
 
     /// Return first queued grant.
@@ -1366,7 +1383,7 @@ impl BsChannelScheduler {
         let ul_phy = if ul_is_traffic { PhysicalChannel::Tp } else { PhysicalChannel::Cp };
 
         let mut elem = if dl_is_traffic {
-            let (tch_buf, stch_opt) = self.dl_build_traffic_block(ts);
+            let (tch_buf, stch_opt, second_stch_opt) = self.dl_build_traffic_block(ts);
 
             if let Some(stch_buf) = stch_opt {
                 tracing::info!(
@@ -1383,10 +1400,19 @@ impl BsChannelScheduler {
                         mac_block: stch_buf,
                         scrambling_code: self.scrambling_code,
                     }),
-                    blk2: Some(TmvUnitdataReq {
-                        logical_channel: LogicalChannel::TchS,
-                        mac_block: tch_buf,
-                        scrambling_code: self.scrambling_code,
+                    // Both halves stolen: the second carries the MAC-END and this slot's voice
+                    // frame is not sent.
+                    blk2: Some(match second_stch_opt {
+                        Some(second) => TmvUnitdataReq {
+                            logical_channel: LogicalChannel::Stch,
+                            mac_block: second,
+                            scrambling_code: self.scrambling_code,
+                        },
+                        None => TmvUnitdataReq {
+                            logical_channel: LogicalChannel::TchS,
+                            mac_block: tch_buf,
+                            scrambling_code: self.scrambling_code,
+                        },
                     }),
                     bbk: None,
                     ul_phy_chan: ul_phy,

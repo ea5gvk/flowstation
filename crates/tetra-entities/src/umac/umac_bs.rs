@@ -14,6 +14,7 @@ use tetra_pdus::umac::fields::sysinfo_default_def_for_access_code_a::SysinfoDefa
 use tetra_pdus::umac::fields::sysinfo_ext_services::SysinfoExtendedServices;
 use tetra_pdus::umac::pdus::mac_access::MacAccess;
 use tetra_pdus::umac::pdus::mac_data::MacData;
+use tetra_pdus::umac::pdus::mac_end_dl::MacEndDl;
 use tetra_pdus::umac::pdus::mac_end_hu::MacEndHu;
 use tetra_pdus::umac::pdus::mac_end_ul::MacEndUl;
 use tetra_pdus::umac::pdus::mac_frag_ul::MacFragUl;
@@ -1500,6 +1501,18 @@ impl UmacBs {
             .dl_enqueue_tma_for_link(prim.link_id, pdu, sdu, prim.tx_reporter);
     }
 
+    /// Whether a MAC-RESOURCE header of `hdr_len` bits plus a TM-SDU of `sdu_len` bits fits in the
+    /// two halves of one stolen slot: the MAC-RESOURCE fills the first 124-bit STCH block and the
+    /// rest must fit, octet-aligned, in a MAC-END in the second - the rule `BsFragger` applies.
+    fn fits_two_stolen_halves(hdr_len: usize, sdu_len: usize) -> bool {
+        const STCH_CAP: usize = 124;
+        if hdr_len >= STCH_CAP {
+            return false;
+        }
+        let rest = sdu_len.saturating_sub(STCH_CAP - hdr_len);
+        (MacEndDl::compute_hdr_len(false, false) + rest).div_ceil(8) * 8 <= STCH_CAP
+    }
+
     fn rx_ul_tma_unitdata_req_carrier(&mut self, _queue: &mut MessageQueue, message: SapMsg) {
         tracing::trace!("rx_ul_tma_unitdata_req");
 
@@ -1509,6 +1522,10 @@ impl UmacBs {
         };
         let preferred_carrier = prim.carrier_num.unwrap_or_else(|| self.main_carrier());
         let mut sdu = prim.pdu;
+        // Set when a stealing request falls back to ordinary signalling because it is too long:
+        // its chan_alloc only named the traffic slot to steal on, and must not go out as a real
+        // channel allocation (it would send idle radios to that slot).
+        let mut chan_alloc_was_stealing_hint = false;
 
         if prim.stealing_permission {
             let requested_ts = prim
@@ -1555,7 +1572,12 @@ impl UmacBs {
 
                     if hdr_len + sdu_len <= STCH_CAP {
                         let mut mac_pdu = mac_pdu;
-                        let num_fill_bits = mac_pdu.update_len_and_fill_ind(sdu_len);
+                        mac_pdu.update_len_and_fill_ind(sdu_len);
+                        // Fill to the next octet only if that stays inside the block: with 121-124
+                        // bits of header + SDU the octet boundary lies past bit 124, and writing
+                        // fill bits there overran the fixed buffer and panicked (the PDU was lost).
+                        let num_fill_bits = fillbits::addition::compute_required(hdr_len + sdu_len, STCH_CAP);
+                        mac_pdu.fill_bits = num_fill_bits > 0;
                         let mut stch_block = BitBuffer::new(STCH_CAP);
                         mac_pdu.to_bitbuf(&mut stch_block);
                         sdu.seek(0);
@@ -1563,25 +1585,37 @@ impl UmacBs {
                         fillbits::addition::write(&mut stch_block, Some(num_fill_bits));
                         self.scheduler_for_mut(requested_carrier)
                             .dl_enqueue_stealing(ts, stch_block, prim.tx_reporter);
-                    } else {
-                        let mut fragger = BsFragger::new(mac_pdu, sdu, prim.tx_reporter);
-                        let mut produced = 0usize;
-                        loop {
-                            let mut stch_block = BitBuffer::new(STCH_CAP);
-                            let done = fragger.get_next_chunk(&mut stch_block);
-                            self.scheduler_for_mut(requested_carrier).dl_enqueue_stealing(ts, stch_block, None);
-                            produced += 1;
-                            if done || produced >= 32 {
-                                break;
-                            }
-                        }
+                        return;
                     }
-                    return;
+                    if Self::fits_two_stolen_halves(hdr_len, sdu_len) {
+                        // TS 100 392-2 23.4.2.1.7: no fragmentation over more than one stolen slot.
+                        // Steal both halves of this one: MAC-RESOURCE with LI=111111 in the first,
+                        // MAC-END in the second. Spreading MAC-RESOURCE/MAC-FRAG/MAC-END over the
+                        // first halves of successive slots made the radio discard the whole PDU.
+                        let mut fragger = BsFragger::new(mac_pdu, sdu, prim.tx_reporter);
+                        let mut first = BitBuffer::new(STCH_CAP);
+                        fragger.get_next_chunk(&mut first);
+                        let mut second = BitBuffer::new(STCH_CAP);
+                        if !fragger.get_next_chunk(&mut second) {
+                            tracing::error!("BUG: stolen-slot PDU did not end in the second half, dropping it");
+                            return;
+                        }
+                        self.scheduler_for_mut(requested_carrier).dl_enqueue_stealing_pair(ts, first, second);
+                        return;
+                    }
+                    // Too long for the two halves of one stolen slot: send it as ordinary
+                    // signalling below rather than as an invalid multi-slot STCH fragmentation.
+                    tracing::info!(
+                        "rx_ul_tma_unitdata_req: {} bits do not fit in one stolen slot on ts {} - sending as signalling instead",
+                        hdr_len + sdu_len,
+                        ts
+                    );
+                    chan_alloc_was_stealing_hint = true;
                 }
             }
         }
 
-        let (usage_marker, mac_chan_alloc) = if let Some(chan_alloc) = prim.chan_alloc {
+        let (usage_marker, mac_chan_alloc) = if let Some(chan_alloc) = prim.chan_alloc.filter(|_| !chan_alloc_was_stealing_hint) {
             let carrier_num = chan_alloc.carrier.unwrap_or(preferred_carrier);
             let Some(mac_chan_alloc) = self.cmce_to_mac_chanalloc(&chan_alloc, carrier_num) else {
                 if let Some(tx_reporter) = prim.tx_reporter {
