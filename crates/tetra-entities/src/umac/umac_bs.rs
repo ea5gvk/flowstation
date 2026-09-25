@@ -2148,6 +2148,7 @@ impl UmacBs {
                 ..
             } => {
                 self.scheduler_for_mut(carrier_num).set_hangtime(ts, false);
+                self.scheduler_for_mut(carrier_num).drop_queued_voice(ts);
                 self.last_ul_voice.insert((carrier_num, ts), self.dltime);
                 self.ul_signal_owner.insert((carrier_num, ts), source_issi);
             }

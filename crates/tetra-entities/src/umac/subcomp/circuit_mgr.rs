@@ -176,6 +176,15 @@ impl CircuitMgr {
         self.tx_data.get(&Self::key(carrier_num, ts)).map_or(0, VecDeque::len)
     }
 
+    /// Drop the downlink voice still queued on this carrier/timeslot; returns how many blocks.
+    pub fn drop_queued_blocks(&mut self, carrier_num: u16, ts: u8) -> usize {
+        self.tx_data.get_mut(&Self::key(carrier_num, ts)).map_or(0, |queue| {
+            let n = queue.len();
+            queue.clear();
+            n
+        })
+    }
+
     /// Take a to-be-transmitted block from the queue.
     pub fn take_block(&mut self, carrier_num: u16, ts: u8) -> Option<Vec<u8>> {
         if !self.is_active(Direction::Dl, carrier_num, ts) {

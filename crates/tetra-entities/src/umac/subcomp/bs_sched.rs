@@ -223,6 +223,22 @@ impl BsChannelScheduler {
     }
 
     /// Enter/leave hangtime for an assigned traffic timeslot.
+    /// Drop the downlink voice still queued on `ts`: a local speaker was just given the floor, so
+    /// nothing in the queue can be theirs yet. Up to MAX_QUEUED_DL_BLOCKS (240 ms) of the previous
+    /// turn used to be left behind at hangtime and played at the start of the next turn, right
+    /// after the D-TX GRANTED that named the new speaker.
+    pub fn drop_queued_voice(&mut self, ts: u8) {
+        let dropped = self.circuits.drop_queued_blocks(self.carrier_num, ts);
+        if dropped > 0 {
+            tracing::debug!(
+                "BsChannelScheduler: dropped {} queued DL voice blocks of the previous turn on carrier={} ts {}",
+                dropped,
+                self.carrier_num,
+                ts
+            );
+        }
+    }
+
     pub fn set_hangtime(&mut self, ts: u8, active: bool) {
         if !(1..=4).contains(&ts) {
             tracing::warn!("BsChannelScheduler::set_hangtime: invalid ts {}", ts);
