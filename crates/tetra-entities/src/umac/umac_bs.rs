@@ -1431,7 +1431,7 @@ impl UmacBs {
                             stch_block.get_len()
                         );
 
-                        self.channel_scheduler.dl_enqueue_stealing(ts, stch_block, prim.tx_reporter);
+                        self.channel_scheduler.dl_enqueue_stealing(ts, stch_block, prim.tx_reporter, false);
                     } else {
                         // Larger than one stolen half-slot: fragment across consecutive stolen
                         // half-slots (panic-safe — a fixed 124-bit buffer used to overflow here and
@@ -1444,7 +1444,7 @@ impl UmacBs {
                         loop {
                             let mut stch_block = BitBuffer::new(STCH_CAP);
                             let done = fragger.get_next_chunk(&mut stch_block);
-                            self.channel_scheduler.dl_enqueue_stealing(ts, stch_block, None);
+                            self.channel_scheduler.dl_enqueue_stealing(ts, stch_block, None, false);
                             produced += 1;
                             if done || produced >= 32 {
                                 break;
@@ -1556,6 +1556,8 @@ impl UmacBs {
                     let has_pending_ra = self
                         .scheduler_for_mut(requested_carrier)
                         .take_pending_ra_ack(ts, prim.main_address.ssi);
+                    // The MS transmitting on this slot listens only in its monitoring-pattern frames.
+                    let to_talker = self.ul_signal_owner.get(&(requested_carrier, ts)) == Some(&prim.main_address.ssi);
                     let mac_pdu = MacResource {
                         fill_bits: false,
                         pos_of_grant: 0,
@@ -1588,7 +1590,7 @@ impl UmacBs {
                         stch_block.copy_bits(&mut sdu, sdu_len);
                         fillbits::addition::write(&mut stch_block, Some(num_fill_bits));
                         self.scheduler_for_mut(requested_carrier)
-                            .dl_enqueue_stealing(ts, stch_block, prim.tx_reporter);
+                            .dl_enqueue_stealing(ts, stch_block, prim.tx_reporter, to_talker);
                         return;
                     }
                     if Self::fits_two_stolen_halves(hdr_len, sdu_len) {
@@ -1604,7 +1606,8 @@ impl UmacBs {
                             tracing::error!("BUG: stolen-slot PDU did not end in the second half, dropping it");
                             return;
                         }
-                        self.scheduler_for_mut(requested_carrier).dl_enqueue_stealing_pair(ts, first, second);
+                        self.scheduler_for_mut(requested_carrier)
+                            .dl_enqueue_stealing_pair(ts, first, second, to_talker);
                         return;
                     }
                     // Too long for the two halves of one stolen slot: send it as ordinary

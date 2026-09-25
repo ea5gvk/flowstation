@@ -169,7 +169,9 @@ pub enum DlSchedElem {
     /// The third field, when present, is a second STCH block that steals the second half of the
     /// SAME slot: a MAC-RESOURCE with LI=111111 in the first half and its MAC-END in the second,
     /// the only fragmentation TS 100 392-2 23.4.2.1.7 allows on stolen slots.
-    Stealing(BitBuffer, Option<TxReporter>, Option<BitBuffer>),
+    /// The fourth field is set when the PDU is for the MS transmitting on the slot: it listens
+    /// only to the frames of its monitoring pattern (9.6), so the block waits for one of them.
+    Stealing(BitBuffer, Option<TxReporter>, Option<BitBuffer>, bool),
 }
 
 const EMPTY_SCHED_ELEM: TimeslotSchedule = TimeslotSchedule {
@@ -848,22 +850,23 @@ impl BsChannelScheduler {
     }
 
     /// Enqueue a pre-built STCH block for FACCH/stealing on a traffic timeslot.
-    /// The block must be 124 type1 bits containing MAC-U-SIGNAL header + TM-SDU.
-    pub fn dl_enqueue_stealing(&mut self, ts: u8, block: BitBuffer, tx_reporter: Option<TxReporter>) {
+    /// The block must be 124 type1 bits containing MAC-U-SIGNAL header + TM-SDU. `to_talker` marks
+    /// a PDU for the MS transmitting on `ts`, sent only in the frames it monitors.
+    pub fn dl_enqueue_stealing(&mut self, ts: u8, block: BitBuffer, tx_reporter: Option<TxReporter>, to_talker: bool) {
         tracing::info!("dl_enqueue_stealing: ts {} enqueueing STCH block ({} bits)", ts, block.get_len());
-        self.dltx_queues[ts as usize - 1].push(DlSchedElem::Stealing(block, tx_reporter, None));
+        self.dltx_queues[ts as usize - 1].push(DlSchedElem::Stealing(block, tx_reporter, None, to_talker));
     }
 
     /// Enqueue two STCH blocks that steal both halves of one traffic slot: a MAC-RESOURCE that
     /// starts fragmentation (LI=111111) and its MAC-END.
-    pub fn dl_enqueue_stealing_pair(&mut self, ts: u8, first: BitBuffer, second: BitBuffer) {
+    pub fn dl_enqueue_stealing_pair(&mut self, ts: u8, first: BitBuffer, second: BitBuffer, to_talker: bool) {
         tracing::info!(
             "dl_enqueue_stealing: ts {} enqueueing both halves of one slot ({} + {} bits)",
             ts,
             first.get_len(),
             second.get_len()
         );
-        self.dltx_queues[ts as usize - 1].push(DlSchedElem::Stealing(first, None, Some(second)));
+        self.dltx_queues[ts as usize - 1].push(DlSchedElem::Stealing(first, None, Some(second), to_talker));
     }
 
     fn dl_enqueue_tma_frag_next_frame(&mut self, fragger: BsFragger) {
@@ -1200,7 +1203,7 @@ impl BsChannelScheduler {
                             buf_opt = Some(buf);
                         }
 
-                        DlSchedElem::Stealing(_, tx_reporter, _) => {
+                        DlSchedElem::Stealing(_, tx_reporter, _, _) => {
                             // Stealing items should only appear on traffic timeslots; discard if found here
                             tracing::warn!(
                                 "dl_build_block_from_signalling_schedule: Stealing item found on non-traffic ts {}, discarding",
@@ -1272,12 +1275,18 @@ impl BsChannelScheduler {
             BitBuffer::new(TCH_S_CAP)
         };
 
-        // Check for FACCH/stealing: take a queued Stealing item (highest priority signaling)
+        // Check for FACCH/stealing: take a queued Stealing item (highest priority signaling). The
+        // talker was given monitoring pattern 1, so it listens to the downlink only in frames
+        // with MN mod 3 = FN mod 3 (TS 100 392-2 9.6, equation 9.22): a PDU for it waits for one.
+        let talker_listens = ts.m % 3 == ts.f % 3;
         let (stch_opt, tx_reporter_opt, second_stch) = {
             let q = &mut self.dltx_queues[ts.t as usize - 1];
-            if let Some(i) = q.iter().position(|e| matches!(e, DlSchedElem::Stealing(..))) {
+            if let Some(i) = q
+                .iter()
+                .position(|e| matches!(e, DlSchedElem::Stealing(_, _, _, to_talker) if !*to_talker || talker_listens))
+            {
                 match q.remove(i) {
-                    DlSchedElem::Stealing(buf, tx_reporter, second) => (Some(buf), tx_reporter, second),
+                    DlSchedElem::Stealing(buf, tx_reporter, second, _) => (Some(buf), tx_reporter, second),
                     _ => unreachable!(),
                 }
             } else {
@@ -1286,7 +1295,8 @@ impl BsChannelScheduler {
         };
 
         // Warn about other queued signaling that can't be sent via stealing yet
-        if stch_opt.is_none() && !self.dltx_queues[ts.t as usize - 1].is_empty() {
+        let q = &self.dltx_queues[ts.t as usize - 1];
+        if stch_opt.is_none() && !q.is_empty() && !q.iter().any(|e| matches!(e, DlSchedElem::Stealing(..))) {
             tracing::warn!("dl_build_traffic_block: queued signaling on ts {} but no stealing item", ts.t);
         }
 
@@ -2123,7 +2133,7 @@ mod tests {
         let mut sched = get_testing_secondary_scheduler();
         sched.create_circuit(Direction::Dl, test_circuit_on_carrier(Direction::Dl, 1002, 2));
         sched.set_dl_time(TdmaTime { t: 1, f: 1, m: 1, h: 0 });
-        sched.dl_enqueue_stealing(2, BitBuffer::new(124), None);
+        sched.dl_enqueue_stealing(2, BitBuffer::new(124), None, false);
 
         let slot = sched.finalize_secondary_ts_for_tick().expect("secondary should emit");
 
@@ -2154,7 +2164,7 @@ mod tests {
         let mut sched = get_testing_secondary_scheduler();
         sched.create_circuit(Direction::Dl, test_circuit_on_carrier(Direction::Dl, 1002, 1));
         sched.set_dl_time(TdmaTime { t: 4, f: 1, m: 1, h: 0 });
-        sched.dl_enqueue_stealing(1, BitBuffer::new(124), None);
+        sched.dl_enqueue_stealing(1, BitBuffer::new(124), None, false);
 
         let slot = sched.finalize_secondary_ts_for_tick().expect("secondary should emit");
 
@@ -2331,7 +2341,7 @@ mod tests {
     fn test_non_traffic_stealing_is_discarded() {
         let mut sched = get_testing_slotter();
 
-        sched.dl_enqueue_stealing(2, BitBuffer::new(124), None);
+        sched.dl_enqueue_stealing(2, BitBuffer::new(124), None, false);
         assert!(sched.has_pending_stealing(2));
 
         assert!(
@@ -2342,11 +2352,31 @@ mod tests {
         assert!(!sched.has_pending_stealing(2));
     }
 
+    /// A stolen PDU for the MS transmitting on the slot goes out only in a frame of monitoring
+    /// pattern 1, MN mod 3 = FN mod 3 (TS 100 392-2 9.6); one for any other MS goes out at once.
+    #[test]
+    fn test_stealing_for_the_talker_waits_for_its_monitoring_frame() {
+        let mut sched = get_testing_slotter();
+
+        sched.dl_enqueue_stealing(2, BitBuffer::new(124), None, true);
+        // Multiframe 1, frame 2: not a pattern-1 frame (MN mod 3 = 1, FN mod 3 = 2).
+        let (_, stch, _) = sched.dl_build_traffic_block(TdmaTime { t: 2, f: 2, m: 1, h: 0 });
+        assert!(stch.is_none(), "the talker does not listen in this frame");
+        assert!(sched.has_pending_stealing(2));
+        // Multiframe 1, frame 4: a pattern-1 frame.
+        let (_, stch, _) = sched.dl_build_traffic_block(TdmaTime { t: 2, f: 4, m: 1, h: 0 });
+        assert!(stch.is_some(), "the talker listens in this frame");
+
+        sched.dl_enqueue_stealing(2, BitBuffer::new(124), None, false);
+        let (_, stch, _) = sched.dl_build_traffic_block(TdmaTime { t: 2, f: 5, m: 1, h: 0 });
+        assert!(stch.is_some(), "a PDU for another MS is not held back");
+    }
+
     #[test]
     fn test_frame_18_keeps_stealing_queued() {
         let mut sched = get_testing_slotter();
 
-        sched.dl_enqueue_stealing(2, BitBuffer::new(124), None);
+        sched.dl_enqueue_stealing(2, BitBuffer::new(124), None, false);
         assert!(sched.has_pending_stealing(2));
 
         assert!(
