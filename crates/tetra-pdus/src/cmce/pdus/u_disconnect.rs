@@ -39,7 +39,7 @@ impl UDisconnect {
         })?;
 
         // obit designates presence of any further type2, type3 or type4 fields
-        let mut obit = delimiters::read_obit(buffer)?;
+        let obit = delimiters::read_obit(buffer)?;
 
         // Type3
         let facility = typed::parse_type3_generic(obit, buffer, CmceType3ElemId::Facility)?;
@@ -47,11 +47,9 @@ impl UDisconnect {
         // Type3
         let proprietary = typed::parse_type3_generic(obit, buffer, CmceType3ElemId::Proprietary)?;
 
-        // Read trailing mbit (if not previously encountered)
-        obit = if obit { buffer.read_field(1, "trailing_obit")? == 1 } else { obit };
-        if obit {
-            return Err(PduParseErr::InvalidTrailingMbitValue);
-        }
+        // Any type 3/4 element this parser does not decode (a second Facility, a newer one) is
+        // skipped by its length instead of failing the whole PDU (Annex E.1.1 NOTE 6).
+        typed::skip_remaining_type34(obit, buffer)?;
 
         Ok(UDisconnect {
             call_identifier,

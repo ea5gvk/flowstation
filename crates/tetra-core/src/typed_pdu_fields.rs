@@ -195,6 +195,33 @@ pub mod typed {
         }
     }
 
+    /// Consume the trailing M-bit of a PDU's optional part, skipping every type 3/4 element that
+    /// follows it and that the parser did not decode (a repeated Facility, an element newer than
+    /// this parser, one it does not list). TS 100 392-2 Annex E.1.1 NOTE 6: the decoder can pass
+    /// unknown type 3/4 elements because their length is in the PDU. Failing the whole PDU on them
+    /// dropped a valid U-SETUP, U-TX DEMAND or U-DISCONNECT without any answer.
+    pub fn skip_remaining_type34(obit: bool, buffer: &mut BitBuffer) -> Result<(), PduParseErr> {
+        if !obit {
+            return Ok(());
+        }
+        while buffer.read_field(1, "trailing_mbit")? == 1 {
+            let id = buffer.read_field(4, "type34_element_id")?;
+            let len_bits = buffer.read_field(11, "type34_length_indicator")? as usize;
+            if len_bits > buffer.get_len_remaining() {
+                return Err(PduParseErr::BufferEnded {
+                    field: Some("skip_remaining_type34 data"),
+                });
+            }
+            tracing::debug!(
+                "skipping type 3/4 element id {} ({} bits) this parser does not decode",
+                id,
+                len_bits
+            );
+            buffer.seek_rel(len_bits as isize);
+        }
+        Ok(())
+    }
+
     /// Parse type3 field into a placeholder struct, pending implementation.
     /// Checks whether a given type3 field identifier is present. If not, returns None without advancing
     /// the bitbuffer position. If present, reads the element and returns it as a u64, advancing the buffer position.
@@ -680,9 +707,33 @@ pub mod typed {
 
 #[cfg(test)]
 mod tests {
-    use super::typed::{parse_type3_generic, parse_type4_generic};
+    use super::typed::{parse_type3_generic, parse_type4_generic, skip_remaining_type34};
     use super::{Type3FieldGeneric, Type4FieldGeneric};
     use crate::{bitbuffer::BitBuffer, pdu_parse_error::PduParseErr};
+
+    /// Elements a parser does not decode - here a type 3 (id 7, 5 bits) and a type 4 (id 3, one
+    /// 4-bit element: LI = 6-bit count + 4) - are skipped up to the final M-bit 0.
+    #[test]
+    fn test_skip_remaining_type34_passes_unknown_elements() {
+        let mut buf = BitBuffer::from_bitstr(&format!(
+            concat!(
+                "1{:04b}{:011b}10110",      // type 3
+                "1{:04b}{:011b}{:06b}1001", // type 4
+                "0",                        // no more elements
+                "1",                        // next field
+            ),
+            7, 5, 3, 10, 1
+        ));
+        assert_eq!(skip_remaining_type34(true, &mut buf), Ok(()));
+        assert_eq!(buf.get_len_remaining(), 1);
+        // Without optional elements there is nothing to consume.
+        let mut empty = BitBuffer::from_bitstr("1");
+        assert_eq!(skip_remaining_type34(false, &mut empty), Ok(()));
+        assert_eq!(empty.get_len_remaining(), 1);
+        // A length running past the PDU is an error, not a panic.
+        let mut short = BitBuffer::from_bitstr(&format!("1{:04b}{:011b}10", 7, 40));
+        assert!(skip_remaining_type34(true, &mut short).is_err());
+    }
 
     /// Build a Type-3 element on the wire: m-bit + 4-bit id + 11-bit length + payload
     fn type3_elem(id: u64, len_bits: usize, payload: &str) -> BitBuffer {
