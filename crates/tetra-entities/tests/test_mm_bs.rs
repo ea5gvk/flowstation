@@ -33,6 +33,11 @@ fn register_terminal(test: &mut ComponentTest, issi: u32) {
 /// Submit a U-LOCATION-UPDATE-DEMAND of `lu_type` as if it arrived from `issi` on L2 `handle`.
 /// The handle is what a teardown is bound to, so tests can forge a mismatched L2 context.
 fn submit_location_update(test: &mut ComponentTest, issi: u32, handle: u32, lu_type: LocationUpdateType) {
+    submit_location_update_with_mni(test, issi, handle, lu_type, None);
+}
+
+/// As [`submit_location_update`], with the terminal's MNI in the address extension.
+fn submit_location_update_with_mni(test: &mut ComponentTest, issi: u32, handle: u32, lu_type: LocationUpdateType, mni: Option<u64>) {
     let demand = ULocationUpdateDemand {
         location_update_type: lu_type,
         request_to_append_la: false,
@@ -42,7 +47,7 @@ fn submit_location_update(test: &mut ComponentTest, issi: u32, handle: u32, lu_t
         energy_saving_mode: None,
         la_information: None,
         ssi: Some(issi as u64),
-        address_extension: None,
+        address_extension: mni,
         group_identity_location_demand: None,
         group_report_response: None,
         authentication_uplink: None,
@@ -454,6 +459,64 @@ fn test_migration_reject_keeps_migration_cause() {
         cause,
         tetra_pdus::mm::enums::reject_cause::RejectCause::MigrationNotSupported as u8
     );
+}
+
+/// TS 100 392-2 16.4.1.1 case c): one of our own terminals migrating back from another network
+/// names this cell's MNI in its migrating update. That is a normal registration - accepted, with
+/// accept type 5 ("migrating or service restoration migrating") - not a "migration not supported".
+/// A foreign MNI is still case b): rejected, addressed to the USSI.
+#[test]
+fn test_migrating_back_home_is_registered_and_foreign_migration_rejected() {
+    debug::setup_logging_verbose();
+    const HOME_RETURNER: u32 = 2260811;
+    const FOREIGNER: u32 = 2260812;
+    // The test cell is MCC 204, MNC 1337: MCC in the top 10 bits, MNC in the low 14.
+    const CELL_MNI: u64 = (204 << 14) | 1337;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+    let mm = MmBs::new(test.get_shared_config(), None, None);
+    test.register_entity(mm);
+
+    submit_location_update_with_mni(
+        &mut test,
+        HOME_RETURNER,
+        0,
+        LocationUpdateType::MigratingLocationUpdating,
+        Some(CELL_MNI),
+    );
+    let msgs = test.dump_sinks();
+    assert!(
+        find_location_update_reject(&msgs).is_none(),
+        "a terminal returning home must not be rejected"
+    );
+    let want = MmPduTypeDl::DLocationUpdateAccept.into_raw();
+    let accept_type = msgs.iter().find_map(|m| match &m.msg {
+        SapMsgInner::LmmMleUnitdataReq(req) if req.address.ssi == HOME_RETURNER => {
+            let mut sdu = BitBuffer::from_bitstr(&req.sdu.to_bitstr());
+            (sdu.read_field(4, "pdu_type").ok()? == want).then(|| sdu.read_field(3, "accept_type").ok())?
+        }
+        _ => None,
+    });
+    assert_eq!(accept_type, Some(5), "accepted as a migrating registration");
+    assert!(test.config.state_read().subscribers.is_registered(HOME_RETURNER));
+
+    submit_location_update_with_mni(
+        &mut test,
+        FOREIGNER,
+        0,
+        LocationUpdateType::MigratingLocationUpdating,
+        Some((214 << 14) | 1),
+    );
+    let msgs = test.dump_sinks();
+    let (issi, cause) = find_location_update_reject(&msgs).expect("a foreign migrating terminal is rejected");
+    assert_eq!(issi, FOREIGNER);
+    assert_eq!(cause, tetra_pdus::mm::enums::reject_cause::RejectCause::MigrationNotSupported as u8);
+    let reject_addr_type = msgs.iter().find_map(|m| match &m.msg {
+        SapMsgInner::LmmMleUnitdataReq(req) if req.address.ssi == FOREIGNER => Some(req.address.ssi_type),
+        _ => None,
+    });
+    assert_eq!(reject_addr_type, Some(SsiType::Ussi), "case b) REJECT goes to the USSI");
 }
 
 /// SHIP-BLOCKER regression: the client registry must stay bounded under an RF-unauthenticated

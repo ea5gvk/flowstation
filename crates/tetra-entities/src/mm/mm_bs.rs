@@ -7,7 +7,7 @@ use crate::net_telemetry::channel::TelemetrySink;
 use crate::{MessageQueue, TetraEntityTrait, net_brew};
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, Layer2Service, Sap, TdmaTime, TetraAddress, unimplemented_log};
+use tetra_core::{BitBuffer, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress, unimplemented_log};
 use tetra_saps::control::brew::{BrewSubscriberAction, MmSubscriberUpdate};
 use tetra_saps::lmm::LmmMleUnitdataReq;
 use tetra_saps::{SapMsg, SapMsgInner};
@@ -505,12 +505,21 @@ impl MmBs {
         // isn't replayed to forever. No-op when recovery is disabled / ISSI not pending.
         self.recovery_confirm(issi);
 
+        // A migrating update whose MNI (address extension) is this cell's own MCC/MNC is TS 100 392-2
+        // 16.4.1.1 case c): one of our own terminals coming back from another network. That is a
+        // normal registration and goes on below. It used to be rejected like a foreign terminal,
+        // and after N351 (4) such rejections the radio gives up on the network until power-cycled.
+        let is_migrating = pdu.location_update_type == LocationUpdateType::MigratingLocationUpdating
+            || pdu.location_update_type == LocationUpdateType::ServiceRestorationMigratingLocationUpdating;
+        let returning_home = is_migrating && pdu.address_extension == Some(self.cell_mni());
+        if returning_home {
+            tracing::info!("MM: ISSI {} migrating back to its home network (case c) — registering it", issi);
+        }
+
         // Migration not supported: ETSI 16.4.1.1 case b) requires identity exchange via
         // D-LOCATION-UPDATE-PROCEEDING which we don't implement. Reject with cause
         // "Migration not supported" (12, Table 16.81) so the MS can act on it.
-        if pdu.location_update_type == LocationUpdateType::MigratingLocationUpdating
-            || pdu.location_update_type == LocationUpdateType::ServiceRestorationMigratingLocationUpdating
-        {
+        if is_migrating && !returning_home {
             // Terminal wants to migrate to another network (e.g. SmartConnect).
             // We don't implement D-LOCATION-UPDATE-PROCEEDING identity exchange (ETSI Â§16.4.1.1 case b),
             // so we can't accept migration formally. But we MUST release the terminal from Brew
@@ -814,7 +823,13 @@ impl MmBs {
         // D-LOCATION-UPDATE-COMMAND at T351 expiry (see tick_start), which is what the terminals
         // in the field actually respond to.
         let periodic_secs = self.config.config().cell.periodic_registration_secs;
-        let accept_type = if periodic_secs > 0 && pdu.location_update_type != LocationUpdateType::ItsiAttach {
+        let accept_type = if is_migrating {
+            // Case c) accept. The accept-type field is its own table (16.10.35a, table 16.68): 5 is "migrating or
+            // service restoration migrating location updating", while 1 there would mean
+            // "temporary registration". This field reuses the demand's enum, whose value 5 is
+            // ServiceRestorationMigratingLocationUpdating - the same bits on the air.
+            LocationUpdateType::ServiceRestorationMigratingLocationUpdating
+        } else if periodic_secs > 0 && pdu.location_update_type != LocationUpdateType::ItsiAttach {
             LocationUpdateType::PeriodicLocationUpdating
         } else {
             pdu.location_update_type
@@ -1868,7 +1883,8 @@ impl MmBs {
     /// Sends a D-LOCATION UPDATE REJECT PDU (ETSI clause 16.9.2.9) with cause "Migration not
     /// supported". Only for the genuine migration path â€” an access-control refusal must carry an
     /// access-control cause instead (see `send_d_location_update_reject_cause`), or a barred radio
-    /// is told to go find another network.
+    /// is told to go find another network. Addressed to the USSI at layer 2, as 16.4.1.1 case b)
+    /// requires of this REJECT.
     fn send_d_location_update_reject_migration(
         queue: &mut MessageQueue,
         issi: u32,
@@ -1876,9 +1892,9 @@ impl MmBs {
         location_update_type: LocationUpdateType,
         address_extension: Option<u64>,
     ) {
-        Self::send_d_location_update_reject_cause(
+        Self::send_d_location_update_reject_to(
             queue,
-            issi,
+            TetraAddress::new(issi, SsiType::Ussi),
             handle,
             location_update_type,
             address_extension,
@@ -1886,9 +1902,33 @@ impl MmBs {
         )
     }
 
+    /// This cell's MNI as the 24-bit address extension carries it: MCC (10 bits) then MNC (14 bits).
+    fn cell_mni(&self) -> u64 {
+        let net = &self.config.config().net;
+        ((net.mcc as u64 & 0x3FF) << 14) | (net.mnc as u64 & 0x3FFF)
+    }
+
     fn send_d_location_update_reject_cause(
         queue: &mut MessageQueue,
         issi: u32,
+        handle: u32,
+        location_update_type: LocationUpdateType,
+        address_extension: Option<u64>,
+        reject_cause: RejectCause,
+    ) {
+        Self::send_d_location_update_reject_to(
+            queue,
+            TetraAddress::issi(issi),
+            handle,
+            location_update_type,
+            address_extension,
+            reject_cause,
+        )
+    }
+
+    fn send_d_location_update_reject_to(
+        queue: &mut MessageQueue,
+        address: TetraAddress,
         handle: u32,
         location_update_type: LocationUpdateType,
         address_extension: Option<u64>,
@@ -1916,7 +1956,7 @@ impl MmBs {
             msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
                 sdu,
                 handle,
-                address: TetraAddress::issi(issi),
+                address,
                 layer2service: Layer2Service::Acknowledged,
                 stealing_permission: false,
                 stealing_repeats_flag: false,
@@ -1999,9 +2039,9 @@ impl MmBs {
 
     fn feature_check_u_location_update_demand(pdu: &ULocationUpdateDemand) -> bool {
         let mut supported = true;
-        if pdu.location_update_type == LocationUpdateType::MigratingLocationUpdating
-            || pdu.location_update_type == LocationUpdateType::DisabledMsUpdating
-        {
+        // A migrating update only gets this far when it is case c) (returning home), which is a
+        // normal registration; case b) was rejected earlier.
+        if pdu.location_update_type == LocationUpdateType::DisabledMsUpdating {
             unimplemented_log!("Unsupported {}", pdu.location_update_type);
             supported = false;
         }
