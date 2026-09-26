@@ -587,3 +587,5 @@ Available at `http://<bts-ip>:8080` when `[dashboard]` is configured.
 ## License
 
 Apache 2.0 — see [LICENSE](LICENSE)
+
+Exceptions: the few files whose SPDX header names `PolyForm-Noncommercial-1.0.0` come from [Nexus-BS](https://github.com/invictus737/nexus-bs) and are used with the permission of Chris YO3TCO. They are for noncommercial use only (PolyForm Noncommercial 1.0.0, text in [LICENSES/](LICENSES/PolyForm-Noncommercial-1.0.0.txt)); see [NOTICE](NOTICE) for the list and the credits.

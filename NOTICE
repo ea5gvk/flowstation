@@ -1,0 +1,44 @@
+FlowStation
+===========
+
+FlowStation is licensed under the Apache License 2.0 (see `LICENSE`), except
+for the files listed below, which carry their own SPDX license headers.
+
+Nexus-BS components
+-------------------
+
+Required Notice: Copyright (c) Chris YO3TCO / Nexus-BS Project.
+
+The files below were copied or adapted from Nexus-BS
+(https://github.com/invictus737/nexus-bs) with the permission of Chris YO3TCO.
+They keep their original SPDX headers and are licensed under the PolyForm
+Noncommercial License 1.0.0, alone or as `Apache-2.0 AND
+PolyForm-Noncommercial-1.0.0`: they may be used for noncommercial purposes
+only. The license text is in `LICENSES/PolyForm-Noncommercial-1.0.0.txt` and
+the Nexus-BS change notice in `CHANGES-NEXUS.md`. A binary built from this
+repository includes them.
+
+Parrot (private echo service):
+- crates/tetra-entities/src/cmce/subentities/cc_bs/parrot.rs
+- crates/tetra-entities/tests/test_parrot_bs.rs
+
+Nexus-BS credits (from the Nexus-BS NOTICE):
+- BlueStation Project for historical TETRA BS foundation and
+  protocol-structure contributions:
+  https://github.com/MidnightBlueLabs/tetra-bluestation
+- FlowStation Project for historical field-feature, dashboard, integration,
+  and deployment-hardening lineage:
+  https://github.com/razvanzeces/flowstation
+- Mihajlo YU4MSH and the misadeks/tetra-bluestation fork for BlueStation fork
+  work, FDX P2P direction, and field-behavior contributions:
+  https://github.com/misadeks/tetra-bluestation
+- Harald Welte and the osmocom team for foundational osmocom-tetra work:
+  https://osmocom.org/projects/tetra/wiki
+- Tatu Peltola for his SXCEIVER project:
+  https://sxceiver.com/
+- Stichting NLnet for partial funding through the RETETRA3 grant:
+  https://nlnet.nl/
+- Dennis DB2OE for dashboard-theme inspiration.
+- Historical, fork, testing, documentation, hardware, dashboard, integration,
+  and operator-community contributors, including ON6RF, EA7KEN, BU2GQ,
+  DK5RTA, DO5MF, ES4TIX, and others.

@@ -54,6 +54,9 @@ assets = [
     ["target/release/bluestation-bs", "usr/bin/bluestation-bs", "755"],
     ["../../example_config/config.toml", "etc/flowstation/config.toml", "644"],
     ["../../README.md", "usr/share/doc/flowstation/README.md", "644"],
+    ["../../NOTICE", "usr/share/doc/flowstation/NOTICE", "644"],
+    ["../../CHANGES-NEXUS.md", "usr/share/doc/flowstation/CHANGES-NEXUS.md", "644"],
+    ["../../LICENSES/PolyForm-Noncommercial-1.0.0.txt", "usr/share/doc/flowstation/PolyForm-Noncommercial-1.0.0.txt", "644"],
 ]
 
 [package.metadata.deb.systemd-units]
