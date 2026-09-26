@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Chris YO3TCO / Nexus-BS Project
 // SPDX-License-Identifier: Apache-2.0 AND PolyForm-Noncommercial-1.0.0
 // SPDX-FileComment: Modified by Nexus-BS Project; see CHANGES-NEXUS.md for change notices.
-// SPDX-FileComment: Adapted for flowstation-miura (carrier_num, configurable ISSI and recording limit) by EA5GVK.
+// SPDX-FileComment: Adapted for flowstation-miura (carrier_num, configurable ISSI and recording limit, repeated U-SETUP) by EA5GVK.
 
 //! Local Parrot/Papagal simplex test service — `parrot_issi` (default 99999).
 //!
@@ -242,6 +242,22 @@ impl CcBsSubentity {
             return;
         }
         if let Some((call_id, state)) = self.find_individual_call_by_issi(calling_party.ssi) {
+            // The LLC hands up every retransmitted BL-DATA, so a lost BL-ACK brings the same
+            // U-SETUP again. Like a group late entry, answer it with the session's D-CONNECT.
+            let own_session = self
+                .parrot_session
+                .as_ref()
+                .is_some_and(|session| session.call_id() == call_id && session.state() == ParrotState::Recording);
+            if let Some(call) = self.individual_calls.get(&call_id).filter(|_| own_session) {
+                let (carrier_num, ts, usage) = (call.calling_carrier_num, call.calling_ts, call.calling_usage);
+                tracing::info!(
+                    "CMCE: parrot: repeated U-SETUP from ISSI {} for its own call_id={}, repeating D-CONNECT",
+                    calling_party.ssi,
+                    call_id
+                );
+                self.send_parrot_d_connect(queue, prim, pdu, calling_party, call_id, carrier_num, ts, usage);
+                return;
+            }
             tracing::info!(
                 "CMCE: parrot: ISSI {} already in individual call_id={} state={:?}",
                 calling_party.ssi,
@@ -358,7 +374,38 @@ impl CcBsSubentity {
 
         // Keep the caller's hook method, so the answer is not shown as a modified call.
         self.send_d_call_proceeding(queue, message, pdu, call_id, CallTimeoutSetupPhase::T10s, pdu.hook_method_selection);
+        self.send_parrot_d_connect(queue, prim, pdu, calling_party, call_id, carrier_num, ts, usage);
 
+        self.parrot_session = Some(ParrotSession::new(carrier_num, ts, call_id, calling_party, parrot_issi, max_secs));
+
+        // notify_umac = true arms the UL inactivity timer: a caller who never talks is released.
+        self.notify_floor_granted(
+            queue,
+            GroupFloorGrant {
+                call_id,
+                source_issi: calling_party.ssi,
+                dest_gssi: parrot_issi,
+                carrier_num,
+                ts,
+                is_group: false,
+            },
+            true,
+            BrewNotification::Never,
+        );
+    }
+
+    /// D-CONNECT (floor granted to the caller) with the channel allocation of the parrot circuit.
+    fn send_parrot_d_connect(
+        &self,
+        queue: &mut MessageQueue,
+        prim: &LcmcMleUnitdataInd,
+        pdu: &USetup,
+        calling_party: TetraAddress,
+        call_id: u16,
+        carrier_num: u16,
+        ts: u8,
+        usage: u8,
+    ) {
         let d_connect = DConnect {
             call_identifier: call_id,
             call_time_out: Self::p2p_call_timeout(false),
@@ -406,23 +453,6 @@ impl CcBsSubentity {
                 tx_reporter: None,
             }),
         });
-
-        self.parrot_session = Some(ParrotSession::new(carrier_num, ts, call_id, calling_party, parrot_issi, max_secs));
-
-        // notify_umac = true arms the UL inactivity timer: a caller who never talks is released.
-        self.notify_floor_granted(
-            queue,
-            GroupFloorGrant {
-                call_id,
-                source_issi: calling_party.ssi,
-                dest_gssi: parrot_issi,
-                carrier_num,
-                ts,
-                is_group: false,
-            },
-            true,
-            BrewNotification::Never,
-        );
     }
 
     fn parrot_reject_setup(

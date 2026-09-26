@@ -377,6 +377,40 @@ fn test_parrot_second_caller_gets_busy() {
     assert!(opened_circuits(&msgs).is_empty());
 }
 
+/// A lost BL-ACK brings the caller's U-SETUP again (the LLC hands up every copy): it gets the
+/// same call's D-CONNECT, not a D-RELEASE, and the session goes on.
+#[test]
+fn test_parrot_repeated_setup_while_recording_repeats_the_connect() {
+    debug::setup_logging_verbose();
+
+    let mut test = cmce_test(parrot_config());
+    let (call, _) = start_parrot_call(&mut test, CALLER, PARROT);
+
+    test.submit_message(u_setup_msg(CALLER, PARROT, false, false));
+    test.run_stack(Some(1));
+    let msgs = test.dump_sinks();
+
+    assert!(
+        d_releases_to(&msgs, CALLER).is_empty(),
+        "a repeated U-SETUP must not release the caller"
+    );
+    let (d_connect, connect_prim) = d_connect_to(&msgs, CALLER).expect("the repeat is answered with D-CONNECT");
+    assert_eq!(d_connect.call_identifier, call.call_id);
+    assert_eq!(d_connect.transmission_grant, TransmissionGrant::Granted);
+    let chan_alloc = connect_prim.chan_alloc.as_ref().expect("D-CONNECT carries the channel allocation");
+    assert_eq!(chan_alloc.carrier, Some(call.carrier_num));
+    assert!(chan_alloc.timeslots[call.ts as usize - 1]);
+    assert!(opened_circuits(&msgs).is_empty(), "no second circuit");
+
+    test.submit_message(ul_frame_to_cmce(call.carrier_num, call.ts, vec![0xA5; 35]));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    test.submit_message(u_tx_ceased_msg(CALLER, call.call_id));
+    let msgs = run_until_release(&mut test, CALLER, 200);
+    assert_eq!(playback_frames(&msgs), vec![(call.carrier_num, call.ts, vec![0xA5; 35])]);
+    assert_released_caller_only(&msgs, call);
+}
+
 #[test]
 fn test_parrot_rejects_a_call_from_its_own_issi() {
     debug::setup_logging_verbose();
