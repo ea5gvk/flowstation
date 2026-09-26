@@ -22,6 +22,11 @@ Parrot (private echo service):
 - crates/tetra-entities/src/cmce/subentities/cc_bs/parrot.rs
 - crates/tetra-entities/tests/test_parrot_bs.rs
 
+WAP gateway codecs (IPv4/UDP helpers, WTP/WSP parsers, status pages):
+- crates/tetra-entities/src/sndcp/ip.rs
+- crates/tetra-entities/src/sndcp/wap_ip.rs
+- crates/tetra-entities/src/sndcp/wap_status.rs
+
 Nexus-BS credits (from the Nexus-BS NOTICE):
 - BlueStation Project for historical TETRA BS foundation and
   protocol-structure contributions:
