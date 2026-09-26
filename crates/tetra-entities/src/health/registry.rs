@@ -72,6 +72,8 @@ pub struct HealthRegistry {
     start: Instant,
     /// Millis-since-`start` at the last core tick; 0 = no tick observed yet.
     last_tick_ms: AtomicU64,
+    /// Core ticks since process start (the systemd watchdog checks that it keeps moving).
+    core_ticks: AtomicU64,
     brew_configured: AtomicBool,
     brew_up: AtomicBool,
     registered_radios: AtomicUsize,
@@ -99,6 +101,7 @@ impl HealthRegistry {
         Self {
             start: Instant::now(),
             last_tick_ms: AtomicU64::new(0),
+            core_ticks: AtomicU64::new(0),
             brew_configured: AtomicBool::new(false),
             brew_up: AtomicBool::new(false),
             registered_radios: AtomicUsize::new(0),
@@ -124,6 +127,7 @@ impl HealthRegistry {
     /// Stamp a core-loop tick (called from the message router each TDMA tick).
     pub fn note_tick(&self) {
         self.last_tick_ms.store(self.now_ms().max(1), Ordering::Relaxed);
+        self.core_ticks.fetch_add(1, Ordering::Relaxed);
     }
     pub fn set_brew_configured(&self, on: bool) {
         self.brew_configured.store(on, Ordering::Relaxed);
@@ -159,6 +163,11 @@ impl HealthRegistry {
         if let Ok(mut g) = self.last_action.lock() {
             *g = Some(what);
         }
+    }
+
+    /// Core ticks since process start.
+    pub fn core_ticks(&self) -> u64 {
+        self.core_ticks.load(Ordering::Relaxed)
     }
 
     /// Millis since the last core tick. `u64::MAX`-ish handling is avoided: if no tick has been
@@ -355,5 +364,16 @@ mod tests {
         assert_eq!(effective_radios_silent_secs(7_200, 3_600), 7_200); // explicit floor wins when larger
         // 1700 s of silence with a 24 h T351 is far below the effective window → not overdue.
         assert!(1_700 < effective_radios_silent_secs(900, 86_400));
+    }
+
+    #[test]
+    fn core_ticks_count_every_tick() {
+        let reg = HealthRegistry::new();
+        assert_eq!(reg.core_ticks(), 0);
+        for _ in 0..3 {
+            reg.note_tick();
+        }
+        assert_eq!(reg.core_ticks(), 3);
+        assert!(reg.tick_age_ms() < 1_000);
     }
 }
