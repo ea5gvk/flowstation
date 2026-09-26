@@ -545,8 +545,20 @@ impl Worker {
         })
     }
 
+    /// Body of one of the weather services, downloaded like any page (network policy, redirects
+    /// checked hop by hop, size cap).
+    fn weather_body(&mut self, url: &str) -> Result<String, String> {
+        let url = Url::parse(url).map_err(|e| e.to_string())?;
+        let deadline = Instant::now() + Duration::from_secs(self.cfg.timeout_secs);
+        let dl = self.download(url, deadline).map_err(|e| e.to_string())?;
+        if !(200..300).contains(&dl.status) {
+            return Err(format!("HTTP {}", dl.status));
+        }
+        Ok(decode_body(&dl.body, &dl.content_type))
+    }
+
     /// `/wx?i=ICAO` (decoded METAR) or `/wx?l=place` (current weather), with the forms again.
-    fn weather(&self, req: &FetchRequest, query: Option<&str>) -> Page {
+    fn weather(&mut self, req: &FetchRequest, query: Option<&str>) -> Page {
         let icao = query_param(query, "i").filter(|v| !v.trim().is_empty());
         let place = query_param(query, "l").map(|l| {
             l.chars()
@@ -555,8 +567,13 @@ impl Worker {
                 .collect::<String>()
         });
         let result = match (icao, place.filter(|p| !p.trim().is_empty())) {
-            (Some(icao), _) => wx_service::fetch_metar_decoded(&icao),
-            (None, Some(place)) => wx_service::fetch_wx(place.trim()),
+            (Some(icao), _) => match wx_service::metar_url(&icao) {
+                Some(url) => self.weather_body(&url).and_then(|body| wx_service::metar_decoded_from_body(&body)),
+                None => Err("empty ICAO".to_string()),
+            },
+            (None, Some(place)) => self
+                .weather_body(&wx_service::wx_url(place.trim()))
+                .and_then(|body| wx_service::wx_from_body(&body)),
             (None, None) => Err("nothing asked".to_string()),
         };
         let text = result.unwrap_or_else(|e| {
@@ -855,6 +872,24 @@ mod tests {
             get(&mut strict, FetchTarget::Url("http://10.0.0.1/".to_string())).0.status,
             status::FORBIDDEN
         );
+    }
+
+    #[test]
+    fn weather_goes_through_the_network_policy() {
+        // Refused before any network access: the weather services are fetched like any page.
+        let cfg = CfgWapBrowse {
+            domain_denylist: vec!["wttr.in".to_string(), "aviationweather.gov".to_string()],
+            ..browse_cfg(80)
+        };
+        let mut w = worker(cfg);
+        for url in [wx_service::wx_url("Madrid"), wx_service::metar_url("LEMD").unwrap()] {
+            let err = w.weather_body(&url).unwrap_err();
+            assert!(err.starts_with("refused"), "{url}: {err}");
+        }
+        let (page, _) = get(&mut w, FetchTarget::Doc("/wx?l=Madrid".to_string()));
+        assert!(body(&page).contains("Sin datos"), "{}", body(&page));
+        assert!(wx_service::metar_decoded_from_body("\nLEMD 261200Z 18005KT CAVOK 25/10 Q1015\n").is_ok());
+        assert!(wx_service::metar_decoded_from_body("\n\n").is_err());
     }
 
     #[test]

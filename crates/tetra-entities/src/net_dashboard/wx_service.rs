@@ -15,16 +15,12 @@ const USER_AGENT: &str = "FlowStation-WX";
 /// Fetch the raw METAR string for an ICAO code (e.g. "LROP" -> "LROP 301600Z ...").
 /// Returns Err(message) on network failure or when no data is returned.
 pub fn fetch_metar_raw(icao: &str) -> Result<String, String> {
-    let icao = sanitize_icao(icao);
-    if icao.is_empty() {
-        return Err("empty ICAO".to_string());
-    }
+    let url = metar_url(icao).ok_or_else(|| "empty ICAO".to_string())?;
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(10))
         .user_agent(USER_AGENT)
         .build()
         .map_err(|e| format!("client build failed: {e}"))?;
-    let url = format!("{METAR_API}?ids={icao}&format=raw&taf=false");
     let body = client
         .get(url)
         .send()
@@ -32,6 +28,17 @@ pub fn fetch_metar_raw(icao: &str) -> Result<String, String> {
         .map_err(|e| format!("request failed: {e}"))?
         .text()
         .map_err(|e| format!("read failed: {e}"))?;
+    metar_line(&body)
+}
+
+/// URL of the raw METAR of an ICAO code; None when the code is empty.
+pub fn metar_url(icao: &str) -> Option<String> {
+    let icao = sanitize_icao(icao);
+    (!icao.is_empty()).then(|| format!("{METAR_API}?ids={icao}&format=raw&taf=false"))
+}
+
+/// The raw METAR in a reply of the METAR API.
+fn metar_line(body: &str) -> Result<String, String> {
     let line = body
         .lines()
         .find(|l| !l.trim().is_empty())
@@ -43,6 +50,11 @@ pub fn fetch_metar_raw(icao: &str) -> Result<String, String> {
 pub fn fetch_metar_decoded(icao: &str) -> Result<String, String> {
     let raw = fetch_metar_raw(icao)?;
     Ok(ascii_only(&decode_metar(&raw)))
+}
+
+/// Decode a reply of the METAR API (for a caller that downloads it itself).
+pub fn metar_decoded_from_body(body: &str) -> Result<String, String> {
+    Ok(ascii_only(&decode_metar(&metar_line(body)?)))
 }
 
 /// Keep only the leading letters/digits of an ICAO token, uppercased, max 4 chars.
@@ -293,17 +305,25 @@ pub fn fetch_wx(location: &str) -> Result<String, String> {
         .build()
         .map_err(|e| format!("client build failed: {e}"))?;
 
-    let encoded = location.replace(' ', "+");
-    // %l=location %C=condition %t=temp %f=feels %h=humidity %w=wind
-    let url = format!("https://wttr.in/{encoded}?format=%l||%C||%t||%f||%h||%w");
     let body = client
-        .get(&url)
+        .get(wx_url(location))
         .send()
         .and_then(|r| r.error_for_status())
         .map_err(|e| format!("request failed: {e}"))?
         .text()
         .map_err(|e| format!("read failed: {e}"))?;
+    wx_from_body(&body)
+}
 
+/// wttr.in URL of the current conditions at a free-text location.
+pub fn wx_url(location: &str) -> String {
+    let encoded = location.replace(' ', "+");
+    // %l=location %C=condition %t=temp %f=feels %h=humidity %w=wind
+    format!("https://wttr.in/{encoded}?format=%l||%C||%t||%f||%h||%w")
+}
+
+/// The compact, ASCII-only line for a wttr.in reply (for a caller that downloads it itself).
+pub fn wx_from_body(body: &str) -> Result<String, String> {
     let line = body
         .lines()
         .find(|l| !l.trim().is_empty())
