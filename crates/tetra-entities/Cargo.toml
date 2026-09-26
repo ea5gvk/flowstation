@@ -49,6 +49,8 @@ libc = "0.2"
 [dev-dependencies]
 # XML well-formedness checks of the WAP gateway pages.
 quick-xml = "0.37"
+# Log output of the wap_debug_gateway example.
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

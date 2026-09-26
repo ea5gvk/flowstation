@@ -1,7 +1,9 @@
+use super::wapgw::WapService;
 use crate::{MessageQueue, TetraEntityTrait};
+use std::time::Instant;
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, Sap};
+use tetra_core::{BitBuffer, Sap, TdmaTime};
 use tetra_saps::ltpd::LtpdMleUnitdataInd;
 use tetra_saps::tla::TlaTlDataReqBl;
 use tetra_saps::{SapMsg, SapMsgInner};
@@ -42,11 +44,14 @@ const PCO_CHAP_SUCCESS_BITS: u64 = 60;
 pub struct Sndcp {
     #[allow(dead_code)] // wired up when the full packet-data state machine is implemented
     config: SharedConfig,
+    /// WAP gateway, only with `[wap] enabled`.
+    wap: Option<WapService>,
 }
 
 impl Sndcp {
     pub fn new(config: SharedConfig) -> Self {
-        Self { config }
+        let wap = WapService::start(&config);
+        Self { config, wap }
     }
 
     /// Reply to an SN-ACTIVATE PDP CONTEXT DEMAND with a spec-conformant SN-ACTIVATE PDP CONTEXT
@@ -193,6 +198,12 @@ impl TetraEntityTrait for Sndcp {
         TetraEntity::Sndcp
     }
 
+    fn tick_start(&mut self, _queue: &mut MessageQueue, _ts: TdmaTime) {
+        if let Some(wap) = self.wap.as_mut() {
+            wap.tick(&self.config, Instant::now());
+        }
+    }
+
     fn rx_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
         // Decode the SN-PDU type and, for an SN-ACTIVATE PDP CONTEXT DEMAND, return an ACCEPT.
         // Never panics: a garbled PDU must not take down the stack.
@@ -269,6 +280,14 @@ mod tests {
         s.push_str("00000010"); // CHAP code = 2 (Response)
         s.push_str("00000111"); // identifier = 7
         assert_eq!(find_chap_response_id(&s), Some(7));
+    }
+
+    #[test]
+    fn shipped_config_leaves_the_wap_gateway_off() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../example_config/config.toml");
+        let cfg = tetra_config::bluestation::from_file(path).expect("example config parses");
+        let sndcp = Sndcp::new(SharedConfig::from_parts(cfg, None));
+        assert!(sndcp.wap.is_none());
     }
 
     #[test]

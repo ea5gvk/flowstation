@@ -1,6 +1,7 @@
 //! End-to-end tests: a simulated WTP initiator (the terminal) against the gateway.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::net::UdpSocket;
 
 use super::fetcher::UnavailableFetcher;
 use super::wtp::{GTR, TTR, initiator};
@@ -455,4 +456,96 @@ fn peer_lost_drops_state() {
     gw.set_path_limits(ISSI, 296);
     gw.on_peer_lost(ISSI);
     assert!(gw.sessions.is_empty() && gw.txs.is_empty() && gw.path_limits.is_empty());
+}
+
+/// Debug UDP bearer in-process: a UDP client on 127.0.0.1 against the service the SNDCP entity
+/// runs, with Connect, the home page in two groups and a lost packet recovered by a Nack.
+#[test]
+fn debug_udp_end_to_end() {
+    let toml = r#"
+config_version = "0.6"
+stack_mode = "Bs"
+
+[phy_io]
+backend = "None"
+
+[net_info]
+mcc = 901
+mnc = 9999
+
+[cell_info]
+main_carrier = 1584
+freq_band = 4
+freq_offset = 0
+duplex_spacing = 4
+reverse_operation = false
+location_area = 1
+
+[wap]
+enabled = true
+mtu = 296
+debug_udp_listen = "127.0.0.1:0"
+debug_issi = 9990
+
+[wap.wtp]
+group_size = 2
+
+[wap.browse]
+enabled = true
+allowed_issis = [9990]
+"#;
+    let config = SharedConfig::from_parts(tetra_config::bluestation::from_toml_str(toml).unwrap(), None);
+    let mut svc = WapService::start(&config).expect("[wap] enabled");
+    let addr = svc.debug_addr().expect("debug bearer running");
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    // Non-blocking: on Windows a datagram arriving as a receive timeout expires can be lost.
+    client.set_nonblocking(true).unwrap();
+
+    let mut exchange = |payload: &[u8], expect: usize| -> Vec<Vec<u8>> {
+        client.send_to(payload, addr).unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 2048];
+        let until = Instant::now() + Duration::from_secs(3);
+        while got.len() < expect && Instant::now() < until {
+            svc.tick(&config, Instant::now());
+            match client.recv_from(&mut buf) {
+                Ok((n, _)) => got.push(buf[..n].to_vec()),
+                Err(_) => std::thread::sleep(Duration::from_millis(1)),
+            }
+        }
+        got
+    };
+
+    let reply = exchange(&connect(0x13cc), 1);
+    assert_eq!(&reply[0][..4], &[0x12, 0x93, 0xcc, 0x02]);
+
+    let group = exchange(&get(0x20, "/"), 2);
+    assert_eq!(group.len(), 2);
+    assert!(group.iter().all(|p| p.len() <= 296 - 28));
+    // Packet 0 "lost": Nack it.
+    let again = exchange(&initiator::nack(0x20, &[0]), 1);
+    assert_eq!((result(&again[0]).1, result(&again[0]).3), (0, true));
+    let mut parts: BTreeMap<u8, Vec<u8>> = BTreeMap::new();
+    for p in group.iter().chain(&again) {
+        parts.insert(result(p).1, result(p).5.to_vec());
+    }
+    let mut last = result(&group[1]).1;
+    loop {
+        let next = exchange(&initiator::ack(0x20, Some(last)), 2);
+        if next.is_empty() {
+            break;
+        }
+        for p in &next {
+            parts.insert(result(p).1, result(p).5.to_vec());
+            last = result(p).1;
+        }
+        if result(next.last().unwrap()).2 == TTR {
+            exchange(&initiator::ack(0x20, Some(last)), 0);
+            break;
+        }
+    }
+    let message: Vec<u8> = parts.into_values().flatten().collect();
+    let body = String::from_utf8_lossy(&message);
+    assert!(body.contains("FlowStation") && body.contains("action=\"/go\""), "{body}");
+    assert!(body.ends_with("</html>"));
 }

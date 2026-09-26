@@ -13,6 +13,7 @@
 //! into a downlink N-PDU ([`UdpOut::to_ipv4`]), and reports a radio that deregisters or drops its
 //! PDP context (`on_peer_lost`).
 
+pub mod debug_udp;
 pub mod fetcher;
 pub mod home;
 pub mod router;
@@ -22,12 +23,13 @@ pub mod wtp;
 pub mod wtp_sar;
 
 use std::collections::{HashMap, HashSet};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::{Duration, Instant};
 
-use tetra_config::bluestation::{CfgWap, CfgWapBrowse, CfgWapWtp, WapSarMode};
+use tetra_config::bluestation::{CfgWap, CfgWapBrowse, CfgWapWtp, SharedConfig, WapSarMode};
 
-use self::fetcher::{FetchReply, FetchRequest, FetchTarget, Fetcher, Page};
+use self::debug_udp::DebugUdp;
+use self::fetcher::{FetchReply, FetchRequest, FetchTarget, Fetcher, Page, UnavailableFetcher};
 use self::router::{Route, RouteCtx};
 use self::wsp::{ContentKind, WspRequest, status};
 use self::wtp::{Invoke, WtpPdu};
@@ -53,6 +55,8 @@ const FETCH_GUARD: Duration = Duration::from_secs(45);
 /// Bound on open transactions (a flood must not grow memory).
 const MAX_TRANSACTIONS: usize = 256;
 const ABORT_REASON_CAPTEMPEXCEEDED: u8 = 7;
+/// Debug datagrams taken per stack tick.
+const MAX_DEBUG_IN_PER_TICK: usize = 16;
 
 /// How a peer reaches the gateway.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -706,6 +710,98 @@ impl WapGateway {
                     );
                     self.respond_page(key, peer, server_port, 2, page, now);
                 }
+            }
+        }
+    }
+}
+
+/// Helper threads of the gateway leave the station's SCHED_FIFO (inherited from the stack): a
+/// flood on a helper must not take CPU from the TETRA stack.
+pub(crate) fn leave_realtime_scheduling() {
+    #[cfg(target_os = "linux")]
+    // SAFETY: one syscall on the calling thread with a zeroed sched_param.
+    unsafe {
+        let param: libc::sched_param = std::mem::zeroed();
+        let _ = libc::sched_setscheduler(0, libc::SCHED_OTHER, &param);
+    }
+}
+
+/// The gateway as the SNDCP entity runs it: built from `[wap]`, with the debug UDP bearer when
+/// configured, driven from the stack tick.
+pub struct WapService {
+    gateway: WapGateway,
+    debug: Option<DebugUdp>,
+    debug_issi: u32,
+}
+
+impl WapService {
+    /// `None` unless `[wap] enabled`.
+    pub fn start(config: &SharedConfig) -> Option<Self> {
+        let cfg = config.effective_wap();
+        if !cfg.enabled {
+            return None;
+        }
+        let thresholds = snapshot::thresholds(&config.config());
+        let gateway = WapGateway::new(
+            cfg.clone(),
+            Box::new(UnavailableFetcher::default()),
+            Box::new(move || snapshot::station_snapshot(&thresholds)),
+        );
+        let debug = cfg.debug_udp_listen.and_then(|listen| match DebugUdp::spawn(listen, &cfg) {
+            Ok(debug) => Some(debug),
+            Err(e) => {
+                tracing::error!("WAP: debug UDP bearer on {listen} not started: {e}");
+                None
+            }
+        });
+        tracing::info!(
+            "WAP: gateway on {} (browsing {}, {} radio(s) allowed)",
+            cfg.gateway_ipv4,
+            if cfg.browse.enabled { "on" } else { "off" },
+            cfg.browse.allowed_issis.len()
+        );
+        Some(Self {
+            gateway,
+            debug,
+            debug_issi: cfg.debug_issi,
+        })
+    }
+
+    /// Address of the debug UDP bearer, if it is running.
+    pub fn debug_addr(&self) -> Option<SocketAddrV4> {
+        self.debug.as_ref().map(DebugUdp::local_addr)
+    }
+
+    /// One stack tick: take the debug datagrams, run the gateway, hand out the answers.
+    pub fn tick(&mut self, config: &SharedConfig, now: Instant) {
+        if let Some(debug) = &self.debug {
+            let port = debug.local_addr().port();
+            for i in 0..MAX_DEBUG_IN_PER_TICK {
+                let Some((src, payload)) = debug.try_recv() else { break };
+                if i == 0 {
+                    // The dashboard may have changed who can browse.
+                    self.gateway.set_browse(config.effective_wap().browse);
+                }
+                let peer = WapPeer {
+                    issi: self.debug_issi,
+                    ip: *src.ip(),
+                    via: WapVia::DebugUdp,
+                };
+                self.gateway.on_udp(
+                    UdpIn {
+                        peer,
+                        src_port: src.port(),
+                        dst_port: port,
+                        payload,
+                    },
+                    now,
+                );
+            }
+        }
+        for out in self.gateway.poll(now) {
+            match (&self.debug, out.peer.via) {
+                (Some(debug), WapVia::DebugUdp) => debug.send(SocketAddrV4::new(out.peer.ip, out.dst_port), out.payload),
+                _ => tracing::debug!("WAP: no bearer to ISSI {} yet, reply dropped", out.peer.issi),
             }
         }
     }
