@@ -631,8 +631,15 @@ fn main() {
     })
     .expect("failed to set Ctrl+C handler");
 
+    // systemd READY/WATCHDOG notifications; inert unless the unit is Type=notify (NOTIFY_SOCKET).
+    tetra_entities::sd_watchdog::spawn(
+        is_running.clone(),
+        std::time::Duration::from_secs(cfg.config().health.core_stall_secs),
+    );
+
     // Start the stack
     router.run_stack(None, Some(is_running));
+    tetra_entities::sd_watchdog::notify_stopping();
 
     // router drops here → entities are dropped, networked entities disconnect.
     // If RestartService/ShutdownService was triggered, exit with the requested code
