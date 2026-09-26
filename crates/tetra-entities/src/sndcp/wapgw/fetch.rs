@@ -373,9 +373,11 @@ impl Worker {
 
     fn browse(&mut self, req: &FetchRequest, start: Url) -> (Page, Option<String>) {
         let started = Instant::now();
+        // One time budget for the whole chain: redirects and meta refreshes.
+        let deadline = started + Duration::from_secs(self.cfg.timeout_secs);
         let mut url = start;
         for _ in 0..=MAX_REFRESHES {
-            let dl = match self.download(url.clone()) {
+            let dl = match self.download(url.clone(), deadline) {
                 Ok(dl) => dl,
                 Err(e) => {
                     tracing::info!("WAP: ISSI {} could not fetch {}: {}", req.issi, host_of(&url), e);
@@ -407,9 +409,8 @@ impl Worker {
         )
     }
 
-    fn download(&mut self, start: Url) -> Result<Downloaded, FetchError> {
+    fn download(&mut self, start: Url, deadline: Instant) -> Result<Downloaded, FetchError> {
         let client = self.client()?;
-        let deadline = Instant::now() + Duration::from_secs(self.cfg.timeout_secs);
         let max = self.cfg.max_download_kb * 1024;
         let mut url = start;
         for _ in 0..=self.cfg.max_redirects {
