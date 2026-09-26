@@ -67,3 +67,12 @@ files from Nexus-BS, copied or adapted with the permission of Chris YO3TCO.
 Those files keep their original SPDX headers and add an `SPDX-FileComment`
 line describing the adaptation; everything else in this repository stays
 Apache-2.0. The list of imported files is kept in `NOTICE`.
+
+The sections above are copied verbatim from Nexus-BS. In this repository:
+
+- `LICENSE` is the Apache-2.0 text (there is no `LICENSES/Apache-2.0.txt`).
+  The PolyForm Noncommercial 1.0.0 text is only in
+  `LICENSES/PolyForm-Noncommercial-1.0.0.txt`; the .deb package installs it,
+  with `NOTICE`, next to this file in `/usr/share/doc/flowstation/`.
+- `LICENSE-OVERVIEW.md` is not included: `NOTICE` and the PolyForm text cover
+  its role for the imported files.
