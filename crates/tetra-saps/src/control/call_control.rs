@@ -8,6 +8,8 @@ pub enum CircuitDlMediaSource {
     LocalLoopback,
     /// Downlink media is supplied by SwMI over the network bridge.
     SwMI,
+    /// Local parrot service: UMAC hands the uplink to CMCE, which plays it back later.
+    LocalParrot,
 }
 
 #[derive(Debug, Clone)]
