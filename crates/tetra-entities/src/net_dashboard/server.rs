@@ -643,6 +643,9 @@ fn run_update(update: SharedUpdateState, config_path: String, source_dir_overrid
     }
 
     log!(update, "=== FlowStation OTA Update ===");
+    // Safety net: keep feeding the systemd watchdog (if armed) while this update runs, even if the
+    // build slows the core loop down. Released when this function returns.
+    let _watchdog_hold = crate::sd_watchdog::ota_hold(std::time::Duration::from_secs(3600));
 
     // Step 1: resolve source directory. Bail out cleanly if we can't find a git repo.
     let src_dir = match resolve_source_dir(source_dir_override.as_deref()) {
@@ -838,7 +841,36 @@ fn run_update(update: SharedUpdateState, config_path: String, source_dir_overrid
             build.env("PATH", new_path);
         }
     }
+    // Under the systemd watchdog the build must not inherit our SCHED_FIFO 73: equal-priority FIFO
+    // threads don't preempt each other, so parallel rustc jobs could starve the core loop and the
+    // sd-notify thread until systemd kills the station mid-build.
+    #[cfg(target_os = "linux")]
+    if crate::sd_watchdog::watchdog_armed() {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: between fork and exec the closure only makes one async-signal-safe syscall.
+        unsafe {
+            build.pre_exec(|| {
+                let param: libc::sched_param = std::mem::zeroed();
+                let _ = libc::sched_setscheduler(0, libc::SCHED_OTHER, &param);
+                Ok(())
+            });
+        }
+    }
     if stream_cmd(&update, build, "$ cargo build --release".to_string()).is_none() {
+        return;
+    }
+
+    // A Type=notify unit only turns READY for a binary that speaks sd_notify. If this one doesn't
+    // (e.g. the branch went back to an older commit), restarting would leave the station killed
+    // every TimeoutStartSec, so keep the running binary.
+    let new_bin = src_dir.join("target/release/bluestation-bs");
+    if std::env::var_os("NOTIFY_SOCKET").is_some() && !crate::sd_watchdog::binary_has_marker(&new_bin) {
+        log!(
+            update,
+            "ERROR: {} does not speak sd_notify but this unit is Type=notify; not restarting. Drop the systemd watchdog from the unit first.",
+            new_bin.display()
+        );
+        update.lock().unwrap().finish(false);
         return;
     }
 
