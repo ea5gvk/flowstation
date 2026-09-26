@@ -2,8 +2,8 @@
 //!
 //! The gateway runs on the TETRA stack thread and never blocks: it hands a [`FetchRequest`] to a
 //! [`Fetcher`] and collects the finished [`FetchReply`] on a later tick. A real fetcher (download,
-//! HTML conversion, pagination, document cache) runs on its own threads; the one here only says
-//! that browsing is not available.
+//! HTML conversion, pagination, document cache) runs on its own threads ([`super::fetch`]); the
+//! one here only says that browsing is not available.
 
 use std::collections::VecDeque;
 
@@ -45,6 +45,8 @@ pub struct Page {
 pub struct FetchReply {
     pub id: u64,
     pub page: Page,
+    /// Host the page came from (after redirects), for the dashboard; never the full URL.
+    pub domain: Option<String>,
 }
 
 pub trait Fetcher: Send {
@@ -75,6 +77,7 @@ impl Fetcher for UnavailableFetcher {
                 kind: ContentKind::Xhtml,
                 body: body.into_bytes(),
             },
+            domain: None,
         });
         Ok(())
     }

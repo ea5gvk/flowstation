@@ -41,8 +41,10 @@ chrono-tz = { workspace = true }
 # rustls-tls (no OpenSSL) keeps cross-compilation to the Pi simple; blocking is fine since
 # both uses run on their own short-lived threads.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
-# WAP gateway: URL parsing and joining of fetched pages (already pulled in by reqwest).
+# WAP gateway downloads: URL parsing/joining (already pulled in by reqwest) and charset decoding
+# of the fetched pages to UTF-8 (reqwest is built without its `charset` feature).
 url = "2"
+encoding_rs = "0.8"
 
 # Unix-only: geteuid() for the OTA source-tree ownership check (dashboard build path).
 [target.'cfg(unix)'.dependencies]

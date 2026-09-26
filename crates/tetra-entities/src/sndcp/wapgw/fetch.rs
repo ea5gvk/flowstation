@@ -1,0 +1,1046 @@
+//! The Internet side of the gateway: a small pool of download threads.
+//!
+//! The stack thread only queues requests and collects replies through bounded channels
+//! ([`PoolFetcher`]); it never waits for the network. Each `wap-fetch` thread first leaves the
+//! station's real-time scheduling (SCHED_OTHER, nice 10) and only then builds its HTTP client, so
+//! the client's own runtime threads inherit the low priority.
+//!
+//! A download follows redirects by hand, checking every hop against the [`NetPolicy`]; the
+//! client's DNS resolver refuses a name that resolves to a non-public address, and the connection
+//! goes to the address that was checked. Bodies are capped, decoded to UTF-8 and either passed
+//! through (small WML / XHTML-MP) or converted and cut into pages kept in a per-radio document
+//! cache. Only the domain of what a radio fetched is logged.
+
+use std::collections::{HashMap, VecDeque};
+use std::io::Read;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
+use encoding_rs::{Encoding, UTF_8, UTF_16BE, UTF_16LE, WINDOWS_1252};
+use reqwest::blocking::Client;
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+use reqwest::header::{ACCEPT, ACCEPT_LANGUAGE, CONTENT_TYPE, HeaderMap, HeaderValue, LOCATION};
+use tetra_config::bluestation::{CfgWap, CfgWapBrowse};
+use url::Url;
+
+use super::convert::{Block, Document, Inline, convert_html, convert_text, trim_wap_markup};
+use super::doc_cache::DocCache;
+use super::fetcher::{FetchReply, FetchRequest, FetchTarget, Fetcher, Page};
+use super::home;
+use super::netpolicy::{NetPolicy, Refusal};
+use super::paginate::render_page;
+use super::router::query_param;
+use super::wsp::{ContentKind, status};
+use crate::net_dashboard::wx_service;
+
+/// Requests waiting for a download thread; a full queue answers "busy" at once.
+const QUEUE_LEN: usize = 8;
+const ACCEPT_VALUE: &str =
+    "application/vnd.wap.xhtml+xml, application/xhtml+xml;q=0.9, text/vnd.wap.wml;q=0.8, text/html;q=0.7, text/plain;q=0.5";
+/// Meta refreshes followed per request (on top of the HTTP redirects).
+const MAX_REFRESHES: usize = 2;
+/// A page with less text than this and a meta refresh is only a redirect.
+const REFRESH_TEXT_CHARS: usize = 200;
+
+/// Leave the station's SCHED_FIFO and run at nice 10 (Linux; on Linux the nice value is per
+/// thread). Threads created afterwards inherit both.
+fn background_priority() {
+    super::leave_realtime_scheduling();
+    #[cfg(target_os = "linux")]
+    // SAFETY: one syscall on the calling thread.
+    unsafe {
+        let _ = libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+    }
+}
+
+/// DNS resolver of the download client: every address a name resolves to must pass the policy.
+struct PolicyResolver {
+    policy: NetPolicy,
+}
+
+impl Resolve for PolicyResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let policy = self.policy.clone();
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            // getaddrinfo blocks: keep it off the client's runtime thread so its timers still run.
+            let addrs: Vec<SocketAddr> =
+                tokio::task::spawn_blocking(move || (host.as_str(), 0).to_socket_addrs().map(|a| a.collect::<Vec<_>>())).await??;
+            let ips: Vec<IpAddr> = addrs.iter().map(SocketAddr::ip).collect();
+            if ips.is_empty() {
+                return Err("no address".into());
+            }
+            policy.check_resolved(&ips)?;
+            Ok(Box::new(addrs.into_iter()) as Addrs)
+        })
+    }
+}
+
+#[derive(Debug)]
+enum FetchError {
+    Refused(Refusal),
+    Timeout,
+    Connect,
+    TooManyRedirects,
+    Other(String),
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FetchError::Refused(r) => write!(f, "refused: {r}"),
+            FetchError::Timeout => write!(f, "timed out"),
+            FetchError::Connect => write!(f, "cannot connect"),
+            FetchError::TooManyRedirects => write!(f, "too many redirects"),
+            FetchError::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+fn classify(e: reqwest::Error) -> FetchError {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&e);
+    while let Some(s) = source {
+        if let Some(refusal) = s.downcast_ref::<Refusal>() {
+            return FetchError::Refused(refusal.clone());
+        }
+        source = s.source();
+    }
+    if e.is_timeout() {
+        FetchError::Timeout
+    } else if e.is_connect() {
+        FetchError::Connect
+    } else {
+        FetchError::Other(e.without_url().to_string())
+    }
+}
+
+struct Downloaded {
+    url: Url,
+    status: u16,
+    content_type: String,
+    body: Vec<u8>,
+    truncated: bool,
+}
+
+/// `charset` parameter of a Content-Type.
+fn charset_param(content_type: &str) -> Option<String> {
+    let lower = content_type.to_ascii_lowercase();
+    let value = &lower[lower.find("charset=")? + 8..];
+    let value = value.trim_start_matches(['"', '\'']);
+    let end = value
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.')))
+        .unwrap_or(value.len());
+    (end > 0).then(|| value[..end].to_string())
+}
+
+/// Charset declared inside the document: `<meta charset>`, `<meta http-equiv content>` or the
+/// XML declaration, in its first kilobyte.
+fn sniff_charset(head: &[u8]) -> Option<String> {
+    let head = String::from_utf8_lossy(&head[..head.len().min(1024)]).to_ascii_lowercase();
+    if head.starts_with("<?xml")
+        && let Some(decl) = head.split("?>").next()
+        && let Some(i) = decl.find("encoding=")
+    {
+        return charset_param(&format!("charset={}", &decl[i + 9..]));
+    }
+    let i = head.find("<meta")?;
+    charset_param(&head[i..])
+}
+
+/// The body as UTF-8: BOM, then the Content-Type charset, then the document's own declaration;
+/// without any, UTF-8 when it is valid and Windows-1252 otherwise.
+fn decode_body(body: &[u8], content_type: &str) -> String {
+    if let Some((enc, bom)) = Encoding::for_bom(body) {
+        return enc.decode_without_bom_handling(&body[bom..]).0.into_owned();
+    }
+    let declared = charset_param(content_type)
+        .or_else(|| sniff_charset(body))
+        .and_then(|label| Encoding::for_label(label.as_bytes()))
+        // A document that says UTF-16 in ASCII bytes is not UTF-16.
+        .map(|enc| if enc == UTF_16LE || enc == UTF_16BE { UTF_8 } else { enc });
+    let enc = declared.unwrap_or_else(|| match std::str::from_utf8(body) {
+        Ok(_) => UTF_8,
+        // Cut in the middle of a character by the size cap: still UTF-8.
+        Err(e) if e.error_len().is_none() => UTF_8,
+        Err(_) => WINDOWS_1252,
+    });
+    enc.decode_without_bom_handling(body).0.into_owned()
+}
+
+/// WSP status for an upstream HTTP error status.
+fn wsp_status_for_http(code: u16) -> u8 {
+    match code {
+        400..=415 => 0x40 + (code - 400) as u8,
+        500..=505 => 0x60 + (code - 500) as u8,
+        500..=599 => status::INTERNAL_ERROR,
+        _ => status::BAD_REQUEST,
+    }
+}
+
+/// A gateway path served by the pool: page of a document, link of a document, or the weather.
+#[derive(Debug, PartialEq, Eq)]
+enum DocPath<'a> {
+    Page { doc: u32, page: usize },
+    Link { doc: u32, link: usize, query: Option<&'a str> },
+    Weather { query: Option<&'a str> },
+}
+
+fn parse_doc_path(path: &str) -> Option<DocPath<'_>> {
+    let (path, query) = match path.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (path, None),
+    };
+    if path == "/wx" {
+        return Some(DocPath::Weather { query });
+    }
+    let mut parts = path.strip_prefix('/')?.split('/');
+    let (kind, doc, n) = (parts.next()?, parts.next()?.parse().ok()?, parts.next()?.parse().ok()?);
+    if parts.next().is_some() {
+        return None;
+    }
+    match kind {
+        "p" => Some(DocPath::Page { doc, page: n }),
+        "l" => Some(DocPath::Link { doc, link: n, query }),
+        _ => None,
+    }
+}
+
+fn notice(status: u8, title: &str, text: &str, req: &FetchRequest) -> Page {
+    Page {
+        status,
+        kind: ContentKind::Xhtml,
+        body: home::notice_page(title, text, &req.home, req.budget).into_bytes(),
+    }
+}
+
+fn error_page(e: &FetchError, req: &FetchRequest) -> Page {
+    match e {
+        FetchError::Refused(Refusal::Address(_) | Refusal::LocalName) => notice(
+            status::FORBIDDEN,
+            "Bloqueada",
+            "Solo se pueden visitar sitios públicos de Internet.",
+            req,
+        ),
+        FetchError::Refused(Refusal::Domain) => notice(status::FORBIDDEN, "No permitido", "Ese sitio no está permitido.", req),
+        FetchError::Refused(Refusal::Scheme | Refusal::Port(_)) => notice(
+            status::FORBIDDEN,
+            "No permitido",
+            "Solo direcciones http y https en los puertos permitidos.",
+            req,
+        ),
+        FetchError::Timeout => notice(status::GATEWAY_TIMEOUT, "Sin respuesta", "El sitio tarda demasiado.", req),
+        FetchError::Connect => notice(status::BAD_GATEWAY, "Sin conexión", "No se puede conectar con el sitio.", req),
+        FetchError::TooManyRedirects => notice(status::BAD_GATEWAY, "Error", "Demasiadas redirecciones.", req),
+        FetchError::Other(_) => notice(status::BAD_GATEWAY, "Error", "No se pudo descargar la página.", req),
+    }
+}
+
+/// Only the domain goes to the log.
+fn host_of(url: &Url) -> String {
+    url.host_str().unwrap_or("?").to_string()
+}
+
+/// One download thread's state. The document cache is shared by the pool.
+struct Worker {
+    cfg: CfgWapBrowse,
+    policy: NetPolicy,
+    docs: Arc<Mutex<DocCache>>,
+    client: Option<Client>,
+}
+
+enum Presented {
+    Page(Page),
+    Refresh(Url),
+}
+
+impl Worker {
+    fn new(cfg: CfgWapBrowse, policy: NetPolicy, docs: Arc<Mutex<DocCache>>) -> Self {
+        Self {
+            cfg,
+            policy,
+            docs,
+            client: None,
+        }
+    }
+
+    fn run(mut self, jobs: Receiver<FetchRequest>, replies: Sender<FetchReply>) {
+        background_priority();
+        while let Ok(req) = jobs.recv() {
+            let (page, domain) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.handle(&req))).unwrap_or_else(|_| {
+                tracing::error!("WAP: download thread panicked on a request of ISSI {}", req.issi);
+                (notice(status::INTERNAL_ERROR, "Error", "Error interno de la pasarela.", &req), None)
+            });
+            if replies.send(FetchReply { id: req.id, page, domain }).is_err() {
+                return; // the gateway is gone
+            }
+        }
+    }
+
+    fn docs(&self) -> std::sync::MutexGuard<'_, DocCache> {
+        self.docs.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The HTTP client, built on first use (on this thread, after the priority change).
+    fn client(&mut self) -> Result<Client, FetchError> {
+        if let Some(client) = &self.client {
+            return Ok(client.clone());
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, HeaderValue::from_static(ACCEPT_VALUE));
+        if let Ok(lang) = HeaderValue::from_str(self.cfg.accept_language.trim())
+            && !lang.is_empty()
+        {
+            headers.insert(ACCEPT_LANGUAGE, lang);
+        }
+        let client = Client::builder()
+            .user_agent(self.cfg.user_agent.clone())
+            .default_headers(headers)
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(self.cfg.timeout_secs.min(8)))
+            .timeout(Duration::from_secs(self.cfg.timeout_secs))
+            .dns_resolver(Arc::new(PolicyResolver {
+                policy: self.policy.clone(),
+            }))
+            .build()
+            .map_err(|e| FetchError::Other(e.to_string()))?;
+        self.client = Some(client.clone());
+        Ok(client)
+    }
+
+    fn handle(&mut self, req: &FetchRequest) -> (Page, Option<String>) {
+        match &req.target {
+            FetchTarget::Url(url) => match Url::parse(url.trim()) {
+                Ok(url) => self.browse(req, url),
+                Err(_) => (notice(status::BAD_REQUEST, "Error", "Dirección no válida.", req), None),
+            },
+            FetchTarget::Search(query) => {
+                let url = format!("{}{}", self.cfg.search_url.trim(), home::percent_encode(query));
+                match Url::parse(&url) {
+                    Ok(url) => self.browse(req, url),
+                    Err(_) => (notice(status::INTERNAL_ERROR, "Error", "Buscador mal configurado.", req), None),
+                }
+            }
+            FetchTarget::Doc(path) => match parse_doc_path(path) {
+                Some(DocPath::Page { doc, page }) => (self.page(req, doc, page), None),
+                Some(DocPath::Link { doc, link, query }) => {
+                    let target = self
+                        .docs()
+                        .get(req.issi, doc, Instant::now())
+                        .map(|d| d.doc.links.get(link).cloned());
+                    match target {
+                        Some(Some(url)) => match Url::parse(&url) {
+                            Ok(mut url) => {
+                                if let Some(query) = query {
+                                    // A GET form: its fields replace the action's query.
+                                    url.set_query(Some(query));
+                                }
+                                self.browse(req, url)
+                            }
+                            Err(_) => (notice(status::NOT_FOUND, "No encontrado", "Enlace no válido.", req), None),
+                        },
+                        Some(None) => (notice(status::NOT_FOUND, "No encontrado", "Ese enlace no existe.", req), None),
+                        None => (expired(req), None),
+                    }
+                }
+                Some(DocPath::Weather { query }) => (self.weather(req, query), None),
+                None => (notice(status::NOT_FOUND, "No encontrado", "Esa página no existe.", req), None),
+            },
+        }
+    }
+
+    fn page_bytes(&self, req: &FetchRequest) -> usize {
+        self.cfg.page_bytes.min(req.budget)
+    }
+
+    fn page(&self, req: &FetchRequest, doc: u32, n: usize) -> Page {
+        let page_bytes = self.page_bytes(req);
+        let mut docs = self.docs();
+        let Some(stored) = docs.get(req.issi, doc, Instant::now()) else {
+            return expired(req);
+        };
+        match render_page(&stored.doc, doc, n, page_bytes, self.cfg.max_pages_per_doc, &req.home) {
+            Some((body, _)) => Page {
+                status: status::OK,
+                kind: ContentKind::Xhtml,
+                body: body.into_bytes(),
+            },
+            None => notice(status::NOT_FOUND, "No encontrado", "Esa página no existe.", req),
+        }
+    }
+
+    fn browse(&mut self, req: &FetchRequest, start: Url) -> (Page, Option<String>) {
+        let started = Instant::now();
+        let mut url = start;
+        for _ in 0..=MAX_REFRESHES {
+            let dl = match self.download(url.clone()) {
+                Ok(dl) => dl,
+                Err(e) => {
+                    tracing::info!("WAP: ISSI {} could not fetch {}: {}", req.issi, host_of(&url), e);
+                    return (error_page(&e, req), Some(host_of(&url)));
+                }
+            };
+            let host = host_of(&dl.url);
+            let (bytes, code, truncated) = (dl.body.len(), dl.status, dl.truncated);
+            match self.present(req, dl) {
+                Presented::Refresh(next) => url = next,
+                Presented::Page(page) => {
+                    tracing::info!(
+                        "WAP: ISSI {} fetched {} (HTTP {}, {} B{}, {} ms, {} B to the radio)",
+                        req.issi,
+                        host,
+                        code,
+                        bytes,
+                        if truncated { ", cut" } else { "" },
+                        started.elapsed().as_millis(),
+                        page.body.len()
+                    );
+                    return (page, Some(host));
+                }
+            }
+        }
+        (
+            notice(status::BAD_GATEWAY, "Error", "Demasiadas redirecciones.", req),
+            Some(host_of(&url)),
+        )
+    }
+
+    fn download(&mut self, start: Url) -> Result<Downloaded, FetchError> {
+        let client = self.client()?;
+        let deadline = Instant::now() + Duration::from_secs(self.cfg.timeout_secs);
+        let max = self.cfg.max_download_kb * 1024;
+        let mut url = start;
+        for _ in 0..=self.cfg.max_redirects {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.set_fragment(None);
+            self.policy.check_url(&url).map_err(FetchError::Refused)?;
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(FetchError::Timeout);
+            }
+            let resp = client.get(url.clone()).timeout(left).send().map_err(classify)?;
+            let code = resp.status();
+            if code.is_redirection()
+                && let Some(location) = resp.headers().get(LOCATION).and_then(|v| v.to_str().ok())
+            {
+                url = url
+                    .join(location.trim())
+                    .map_err(|_| FetchError::Other("bad redirect".to_string()))?;
+                continue;
+            }
+            let content_type = resp
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let mut body = Vec::new();
+            if let Err(e) = resp.take(max as u64 + 1).read_to_end(&mut body) {
+                // The client reports a body timeout as an I/O error around its own error.
+                let timed_out = e.kind() == std::io::ErrorKind::TimedOut
+                    || e.get_ref()
+                        .and_then(|inner| inner.downcast_ref::<reqwest::Error>())
+                        .is_some_and(reqwest::Error::is_timeout);
+                return Err(if timed_out {
+                    FetchError::Timeout
+                } else {
+                    FetchError::Other(e.to_string())
+                });
+            }
+            let truncated = body.len() > max;
+            body.truncate(max);
+            return Ok(Downloaded {
+                url,
+                status: code.as_u16(),
+                content_type,
+                body,
+                truncated,
+            });
+        }
+        Err(FetchError::TooManyRedirects)
+    }
+
+    /// Turn a download into the page for the radio (or a meta refresh to follow).
+    fn present(&mut self, req: &FetchRequest, dl: Downloaded) -> Presented {
+        if !(200..300).contains(&dl.status) {
+            return Presented::Page(notice(
+                wsp_status_for_http(dl.status),
+                "Error",
+                &format!("El sitio respondió HTTP {}.", dl.status),
+                req,
+            ));
+        }
+        let mime = dl.content_type.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+        let text = |dl: &Downloaded| decode_body(&dl.body, &dl.content_type);
+        let doc = match mime.as_str() {
+            "text/vnd.wap.wml" | "application/vnd.wap.xhtml+xml" | "text/html" | "application/xhtml+xml" | "" => {
+                let body = text(&dl);
+                let wml = mime == "text/vnd.wap.wml";
+                let xhtml_mp =
+                    mime == "application/vnd.wap.xhtml+xml" || body.find("-//WAPFORUM//DTD XHTML Mobile").is_some_and(|i| i < 1024);
+                if (wml || xhtml_mp) && !dl.truncated {
+                    let trimmed = trim_wap_markup(&body, !wml, &dl.url);
+                    if trimmed.len() <= req.budget {
+                        return Presented::Page(Page {
+                            status: status::OK,
+                            kind: if wml { ContentKind::Wml } else { ContentKind::Xhtml },
+                            body: trimmed.into_bytes(),
+                        });
+                    }
+                }
+                convert_html(&body, &dl.url)
+            }
+            "text/plain" => {
+                let name = dl.url.path_segments().and_then(|mut s| s.next_back()).unwrap_or("").to_string();
+                let title = if name.is_empty() { host_of(&dl.url) } else { name };
+                convert_text(&text(&dl), &title)
+            }
+            other => {
+                return Presented::Page(notice(
+                    status::UNSUPPORTED_MEDIA_TYPE,
+                    "No se puede mostrar",
+                    &format!("La radio no puede mostrar contenido {other}."),
+                    req,
+                ));
+            }
+        };
+        if let Some(target) = doc.refresh.as_deref().filter(|_| doc.text_len() < REFRESH_TEXT_CHARS)
+            && let Ok(target) = Url::parse(target)
+        {
+            return Presented::Refresh(target);
+        }
+        self.store_and_render(req, doc, dl.truncated)
+    }
+
+    fn store_and_render(&mut self, req: &FetchRequest, mut doc: Document, truncated: bool) -> Presented {
+        if doc.blocks.is_empty() {
+            return Presented::Page(notice(
+                status::OK,
+                "Sin texto",
+                "La página no tiene texto que mostrar (quizá necesita JavaScript).",
+                req,
+            ));
+        }
+        if truncated {
+            doc.blocks
+                .push(Block::Para(vec![Inline::Text("(Página recortada: demasiado grande.)".to_string())]));
+        }
+        let page_bytes = self.page_bytes(req);
+        let id = self.docs().insert(req.issi, doc, Instant::now());
+        let mut docs = self.docs();
+        let rendered = docs
+            .get(req.issi, id, Instant::now())
+            .and_then(|stored| render_page(&stored.doc, id, 1, page_bytes, self.cfg.max_pages_per_doc, &req.home));
+        Presented::Page(match rendered {
+            Some((body, _)) => Page {
+                status: status::OK,
+                kind: ContentKind::Xhtml,
+                body: body.into_bytes(),
+            },
+            None => notice(status::INTERNAL_ERROR, "Error", "La página no cabe en la respuesta.", req),
+        })
+    }
+
+    /// `/wx?i=ICAO` (decoded METAR) or `/wx?l=place` (current weather), with the forms again.
+    fn weather(&self, req: &FetchRequest, query: Option<&str>) -> Page {
+        let icao = query_param(query, "i").filter(|v| !v.trim().is_empty());
+        let place = query_param(query, "l").map(|l| {
+            l.chars()
+                .filter(|c| c.is_alphanumeric() || matches!(c, ' ' | ',' | '-' | '.'))
+                .take(40)
+                .collect::<String>()
+        });
+        let result = match (icao, place.filter(|p| !p.trim().is_empty())) {
+            (Some(icao), _) => wx_service::fetch_metar_decoded(&icao),
+            (None, Some(place)) => wx_service::fetch_wx(place.trim()),
+            (None, None) => Err("nothing asked".to_string()),
+        };
+        let text = result.unwrap_or_else(|e| {
+            tracing::debug!("WAP: weather for ISSI {} failed: {e}", req.issi);
+            "Sin datos para esa consulta.".to_string()
+        });
+        Page {
+            status: status::OK,
+            kind: ContentKind::Xhtml,
+            body: home::wx_page(Some(&text), &req.home, req.budget).into_bytes(),
+        }
+    }
+}
+
+fn expired(req: &FetchRequest) -> Page {
+    notice(
+        status::GONE,
+        "Caducada",
+        "Esta página ya no está guardada. Vuelve a abrirla desde el inicio.",
+        req,
+    )
+}
+
+/// Whether a request goes out to the Internet (and counts against the radio's limit).
+fn uses_internet(target: &FetchTarget) -> bool {
+    match target {
+        FetchTarget::Doc(path) => !path.starts_with("/p/"),
+        FetchTarget::Url(_) | FetchTarget::Search(_) => true,
+    }
+}
+
+/// The stack side of the pool: queues requests and collects replies without blocking, and
+/// limits how many Internet requests each radio makes.
+pub struct PoolFetcher {
+    jobs: Sender<FetchRequest>,
+    replies: Receiver<FetchReply>,
+    /// Answers made on the stack side (over the limit).
+    ready: VecDeque<FetchReply>,
+    recent: HashMap<u32, VecDeque<Instant>>,
+    per_issi: usize,
+    window: Duration,
+}
+
+impl PoolFetcher {
+    pub fn spawn(cfg: &CfgWap, policy: NetPolicy) -> std::io::Result<Self> {
+        let (jobs_tx, jobs_rx) = bounded(QUEUE_LEN);
+        let (replies_tx, replies_rx) = unbounded();
+        let docs = Arc::new(Mutex::new(DocCache::default()));
+        for i in 0..cfg.browse.max_concurrent_fetches.max(1) {
+            let worker = Worker::new(cfg.browse.clone(), policy.clone(), Arc::clone(&docs));
+            let (jobs, replies) = (jobs_rx.clone(), replies_tx.clone());
+            std::thread::Builder::new()
+                .name(format!("wap-fetch-{i}"))
+                .spawn(move || worker.run(jobs, replies))?;
+        }
+        Ok(Self {
+            jobs: jobs_tx,
+            replies: replies_rx,
+            ready: VecDeque::new(),
+            recent: HashMap::new(),
+            per_issi: cfg.browse.requests_per_issi as usize,
+            window: Duration::from_secs(cfg.browse.requests_window_secs),
+        })
+    }
+}
+
+impl Fetcher for PoolFetcher {
+    fn submit(&mut self, req: FetchRequest) -> Result<(), FetchRequest> {
+        let counted = uses_internet(&req.target);
+        if counted {
+            let now = Instant::now();
+            let window = self.window;
+            self.recent.retain(|_, q| {
+                while q.front().is_some_and(|t| now.duration_since(*t) >= window) {
+                    q.pop_front();
+                }
+                !q.is_empty()
+            });
+            let recent = self.recent.entry(req.issi).or_default();
+            if recent.len() >= self.per_issi {
+                tracing::info!("WAP: ISSI {} is over its request limit", req.issi);
+                let page = notice(
+                    status::SERVICE_UNAVAILABLE,
+                    "Demasiadas peticiones",
+                    "Espera unos minutos antes de seguir navegando.",
+                    &req,
+                );
+                self.ready.push_back(FetchReply {
+                    id: req.id,
+                    page,
+                    domain: None,
+                });
+                return Ok(());
+            }
+            recent.push_back(now);
+        }
+        match self.jobs.try_send(req) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(req) | TrySendError::Disconnected(req)) => {
+                if counted && let Some(recent) = self.recent.get_mut(&req.issi) {
+                    recent.pop_back();
+                }
+                Err(req)
+            }
+        }
+    }
+
+    fn try_recv(&mut self) -> Option<FetchReply> {
+        self.ready.pop_front().or_else(|| self.replies.try_recv().ok())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sndcp::wapgw::paginate::assert_well_formed;
+    use std::io::Write;
+    use std::net::TcpListener;
+
+    const ISSI: u32 = 2_260_618;
+
+    /// A one-shot-per-connection HTTP server on 127.0.0.1: `routes` maps the request target
+    /// (path and query) to the raw response; "SLOW" answers after 3 s.
+    fn serve(routes: Vec<(String, Vec<u8>)>) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let routes = routes.clone();
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let target = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let response = routes
+                        .iter()
+                        .find(|(path, _)| *path == target)
+                        .map(|(_, r)| r.clone())
+                        .unwrap_or_else(|| http("404 Not Found", "text/html", b"<p>missing</p>"));
+                    if response.starts_with(b"SLOW") {
+                        std::thread::sleep(Duration::from_secs(3));
+                        let _ = stream.write_all(&response[4..]);
+                    } else {
+                        let _ = stream.write_all(&response);
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    fn http(status: &str, content_type: &str, body: &[u8]) -> Vec<u8> {
+        let mut out = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn redirect(location: &str) -> Vec<u8> {
+        format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").into_bytes()
+    }
+
+    fn browse_cfg(port: u16) -> CfgWapBrowse {
+        CfgWapBrowse {
+            enabled: true,
+            allowed_issis: vec![ISSI],
+            allowed_ports: vec![port, 80, 443],
+            search_url: format!("http://127.0.0.1:{port}/lite/?q="),
+            ..Default::default()
+        }
+    }
+
+    fn worker(cfg: CfgWapBrowse) -> Worker {
+        let policy = NetPolicy::new(&cfg).allowing_loopback();
+        Worker::new(cfg, policy, Arc::new(Mutex::new(DocCache::default())))
+    }
+
+    fn request(target: FetchTarget, budget: usize) -> FetchRequest {
+        FetchRequest {
+            id: 1,
+            issi: ISSI,
+            target,
+            budget,
+            home: "http://10.0.0.1/".to_string(),
+        }
+    }
+
+    fn get(w: &mut Worker, target: FetchTarget) -> (Page, Option<String>) {
+        w.handle(&request(target, 4000))
+    }
+
+    fn body(page: &Page) -> String {
+        String::from_utf8(page.body.clone()).unwrap()
+    }
+
+    const ARTICLE: &str = r#"<!DOCTYPE html><html><head><title>Noticia de prueba</title>
+        <script>var x = "<p>nope</p>";</script><style>.a{}</style></head>
+        <body><nav><a href="/">Portada</a></nav><article><h1>Titular</h1>
+        <p>Primer párrafo con <a href="/otra">un enlace</a>.</p><img src="foto.jpg" alt="foto">
+        <form action="/find"><input name="q"></form></article><footer>pie</footer></body></html>"#;
+
+    #[test]
+    fn fetches_converts_and_pages_an_article() {
+        let port = serve(vec![
+            (
+                "/article".to_string(),
+                http("200 OK", "text/html; charset=utf-8", ARTICLE.as_bytes()),
+            ),
+            (
+                "/otra".to_string(),
+                http("200 OK", "text/html", b"<title>Otra</title><p>Segunda</p>"),
+            ),
+            (
+                "/find?q=tetra+radio".to_string(),
+                http("200 OK", "text/html", b"<p>Resultados de tetra</p>"),
+            ),
+        ]);
+        let mut w = worker(browse_cfg(port));
+        let (page, domain) = get(&mut w, FetchTarget::Url(format!("http://127.0.0.1:{port}/article")));
+        let html = body(&page);
+        assert_eq!(page.status, status::OK, "{html}");
+        assert_eq!(domain.as_deref(), Some("127.0.0.1"));
+        assert!(html.contains("<title>Noticia de prueba (1/1)</title>"), "{html}");
+        assert!(
+            html.contains("<p><b>Titular</b></p><p>Primer párrafo con <a href=\"/l/1/0\">un enlace</a>.</p>"),
+            "{html}"
+        );
+        assert!(
+            !html.contains("nope") && !html.contains("Portada") && !html.contains("foto"),
+            "{html}"
+        );
+        assert!(html.contains("<form action=\"/l/1/1\" method=\"get\">"));
+        assert_well_formed(&html);
+
+        // The shortened link and the form go to the right place.
+        let (next, _) = get(&mut w, FetchTarget::Doc("/l/1/0".to_string()));
+        assert!(body(&next).contains("Segunda"));
+        let (found, _) = get(&mut w, FetchTarget::Doc("/l/1/1?q=tetra+radio".to_string()));
+        assert!(body(&found).contains("Resultados de tetra"), "{}", body(&found));
+
+        // Another radio cannot read this radio's documents; unknown documents have expired.
+        let mut other = request(FetchTarget::Doc("/p/1/1".to_string()), 4000);
+        other.issi = 1234;
+        assert_eq!(w.handle(&other).0.status, status::GONE);
+        assert_eq!(get(&mut w, FetchTarget::Doc("/p/99/1".to_string())).0.status, status::GONE);
+    }
+
+    #[test]
+    fn long_page_is_split_with_siguiente() {
+        let text: String = (0..60)
+            .map(|i| format!("<p>Frase número {i} de un artículo largo de prueba.</p>"))
+            .collect();
+        let port = serve(vec![("/long".to_string(), http("200 OK", "text/html", text.as_bytes()))]);
+        let mut w = worker(browse_cfg(port));
+        let (first, _) = get(&mut w, FetchTarget::Url(format!("http://127.0.0.1:{port}/long")));
+        let first = body(&first);
+        assert!(first.contains("<a href=\"/p/1/2\">Siguiente</a>"), "{first}");
+        assert!(first.len() <= 1200);
+        let (second, _) = get(&mut w, FetchTarget::Doc("/p/1/2".to_string()));
+        let second = body(&second);
+        assert!(second.contains("<a href=\"/p/1/1\">Anterior</a>"), "{second}");
+        assert_well_formed(&second);
+    }
+
+    #[test]
+    fn redirect_to_private_is_blocked() {
+        let port = serve(vec![
+            ("/to-lan".to_string(), redirect("http://192.168.1.1/admin")),
+            ("/to-localhost".to_string(), redirect("http://localhost/")),
+            ("/to-self".to_string(), redirect("/final")),
+            ("/final".to_string(), http("200 OK", "text/html", b"<p>llegamos</p>")),
+            ("/loop".to_string(), redirect("/loop")),
+        ]);
+        let mut w = worker(browse_cfg(port));
+        let base = format!("http://127.0.0.1:{port}");
+        let (page, _) = get(&mut w, FetchTarget::Url(format!("{base}/to-lan")));
+        assert_eq!(page.status, status::FORBIDDEN, "{}", body(&page));
+        assert_eq!(
+            get(&mut w, FetchTarget::Url(format!("{base}/to-localhost"))).0.status,
+            status::FORBIDDEN
+        );
+        assert!(body(&get(&mut w, FetchTarget::Url(format!("{base}/to-self"))).0).contains("llegamos"));
+        assert_eq!(get(&mut w, FetchTarget::Url(format!("{base}/loop"))).0.status, status::BAD_GATEWAY);
+        // Without the test override the local server itself is out of reach.
+        let cfg = browse_cfg(port);
+        let mut strict = Worker::new(cfg.clone(), NetPolicy::new(&cfg), Arc::new(Mutex::new(DocCache::default())));
+        assert_eq!(
+            get(&mut strict, FetchTarget::Url(format!("{base}/final"))).0.status,
+            status::FORBIDDEN
+        );
+        assert_eq!(
+            get(&mut strict, FetchTarget::Url("http://10.0.0.1/".to_string())).0.status,
+            status::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn resolver_refuses_names_of_private_addresses() {
+        let resolver = PolicyResolver {
+            policy: NetPolicy::new(&CfgWapBrowse::default()),
+        };
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let result = rt.block_on(resolver.resolve("localhost".parse().unwrap()));
+        let err = result.err().expect("localhost resolves to loopback");
+        assert!(err.downcast_ref::<Refusal>().is_some(), "{err}");
+    }
+
+    #[test]
+    fn size_cap_truncates() {
+        let big: String = (0..3000).map(|i| format!("<p>Línea {i} de relleno.</p>")).collect();
+        let port = serve(vec![("/big".to_string(), http("200 OK", "text/html", big.as_bytes()))]);
+        let mut cfg = browse_cfg(port);
+        cfg.max_download_kb = 16;
+        let mut w = worker(cfg);
+        let (page, _) = get(&mut w, FetchTarget::Url(format!("http://127.0.0.1:{port}/big")));
+        assert_eq!(page.status, status::OK);
+        let mut docs = w.docs();
+        let doc = &docs.get(ISSI, 1, Instant::now()).unwrap().doc;
+        assert!(doc.text_len() < 16 * 1024);
+        assert_eq!(
+            doc.blocks.last(),
+            Some(&Block::Para(vec![Inline::Text(
+                "(Página recortada: demasiado grande.)".to_string()
+            )]))
+        );
+    }
+
+    #[test]
+    fn timeout() {
+        let mut slow = b"SLOW".to_vec();
+        slow.extend(http("200 OK", "text/html", b"<p>tarde</p>"));
+        let port = serve(vec![("/slow".to_string(), slow)]);
+        let mut cfg = browse_cfg(port);
+        cfg.timeout_secs = 1;
+        let mut w = worker(cfg);
+        let started = Instant::now();
+        let (page, _) = get(&mut w, FetchTarget::Url(format!("http://127.0.0.1:{port}/slow")));
+        assert_eq!(page.status, status::GATEWAY_TIMEOUT, "{}", body(&page));
+        assert!(started.elapsed() < Duration::from_millis(2500));
+    }
+
+    #[test]
+    fn charset_latin1_to_utf8() {
+        let port = serve(vec![
+            (
+                "/h".to_string(),
+                http("200 OK", "text/html; charset=ISO-8859-1", b"<p>Canci\xf3n espa\xf1ola</p>"),
+            ),
+            (
+                "/m".to_string(),
+                http("200 OK", "text/html", b"<meta charset=\"windows-1252\"><p>\x93Hola\x94 \x80</p>"),
+            ),
+            ("/u".to_string(), http("200 OK", "text/html", "<p>ya en UTF-8: ñ</p>".as_bytes())),
+            ("/x".to_string(), http("200 OK", "text/html", b"<p>sin declarar: a\xf1o</p>")),
+        ]);
+        let mut w = worker(browse_cfg(port));
+        let base = format!("http://127.0.0.1:{port}");
+        let text = |w: &mut Worker, p: &str| body(&get(w, FetchTarget::Url(format!("{base}{p}"))).0);
+        assert!(text(&mut w, "/h").contains("Canción española"));
+        assert!(text(&mut w, "/m").contains("“Hola” €"));
+        assert!(text(&mut w, "/u").contains("ya en UTF-8: ñ"));
+        assert!(text(&mut w, "/x").contains("sin declarar: año"));
+    }
+
+    #[test]
+    fn wap_content_passes_through() {
+        let wml = "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>\n<wml>\n  <card id=\"c\" title=\"T\"><p>Hola</p></card>\n</wml>";
+        let xhtml = "<?xml version=\"1.0\"?><!DOCTYPE html PUBLIC \"-//WAPFORUM//DTD XHTML Mobile 1.0//EN\" \"x\"><html><head><title>M</title></head><body><p><a href=\"b.xhtml\">b</a></p></body></html>";
+        let port = serve(vec![
+            ("/w".to_string(), http("200 OK", "text/vnd.wap.wml", wml.as_bytes())),
+            ("/x".to_string(), http("200 OK", "application/vnd.wap.xhtml+xml", xhtml.as_bytes())),
+        ]);
+        let mut w = worker(browse_cfg(port));
+        let (page, _) = get(&mut w, FetchTarget::Url(format!("http://127.0.0.1:{port}/w")));
+        assert_eq!(page.kind, ContentKind::Wml);
+        assert_eq!(
+            body(&page),
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?><wml><card id=\"c\" title=\"T\"><p>Hola</p></card></wml>"
+        );
+        let (page, _) = get(&mut w, FetchTarget::Url(format!("http://127.0.0.1:{port}/x")));
+        assert_eq!(page.kind, ContentKind::Xhtml);
+        assert!(body(&page).contains(&format!("<head><base href=\"http://127.0.0.1:{port}/x\"/><title>M</title>")));
+        // Too big for the reply: converted and paged instead.
+        let small = w.handle(&request(FetchTarget::Url(format!("http://127.0.0.1:{port}/x")), 100));
+        assert!(body(&small.0).len() <= 100 || small.0.status != status::OK);
+    }
+
+    #[test]
+    fn search_errors_and_unsupported_types() {
+        let port = serve(vec![
+            (
+                "/lite/?q=radio%20tetra".to_string(),
+                http("200 OK", "text/html", b"<p>resultado</p>"),
+            ),
+            ("/img".to_string(), http("200 OK", "image/png", b"\x89PNG")),
+            ("/gone".to_string(), http("404 Not Found", "text/html", b"<p>no</p>")),
+            ("/empty".to_string(), http("200 OK", "text/html", b"<script>app()</script>")),
+        ]);
+        let mut w = worker(browse_cfg(port));
+        let base = format!("http://127.0.0.1:{port}");
+        assert!(body(&get(&mut w, FetchTarget::Search("radio tetra".to_string())).0).contains("resultado"));
+        assert_eq!(
+            get(&mut w, FetchTarget::Url(format!("{base}/img"))).0.status,
+            status::UNSUPPORTED_MEDIA_TYPE
+        );
+        assert_eq!(get(&mut w, FetchTarget::Url(format!("{base}/gone"))).0.status, status::NOT_FOUND);
+        assert!(body(&get(&mut w, FetchTarget::Url(format!("{base}/empty"))).0).contains("Sin texto"));
+        assert_eq!(
+            get(&mut w, FetchTarget::Url("http://127.0.0.1:1/".to_string())).0.status,
+            status::FORBIDDEN,
+            "port not allowed"
+        );
+    }
+
+    #[test]
+    fn doc_paths() {
+        assert_eq!(parse_doc_path("/p/3/2"), Some(DocPath::Page { doc: 3, page: 2 }));
+        assert_eq!(
+            parse_doc_path("/l/3/7?q=a"),
+            Some(DocPath::Link {
+                doc: 3,
+                link: 7,
+                query: Some("q=a")
+            })
+        );
+        assert_eq!(parse_doc_path("/wx?i=LEMD"), Some(DocPath::Weather { query: Some("i=LEMD") }));
+        assert_eq!(parse_doc_path("/p/x/2"), None);
+        assert_eq!(parse_doc_path("/p/1/2/3"), None);
+        assert_eq!(parse_doc_path("/q/1/2"), None);
+    }
+
+    #[test]
+    fn requests_per_issi_are_limited() {
+        let cfg = CfgWap {
+            enabled: true,
+            browse: CfgWapBrowse {
+                requests_per_issi: 2,
+                // Nothing can be fetched: the replies come back quickly.
+                allowed_ports: vec![1],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut pool = PoolFetcher::spawn(&cfg, NetPolicy::new(&cfg.browse)).unwrap();
+        let req = |id, target| FetchRequest {
+            id,
+            ..request(target, 1000)
+        };
+        for id in 1..=2 {
+            pool.submit(req(id, FetchTarget::Url("http://example.org/".to_string()))).unwrap();
+        }
+        // Pages of a fetched document do not count.
+        pool.submit(req(3, FetchTarget::Doc("/p/1/1".to_string()))).unwrap();
+        pool.submit(req(4, FetchTarget::Search("x".to_string()))).unwrap();
+        let mut replies = HashMap::new();
+        let until = Instant::now() + Duration::from_secs(5);
+        while replies.len() < 4 && Instant::now() < until {
+            match pool.try_recv() {
+                Some(r) => {
+                    replies.insert(r.id, r.page.status);
+                }
+                None => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        assert_eq!(replies.get(&4), Some(&status::SERVICE_UNAVAILABLE), "{replies:?}");
+        assert_eq!(replies.get(&1), Some(&status::FORBIDDEN));
+        assert_eq!(replies.get(&3), Some(&status::GONE));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fetch_thread_is_sched_other() {
+        std::thread::spawn(|| {
+            background_priority();
+            // SAFETY: plain queries on the calling thread.
+            unsafe {
+                assert_eq!(libc::sched_getscheduler(0), libc::SCHED_OTHER);
+                assert!(libc::getpriority(libc::PRIO_PROCESS, 0) >= 10);
+            }
+        })
+        .join()
+        .unwrap();
+    }
+}

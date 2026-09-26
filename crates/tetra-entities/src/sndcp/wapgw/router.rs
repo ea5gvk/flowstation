@@ -4,8 +4,8 @@
 //! - `/`: home page;
 //! - `/status.xhtml` (also `/status`, `/status.html`) and `/status.wml`, with `?s=N` for a
 //!   section: station status (Nexus-BS renderers);
-//! - `/go?u=URL`, `/s?q=QUERY`, `/p/...` and `/l/...`: Internet side, only for the radios allowed
-//!   to browse.
+//! - `/go?u=URL`, `/s?q=QUERY`, `/p/...`, `/l/...` and `/wx?i=ICAO` / `/wx?l=PLACE`: Internet
+//!   side, only for the radios allowed to browse (`/wx` alone is the local weather form).
 //!
 //! Any other host is a page the terminal asks for through the gateway (WSP proxy): Internet side
 //! as well, with the same permission.
@@ -204,6 +204,21 @@ pub fn route(uri: &str, ctx: &RouteCtx<'_>) -> Route {
             };
             ctx.fetch(FetchTarget::Doc(doc))
         }
+        // Weather: the forms are local, the answer comes from the Internet side.
+        "/wx" => {
+            let asked = ["i", "l"]
+                .iter()
+                .any(|k| query_param(parts.query, k).is_some_and(|v| !v.trim().is_empty()));
+            if !asked && ctx.browse() == Browse::Allowed {
+                Route::Page(Page {
+                    status: status::OK,
+                    kind: ContentKind::Xhtml,
+                    body: home::wx_page(None, &home::home_url(ctx.cfg.gateway_ipv4), ctx.budget).into_bytes(),
+                })
+            } else {
+                ctx.fetch(FetchTarget::Doc(format!("/wx?{}", parts.query.unwrap_or(""))))
+            }
+        }
         _ => ctx.notice(status::NOT_FOUND, "No encontrado", "Esa página no existe en la estación."),
     }
 }
@@ -300,6 +315,20 @@ mod tests {
         assert_eq!(p.status, status::FORBIDDEN, "unlisted ISSI");
         let p = page(route_for("http://68k.news/", &cfg(false, &[2260618]), 2260618, 900));
         assert_eq!(p.status, status::FORBIDDEN, "browsing off");
+    }
+
+    #[test]
+    fn weather_form_local_answer_fetched() {
+        let allowed = cfg(true, &[1]);
+        let form = page(route_for("/wx", &allowed, 1, 900));
+        assert_eq!(form.status, status::OK);
+        assert!(String::from_utf8(form.body).unwrap().contains("name=\"i\""));
+        assert_eq!(
+            route_for("/wx?i=LEMD", &allowed, 1, 900),
+            Route::Fetch(FetchTarget::Doc("/wx?i=LEMD".to_string()))
+        );
+        assert_eq!(page(route_for("/wx", &allowed, 2, 900)).status, status::FORBIDDEN);
+        assert_eq!(page(route_for("/wx?l=Madrid", &allowed, 2, 900)).status, status::FORBIDDEN);
     }
 
     #[test]

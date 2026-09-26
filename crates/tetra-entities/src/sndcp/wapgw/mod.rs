@@ -16,8 +16,10 @@
 pub mod convert;
 pub mod debug_udp;
 pub mod doc_cache;
+pub mod fetch;
 pub mod fetcher;
 pub mod home;
+pub mod netpolicy;
 pub mod paginate;
 pub mod router;
 pub mod snapshot;
@@ -32,7 +34,9 @@ use std::time::{Duration, Instant};
 use tetra_config::bluestation::{CfgWap, CfgWapBrowse, CfgWapWtp, SharedConfig, WapSarMode};
 
 use self::debug_udp::DebugUdp;
+use self::fetch::PoolFetcher;
 use self::fetcher::{FetchReply, FetchRequest, FetchTarget, Fetcher, Page, UnavailableFetcher};
+use self::netpolicy::NetPolicy;
 use self::router::{Route, RouteCtx};
 use self::wsp::{ContentKind, WspRequest, status};
 use self::wtp::{Invoke, WtpPdu};
@@ -740,16 +744,25 @@ pub struct WapService {
 impl WapService {
     /// `None` unless `[wap] enabled`.
     pub fn start(config: &SharedConfig) -> Option<Self> {
+        let policy = NetPolicy::new(&config.config().wap.browse);
+        Self::start_with_policy(config, policy)
+    }
+
+    fn start_with_policy(config: &SharedConfig, policy: NetPolicy) -> Option<Self> {
         let cfg = config.effective_wap();
         if !cfg.enabled {
             return None;
         }
         let thresholds = snapshot::thresholds(&config.config());
-        let gateway = WapGateway::new(
-            cfg.clone(),
-            Box::new(UnavailableFetcher::default()),
-            Box::new(move || snapshot::station_snapshot(&thresholds)),
-        );
+        // The pool runs even with browsing off: the dashboard can switch browsing on at runtime.
+        let fetcher: Box<dyn Fetcher> = match PoolFetcher::spawn(&cfg, policy) {
+            Ok(pool) => Box::new(pool),
+            Err(e) => {
+                tracing::error!("WAP: download threads not started ({e}), browsing unavailable");
+                Box::new(UnavailableFetcher::default())
+            }
+        };
+        let gateway = WapGateway::new(cfg.clone(), fetcher, Box::new(move || snapshot::station_snapshot(&thresholds)));
         let debug = cfg.debug_udp_listen.and_then(|listen| match DebugUdp::spawn(listen, &cfg) {
             Ok(debug) => Some(debug),
             Err(e) => {

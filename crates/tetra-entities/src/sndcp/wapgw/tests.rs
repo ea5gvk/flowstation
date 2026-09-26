@@ -75,6 +75,7 @@ impl Fetcher for PageFetcher {
                     kind: ContentKind::Xhtml,
                     body,
                 },
+                domain: None,
             });
         }
         Ok(())
@@ -548,4 +549,128 @@ allowed_issis = [9990]
     let body = String::from_utf8_lossy(&message);
     assert!(body.contains("FlowStation") && body.contains("action=\"/go\""), "{body}");
     assert!(body.ends_with("</html>"));
+}
+
+/// HTTP server on 127.0.0.1 for the end-to-end test: `routes` maps a path to an HTML body.
+fn http_server(routes: Vec<(&'static str, String)>) -> u16 {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut buf = [0u8; 4096];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let path = request.split_whitespace().nth(1).unwrap_or("/");
+            let (code, body) = match routes.iter().find(|(p, _)| *p == path) {
+                Some((_, body)) => ("200 OK", body.as_str()),
+                None => ("404 Not Found", "<p>no</p>"),
+            };
+            let response = format!(
+                "HTTP/1.1 {code}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+        }
+    });
+    port
+}
+
+/// Browsing end to end: a UDP client on 127.0.0.1 asks the debug bearer for a web page served by
+/// a local HTTP server, gets the hold-on Ack and then the first converted page, walks to the next
+/// page and follows a shortened link.
+#[test]
+fn debug_udp_fetches_a_web_page() {
+    let mut article = String::from("<html><head><title>Articulo</title><script>track()</script></head><body>");
+    article.push_str("<p><a href=\"/dos\">Otra noticia</a></p>");
+    for i in 0..40 {
+        article.push_str(&format!("<p>Parrafo {i} del articulo de prueba, con algo de texto.</p>"));
+    }
+    article.push_str("</body></html>");
+    let port = http_server(vec![("/articulo", article), ("/dos", "<p>Pagina dos</p>".to_string())]);
+    let toml = format!(
+        r#"
+config_version = "0.6"
+stack_mode = "Bs"
+
+[phy_io]
+backend = "None"
+
+[net_info]
+mcc = 901
+mnc = 9999
+
+[cell_info]
+main_carrier = 1584
+freq_band = 4
+freq_offset = 0
+duplex_spacing = 4
+reverse_operation = false
+location_area = 1
+
+[wap]
+enabled = true
+mtu = 1500
+debug_udp_listen = "127.0.0.1:0"
+debug_issi = 9990
+
+[wap.browse]
+enabled = true
+allowed_issis = [9990]
+allowed_ports = [{port}]
+"#
+    );
+    let config = SharedConfig::from_parts(tetra_config::bluestation::from_toml_str(&toml).unwrap(), None);
+    // The test server is on loopback, which the real policy refuses.
+    let policy = NetPolicy::new(&config.config().wap.browse).allowing_loopback();
+    let mut svc = WapService::start_with_policy(&config, policy).expect("[wap] enabled");
+    let addr = svc.debug_addr().expect("debug bearer running");
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    client.set_nonblocking(true).unwrap();
+
+    let mut exchange = |payload: &[u8], expect: usize| -> Vec<Vec<u8>> {
+        client.send_to(payload, addr).unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 2048];
+        let until = Instant::now() + Duration::from_secs(10);
+        while got.len() < expect && Instant::now() < until {
+            svc.tick(&config, Instant::now());
+            match client.recv_from(&mut buf) {
+                Ok((n, _)) => got.push(buf[..n].to_vec()),
+                Err(_) => std::thread::sleep(Duration::from_millis(1)),
+            }
+        }
+        got
+    };
+    assert_eq!(&exchange(&connect(1), 1)[0][..4], &[0x12, 0x80, 0x01, 0x02]);
+
+    // Hold-on Ack, then the page in one Result (MTU 1500 carries a 1200-octet page); returns the
+    // XHTML body after acknowledging the Result.
+    let mut fetch = |tid: u16, uri: &str| -> String {
+        let got = exchange(&get(tid, uri), 2);
+        assert_eq!(got.len(), 2, "hold-on Ack and Result for {uri}");
+        assert_eq!(got[0], wtp::ack(tid, None, false), "hold-on Ack first");
+        let (ty, _, flags, _, _, wsp) = result(&got[1]);
+        assert_eq!((ty, flags), (2, TTR));
+        assert_eq!(&wsp[..2], &[0x04, 0x20], "WSP Reply 200");
+        let body = String::from_utf8(wsp[3 + wsp[2] as usize..].to_vec()).unwrap();
+        assert!(exchange(&initiator::ack(tid, None), 0).is_empty());
+        body
+    };
+
+    let url = format!("http%3A%2F%2F127.0.0.1%3A{port}%2Farticulo");
+    let first = fetch(2, &format!("/go?u={url}"));
+    assert!(first.contains("<title>Articulo (1/"), "{first}");
+    assert!(first.contains("<a href=\"/l/1/0\">Otra noticia</a>") && first.contains("Parrafo 0 del articulo"));
+    assert!(first.contains("<a href=\"/p/1/2\">Siguiente</a>") && !first.contains("track()"));
+    assert!(first.len() <= 1200, "{} octets", first.len());
+
+    let second = fetch(3, "/p/1/2");
+    assert!(
+        second.contains("<a href=\"/p/1/1\">Anterior</a>") && second.contains("Parrafo"),
+        "{second}"
+    );
+
+    let linked = fetch(4, "/l/1/0");
+    assert!(linked.contains("Pagina dos"), "{linked}");
 }

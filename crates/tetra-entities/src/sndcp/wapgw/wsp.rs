@@ -24,7 +24,10 @@ pub mod status {
     pub const FORBIDDEN: u8 = 0x43;
     pub const NOT_FOUND: u8 = 0x44;
     pub const METHOD_NOT_ALLOWED: u8 = 0x45;
+    pub const GONE: u8 = 0x4a;
+    pub const UNSUPPORTED_MEDIA_TYPE: u8 = 0x4f;
     pub const INTERNAL_ERROR: u8 = 0x60;
+    pub const BAD_GATEWAY: u8 = 0x62;
     pub const SERVICE_UNAVAILABLE: u8 = 0x63;
     pub const GATEWAY_TIMEOUT: u8 = 0x64;
 }

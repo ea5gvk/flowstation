@@ -89,7 +89,11 @@ pub fn home_page(s: &WapStatusSnapshot, browse: Browse, gateway: Ipv4Addr, bookm
     } else {
         String::new()
     };
-    let status_link = "<p><a href=\"/status.xhtml\">Estado de la BS</a></p>";
+    let status_link = if browse == Browse::Allowed {
+        "<p><a href=\"/status.xhtml\">Estado de la BS</a> | <a href=\"/wx\">Tiempo</a></p>"
+    } else {
+        "<p><a href=\"/status.xhtml\">Estado de la BS</a></p>"
+    };
 
     let candidates = [
         document(
@@ -104,6 +108,25 @@ pub fn home_page(s: &WapStatusSnapshot, browse: Browse, gateway: Ipv4Addr, bookm
     ];
     let smallest = candidates[candidates.len() - 1].clone();
     candidates.into_iter().find(|page| page.len() <= budget).unwrap_or(smallest)
+}
+
+/// Weather page (`/wx`): the last answer, if any, and the forms for a place or an airport.
+pub fn wx_page(result: Option<&str>, home: &str, budget: usize) -> String {
+    let result = result.map(|r| format!("<p>{}</p>", escape_xhtml_text(r))).unwrap_or_default();
+    let forms = "<form action=\"/wx\" method=\"get\"><p>Lugar <input type=\"text\" name=\"l\" size=\"10\"/>\
+         <input type=\"submit\" value=\"Ver\"/></p></form>\
+         <form action=\"/wx\" method=\"get\"><p>METAR <input type=\"text\" name=\"i\" size=\"4\"/>\
+         <input type=\"submit\" value=\"Ver\"/></p></form>";
+    let link = format!("<p><a href=\"{home}\">Inicio</a></p>");
+    let full = document(true, "Tiempo", Some(home), &format!("{result}{forms}{link}"));
+    if full.len() <= budget {
+        return full;
+    }
+    let short = document(false, "Tiempo", Some(home), &format!("{result}{forms}"));
+    if short.len() <= budget {
+        return short;
+    }
+    document(false, "Tiempo", None, &result)
 }
 
 /// A short page with a title, a sentence and a link home.
@@ -212,6 +235,16 @@ mod tests {
         let tiny = notice_page("Error", "texto largo", "http://10.0.0.1/", 150);
         assert!(tiny.len() <= 150, "{} bytes", tiny.len());
         assert_well_formed(&tiny);
+    }
+
+    #[test]
+    fn wx_page_has_forms_and_fits() {
+        let page = wx_page(Some("WX Madrid: Soleado <25C>"), "http://10.0.0.1/", 4096);
+        assert!(page.contains("<p>WX Madrid: Soleado &lt;25C&gt;</p>") && page.contains("name=\"i\""));
+        assert_well_formed(&page);
+        let small = wx_page(None, "http://10.0.0.1/", 500);
+        assert!(small.len() <= 500 && small.contains("name=\"l\""), "{small}");
+        assert_well_formed(&small);
     }
 
     #[test]

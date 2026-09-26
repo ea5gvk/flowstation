@@ -479,9 +479,12 @@ voice_service = true
 # the radios listed in [wap.browse] allowed_issis also get a search box and bookmarks for
 # text-only sites. Everything is off by default.
 #
+# Browsing fetches the page on the station (http/https only, public addresses only: LAN,
+# loopback, link-local and CGNAT are refused, also after DNS and after every redirect), turns it
+# into small XHTML-MP pages with "Siguiente" links, and logs only the domain.
+#
 # Not in this build yet: the SNDCP packet-data bearer (so radios cannot reach the gateway over
-# the air) and the Internet fetcher (a radio allowed to browse gets a "not available" page).
-# Until then the gateway is reachable only through the debug UDP bearer, for example with
+# the air). Until then the gateway is reachable only through the debug UDP bearer, for example with
 # contrib/wap-debug/wtp_client.py. That bearer answers anyone who can reach it, so it listens
 # on loopback; to test from the LAN use debug_udp_listen = "0.0.0.0:9200" and restrict
 # debug_udp_allowed_sources to your LAN (a LAN listener without a source list is refused).
@@ -509,6 +512,19 @@ voice_service = true
 # allowed_issis = []                             # radios that may browse; empty = nobody
 # search_url = "http://lite.duckduckgo.com/lite/?q="  # the query is appended URL-encoded
 # bookmarks = ["http://68k.news/", "http://wiby.me/", "http://text.npr.org/"]
+# user_agent = "Mozilla/5.0 (compatible; FlowStation-WAP/1.0; TETRA text gateway)"
+# accept_language = "es-ES,es;q=0.9,en;q=0.5"
+# timeout_secs = 15                              # whole download, redirects included (1..=40)
+# max_download_kb = 256                          # larger pages are cut and converted as far as they got
+# max_redirects = 5
+# page_bytes = 1200                              # size of one page of a converted document
+# max_pages_per_doc = 40
+# allowed_ports = [80, 443]                      # ports a page may be fetched from
+# domain_allowlist = []                          # only these domains (and subdomains); empty = any
+# domain_denylist = []                           # never these domains (and subdomains)
+# requests_per_issi = 20                         # Internet requests per radio ...
+# requests_window_secs = 600                     # ... in this window
+# max_concurrent_fetches = 2                     # downloads at the same time (1..=4)
 
 ###############################################################################
 
