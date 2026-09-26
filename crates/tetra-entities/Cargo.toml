@@ -46,5 +46,9 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[dev-dependencies]
+# XML well-formedness checks of the WAP gateway pages.
+quick-xml = "0.37"
+
 [lints]
 workspace = true

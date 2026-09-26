@@ -165,6 +165,14 @@ impl HealthRegistry {
         }
     }
 
+    /// Radios last reported as registered (stays 0 while telemetry is off).
+    pub fn registered_radios(&self) -> usize {
+        self.registered_radios.load(Ordering::Relaxed)
+    }
+    pub fn sds_queue_depth(&self) -> usize {
+        self.sds_queue_depth.load(Ordering::Relaxed)
+    }
+
     /// Core ticks since process start.
     pub fn core_ticks(&self) -> u64 {
         self.core_ticks.load(Ordering::Relaxed)
