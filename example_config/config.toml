@@ -189,6 +189,15 @@ voice_service = true
 # Valid values: 0..5 (ETSI Table 51). Default: 0 = AttachedPermanently.
 # dgna_attachment_mode = 0
 
+# Parrot (private echo) service: make a SIMPLEX private call to parrot_issi, talk, release the
+# PTT and the recording (up to parrot_max_secs) is played back to you, then the call is cleared.
+# Handled locally, never sent to Brew/Asterisk. While enabled, a local radio registered with
+# parrot_issi cannot be called. Only one parrot call at a time; duplex calls are rejected.
+# Default: off (a call to that ISSI is routed as any other).
+# parrot_enabled = false
+# parrot_issi = 99999
+# parrot_max_secs = 20
+
 # Maximum active call duration in seconds — ETSI EN 300 392-2 §14.9.1 T310 equivalent (FlowStation).
 # After this time the BS sends D-RELEASE regardless of call activity.
 # 0 = no limit (infinite — call runs until U-DISCONNECT or hangtime).

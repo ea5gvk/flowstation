@@ -677,6 +677,27 @@ main_carrier_number = 1586
     }
 
     #[test]
+    fn parrot_defaults_off_on_99999_and_validates_values() {
+        let cfg = from_toml_str(&minimal_toml("")).expect("parse");
+        assert!(!cfg.cell.parrot_enabled, "absent flag => parrot off");
+        assert_eq!(cfg.cell.parrot_issi, 99_999);
+        assert_eq!(cfg.cell.parrot_max_secs, 20);
+
+        let cfg = from_toml_str(&minimal_toml("parrot_enabled = true\nparrot_issi = 12345\nparrot_max_secs = 10")).expect("parse");
+        assert!(cfg.cell.parrot_enabled);
+        assert_eq!(cfg.cell.parrot_issi, 12345);
+        assert_eq!(cfg.cell.parrot_max_secs, 10);
+
+        let cfg = from_toml_str(&minimal_toml("parrot_issi = 0\nparrot_max_secs = 0")).expect("parse");
+        assert_eq!(cfg.cell.parrot_issi, 99_999, "ISSI 0 is not a valid parrot ISSI");
+        assert_eq!(cfg.cell.parrot_max_secs, 1, "recording limit is clamped to 1..=60 s");
+
+        let cfg = from_toml_str(&minimal_toml("parrot_issi = 16777215\nparrot_max_secs = 600")).expect("parse");
+        assert_eq!(cfg.cell.parrot_issi, 99_999, "the all-ones SSI is not a valid parrot ISSI");
+        assert_eq!(cfg.cell.parrot_max_secs, 60);
+    }
+
+    #[test]
     fn telegram_alerts_section_parses() {
         let toml = minimal_toml("")
             + r#"

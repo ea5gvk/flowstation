@@ -223,6 +223,15 @@ pub struct CfgCellInfo {
     /// config knob rather than a per-click operator choice unless the advanced dashboard picker is
     /// enabled. Default: 0 (Attached permanently), per EN 300 392-2 Table 16.51.
     pub dgna_attachment_mode: u8,
+
+    /// Parrot service: a simplex private call to `parrot_issi` records what the caller says
+    /// (up to `parrot_max_secs`), plays it back when the PTT is released and hangs up.
+    /// Default: false, so a call to that ISSI is routed as any other.
+    pub parrot_enabled: bool,
+    /// ISSI the parrot answers on. Default: 99999.
+    pub parrot_issi: u32,
+    /// Longest recording played back, in seconds. Default: 20. Range: 1–60.
+    pub parrot_max_secs: u32,
 }
 
 #[derive(Default, Deserialize)]
@@ -306,6 +315,13 @@ pub struct CellInfoDto {
     /// Default SS-DGNA attachment mode for operator regroup commands. Absent = 0
     /// (Attached permanently). Values outside 0..=5 are clamped.
     pub dgna_attachment_mode: Option<u8>,
+
+    /// Parrot (private echo) service. Default: false.
+    pub parrot_enabled: Option<bool>,
+    /// ISSI of the parrot service. Default: 99999.
+    pub parrot_issi: Option<u32>,
+    /// Parrot recording limit in seconds. Default: 20.
+    pub parrot_max_secs: Option<u32>,
 
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
@@ -393,6 +409,9 @@ pub fn cell_dto_to_cfg(ci: CellInfoDto) -> CfgCellInfo {
         release_group_on_same_speaker_retake: ci.release_group_on_same_speaker_retake.unwrap_or(false),
         dgna_use_ss_facility: ci.dgna_use_ss_facility.unwrap_or(true),
         dgna_attachment_mode: ci.dgna_attachment_mode.unwrap_or(0).min(5),
+        parrot_enabled: ci.parrot_enabled.unwrap_or(false),
+        parrot_issi: ci.parrot_issi.filter(|v| (1..=0xFF_FFFE).contains(v)).unwrap_or(99_999),
+        parrot_max_secs: ci.parrot_max_secs.unwrap_or(20).clamp(1, 60),
     }
 }
 

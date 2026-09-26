@@ -97,6 +97,9 @@ pub fn default_cell_info(freq_info: FreqInfo) -> CfgCellInfo {
         sds_command_control: None,
         release_group_on_same_speaker_retake: false,
         dgna_use_ss_facility: true,
+        parrot_enabled: false,
+        parrot_issi: 99_999,
+        parrot_max_secs: 20,
     }
 }
 
