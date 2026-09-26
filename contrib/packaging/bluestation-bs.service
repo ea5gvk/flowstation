@@ -18,6 +18,15 @@ StartLimitBurst=10
 
 [Service]
 Type=simple
+# Optional systemd watchdog. The binary sends READY=1 once the core loop ticks and then
+# WATCHDOG=1 only while it keeps ticking, so systemd kills and restarts a hung core loop
+# (the in-process restart_on_core_stall cannot: a hung loop never reads its stop flag).
+# To enable it, replace Type=simple with these lines (TimeoutStartSec covers the SDR-open
+# retries):
+#Type=notify
+#NotifyAccess=main
+#WatchdogSec=30s
+#TimeoutStartSec=120s
 ExecStart=/usr/bin/bluestation-bs /etc/flowstation/config.toml
 # Real-time scheduling for the PHY loop (same as the source deployment).
 CPUSchedulingPolicy=fifo

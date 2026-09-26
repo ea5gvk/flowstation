@@ -108,6 +108,8 @@ systemctl daemon-reload
 systemctl enable --now tetra
 ```
 
+The unit ships as `Type=simple`. It carries a commented-out systemd watchdog block (`Type=notify` + `WatchdogSec=30s`): with it, systemd restarts the station if the core loop hangs.
+
 ---
 
 ## Configuration

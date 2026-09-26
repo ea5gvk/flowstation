@@ -8191,7 +8191,7 @@ const HEALTH_ADVICE = {
     critical: { why: 'The stack stopped processing TDMA frames. Calls and SDS will fail and radios may drop. This is the most serious state.',
       do: ['Check the Log for a panic or repeated SDR errors.',
            'Restart the service: `systemctl restart <unit>`.',
-           'Enable the software watchdog so this auto-recovers: `[health] restart_on_core_stall = true`.'] },
+           'For auto-recovery run the unit under the systemd watchdog (Type=notify + WatchdogSec=30s, see contrib/systemd; tetra-live-monitor sets it up): unlike `[health] restart_on_core_stall = true`, it also recovers a hung loop.'] },
   },
   backhaul: {
     ok: { why: 'The Brew/TetraPack interconnect is up — calls/SDS route to other cells & BrandMeister.', do: [] },

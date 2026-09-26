@@ -439,6 +439,12 @@ voice_service = true
 # that is RF-/service-affecting, so it defaults OFF and is a deliberate operator choice. The
 # whole block can be omitted; these are the defaults.
 #
+# restart_on_core_stall cannot recover a truly hung loop (it never reads the stop flag). For
+# that, run the unit under the systemd watchdog (Type=notify + WatchdogSec=30s, see
+# contrib/systemd); when it is armed it takes over the core-stall restart, and core_stall_secs
+# (at least 5 s, at most half of WatchdogSec) is how old the last tick may be before the
+# watchdog stops being fed.
+#
 # [health]
 # enabled = true                    # master on/off for the monitor (default true)
 # snapshot_interval_secs = 5        # how often a snapshot is emitted (1..=300)
