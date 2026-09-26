@@ -14,6 +14,8 @@ const FULL_MARKUP_BYTES: usize = 900;
 const COMPACT_MARKUP_BYTES: usize = 450;
 /// A paragraph is only cut when at least this much room is left on the page.
 const MIN_SPLIT_BYTES: usize = 60;
+/// Smallest piece of a paragraph left at the bottom of a page.
+const MIN_HEAD_CHARS: usize = 12;
 const TITLE_CHARS: usize = 30;
 const TRUNCATED_NOTE: &str = "<p>(Documento recortado)</p>";
 /// Smallest room for content on a page.
@@ -184,10 +186,10 @@ impl Layout<'_> {
                 used += cost;
                 continue;
             }
-            let force = force && head.is_empty();
+            let first = force && head.is_empty();
             let mut tail: Vec<Inline> = Vec::new();
             match item {
-                Inline::Text(t) => match split_text(t, room - used, force) {
+                Inline::Text(t) => match split_text(t, room - used, first) {
                     Some((a, b)) => {
                         if !a.is_empty() {
                             head.push(Inline::Text(a));
@@ -199,7 +201,7 @@ impl Layout<'_> {
                     None => tail.push(item.clone()),
                 },
                 // A link that does not fit an empty page loses its target.
-                Inline::Link { text, .. } if force => match split_text(text, room, true) {
+                Inline::Link { text, .. } if first => match split_text(text, room, true) {
                     Some((a, b)) => {
                         head.push(Inline::Text(a));
                         if !b.is_empty() {
@@ -213,6 +215,18 @@ impl Layout<'_> {
             tail.extend_from_slice(&v[i + 1..]);
             while head.last() == Some(&Inline::Br) {
                 head.pop();
+            }
+            // Do not leave a lone list bullet or a word or two behind: move the whole block.
+            let head_chars: usize = head
+                .iter()
+                .map(|i| match i {
+                    Inline::Text(t) => t.trim().chars().count(),
+                    Inline::Link { .. } => MIN_HEAD_CHARS,
+                    Inline::Br => 0,
+                })
+                .sum();
+            if !force && head_chars < MIN_HEAD_CHARS {
+                return (Vec::new(), v.to_vec());
             }
             while tail.first() == Some(&Inline::Br) {
                 tail.remove(0);
@@ -428,6 +442,25 @@ mod tests {
             xs += page.matches('x').count() - HTML_OPEN.matches('x').count();
         }
         assert_eq!(xs, 3000);
+    }
+
+    #[test]
+    fn no_lone_bullet_at_the_bottom_of_a_page() {
+        let item = |i: usize| {
+            Block::Para(vec![
+                Inline::Text("- ".to_string()),
+                Inline::Link {
+                    text: format!("Titular largo número {i} de una lista de noticias de prueba"),
+                    link: 0,
+                },
+            ])
+        };
+        let d = doc((0..20).map(item).collect());
+        let (_, total) = render_page(&d, 1, 1, 1200, 40, HOME).unwrap();
+        for n in 1..=total {
+            let (page, _) = render_page(&d, 1, n, 1200, 40, HOME).unwrap();
+            assert!(!page.contains("<p>- </p>"), "page {n}: {page}");
+        }
     }
 
     #[test]
