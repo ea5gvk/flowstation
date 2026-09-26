@@ -27,11 +27,11 @@ pub mod wsp;
 pub mod wtp;
 pub mod wtp_sar;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tetra_config::bluestation::{CfgWap, CfgWapBrowse, CfgWapWtp, SharedConfig, WapSarMode};
+use tetra_config::bluestation::{CfgWap, CfgWapBrowse, CfgWapWtp, SharedConfig, WapRuntimeStatus, WapSarMode, WapSessionStatus};
 
 use self::debug_udp::DebugUdp;
 use self::fetch::PoolFetcher;
@@ -61,6 +61,14 @@ const REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(30);
 const FETCH_GUARD: Duration = Duration::from_secs(45);
 /// Bound on open transactions (a flood must not grow memory).
 const MAX_TRANSACTIONS: usize = 256;
+/// Bound on WSP sessions; the least recently used one goes first.
+const MAX_SESSIONS: usize = 256;
+/// A session with no request for this long is forgotten (the terminal starts a new one).
+const SESSION_IDLE_SECS: u64 = 3600;
+/// Domains listed in the dashboard status.
+const RECENT_DOMAINS: usize = 10;
+/// The dashboard status is refreshed at most this often.
+const STATUS_INTERVAL: Duration = Duration::from_secs(1);
 const ABORT_REASON_CAPTEMPEXCEEDED: u8 = 7;
 /// Debug datagrams taken per stack tick.
 const MAX_DEBUG_IN_PER_TICK: usize = 16;
@@ -158,6 +166,26 @@ struct Tx {
 struct Session {
     issi: u32,
     client_sdu: usize,
+    peer: WapPeer,
+    last_seen_unix: u64,
+    /// Host of the last page fetched in this session.
+    last_domain: Option<String>,
+}
+
+impl Session {
+    fn new(peer: WapPeer, client_sdu: usize) -> Self {
+        Self {
+            issi: peer.issi,
+            client_sdu,
+            peer,
+            last_seen_unix: unix_now(),
+            last_domain: None,
+        }
+    }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 type StatusSource = Box<dyn Fn() -> WapStatusSnapshot + Send>;
@@ -174,6 +202,9 @@ pub struct WapGateway {
     next_session_id: u32,
     next_fetch_id: u64,
     out: Vec<UdpOut>,
+    /// Hosts fetched recently, newest first, with a count (dashboard).
+    recent_domains: VecDeque<(String, u32)>,
+    fetches: u64,
 }
 
 fn push(out: &mut Vec<UdpOut>, peer: WapPeer, server_port: u16, client_port: u16, payload: Vec<u8>) {
@@ -204,6 +235,7 @@ fn target_for_log(target: &FetchTarget) -> String {
             .unwrap_or("")
             .to_string(),
         FetchTarget::Search(_) => "(search)".to_string(),
+        FetchTarget::Doc(path) if path.starts_with("/wx") => "(weather)".to_string(),
         FetchTarget::Doc(_) => "(document page)".to_string(),
     }
 }
@@ -221,7 +253,53 @@ impl WapGateway {
             next_session_id: 1,
             next_fetch_id: 1,
             out: Vec::new(),
+            recent_domains: VecDeque::new(),
+            fetches: 0,
         }
+    }
+
+    /// Sessions and recently fetched domains, for the dashboard.
+    pub fn status(&self) -> WapRuntimeStatus {
+        let mut sessions: Vec<WapSessionStatus> = self
+            .sessions
+            .values()
+            .map(|s| WapSessionStatus {
+                issi: s.issi,
+                ip: s.peer.ip.to_string(),
+                via: match s.peer.via {
+                    WapVia::Air => "air",
+                    WapVia::DebugUdp => "debug-udp",
+                }
+                .to_string(),
+                last_seen_unix: s.last_seen_unix,
+                last_domain: s.last_domain.clone(),
+            })
+            .collect();
+        sessions.sort_by(|a, b| (a.issi, &a.ip).cmp(&(b.issi, &b.ip)));
+        WapRuntimeStatus {
+            running: true,
+            browse_enabled: self.cfg.browse.enabled,
+            sessions,
+            recent_domains: self.recent_domains.iter().cloned().collect(),
+            fetches: self.fetches,
+        }
+    }
+
+    /// Forget sessions that have been idle for `idle_secs`.
+    pub fn expire_sessions(&mut self, now_unix: u64, idle_secs: u64) {
+        self.sessions.retain(|_, s| now_unix.saturating_sub(s.last_seen_unix) < idle_secs);
+    }
+
+    fn note_domain(&mut self, key: TxKey, domain: String) {
+        if let Some(session) = self.sessions.get_mut(&(key.ip, key.port)) {
+            session.last_domain = Some(domain.clone());
+        }
+        let count = match self.recent_domains.iter().position(|(d, _)| *d == domain) {
+            Some(i) => self.recent_domains.remove(i).map(|(_, n)| n).unwrap_or(0),
+            None => 0,
+        };
+        self.recent_domains.push_front((domain, count.saturating_add(1)));
+        self.recent_domains.truncate(RECENT_DOMAINS);
     }
 
     /// Apply a new browse switch / ISSI list (dashboard override).
@@ -474,6 +552,9 @@ impl WapGateway {
     }
 
     fn handle_request(&mut self, key: TxKey, peer: WapPeer, server_port: u16, class: u8, wsp_pdu: &[u8], now: Instant) {
+        if let Some(session) = self.sessions.get_mut(&(peer.ip, key.port)) {
+            session.last_seen_unix = unix_now();
+        }
         match wsp::parse_request(wsp_pdu) {
             WspRequest::Connect(connect) => {
                 let id = self.next_session_id;
@@ -481,23 +562,20 @@ impl WapGateway {
                 let client_sdu = wsp::requested_client_sdu(&connect)
                     .unwrap_or(self.cfg.max_message_bytes)
                     .min(self.cfg.max_message_bytes);
-                self.sessions.insert(
-                    (peer.ip, key.port),
-                    Session {
-                        issi: peer.issi,
-                        client_sdu,
-                    },
-                );
+                if self.sessions.len() >= MAX_SESSIONS
+                    && !self.sessions.contains_key(&(peer.ip, key.port))
+                    && let Some(oldest) = self.sessions.iter().min_by_key(|(_, s)| s.last_seen_unix).map(|(k, _)| *k)
+                {
+                    self.sessions.remove(&oldest);
+                }
+                self.sessions.insert((peer.ip, key.port), Session::new(peer, client_sdu));
                 tracing::info!("WAP: ISSI {} connected (session {}, Client-SDU {})", peer.issi, id, client_sdu);
                 let reply = wsp::connect_reply(id, &connect, self.cfg.max_message_bytes, self.cfg.max_request_bytes);
                 self.respond(key, peer, server_port, class, reply, now);
             }
             WspRequest::Resume { session_id } => {
                 let max = self.cfg.max_message_bytes;
-                self.sessions.entry((peer.ip, key.port)).or_insert(Session {
-                    issi: peer.issi,
-                    client_sdu: max,
-                });
+                self.sessions.entry((peer.ip, key.port)).or_insert_with(|| Session::new(peer, max));
                 tracing::info!("WAP: ISSI {} resumed session {}", peer.issi, session_id);
                 self.respond(key, peer, server_port, class, wsp::empty_reply(status::OK), now);
             }
@@ -579,6 +657,7 @@ impl WapGateway {
             self.respond_page(key, peer, server_port, class, page, now);
             return;
         }
+        self.fetches += 1;
         self.insert_tx(key, peer, server_port, TxState::Fetching { id, since: now });
         // Hold-on: the request is accepted (the WSP user's acknowledgement when U/P is set).
         push(&mut self.out, peer, server_port, key.port, wtp::ack(key.tid, None, false));
@@ -591,7 +670,12 @@ impl WapGateway {
             .find(|(_, tx)| matches!(tx.state, TxState::Fetching { id, .. } if id == reply.id))
             .map(|(key, tx)| (*key, tx.peer, tx.server_port));
         match found {
-            Some((key, peer, server_port)) => self.respond_page(key, peer, server_port, 2, reply.page, now),
+            Some((key, peer, server_port)) => {
+                if let Some(domain) = reply.domain {
+                    self.note_domain(key, domain);
+                }
+                self.respond_page(key, peer, server_port, 2, reply.page, now)
+            }
             None => tracing::debug!("WAP: fetch {} finished after its transaction ended", reply.id),
         }
     }
@@ -739,6 +823,9 @@ pub struct WapService {
     gateway: WapGateway,
     debug: Option<DebugUdp>,
     debug_issi: u32,
+    last_status: Option<Instant>,
+    /// What the dashboard was last given.
+    published: WapRuntimeStatus,
 }
 
 impl WapService {
@@ -780,6 +867,8 @@ impl WapService {
             gateway,
             debug,
             debug_issi: cfg.debug_issi,
+            last_status: None,
+            published: WapRuntimeStatus::default(),
         })
     }
 
@@ -818,6 +907,17 @@ impl WapService {
             match (&self.debug, out.peer.via) {
                 (Some(debug), WapVia::DebugUdp) => debug.send(SocketAddrV4::new(out.peer.ip, out.dst_port), out.payload),
                 _ => tracing::debug!("WAP: no bearer to ISSI {} yet, reply dropped", out.peer.issi),
+            }
+        }
+        if self.last_status.is_none_or(|t| now.duration_since(t) >= STATUS_INTERVAL) {
+            self.last_status = Some(now);
+            // Pick up the dashboard's browse switch and ISSI list even without traffic.
+            self.gateway.set_browse(config.effective_wap().browse);
+            self.gateway.expire_sessions(unix_now(), SESSION_IDLE_SECS);
+            let status = self.gateway.status();
+            if status != self.published {
+                config.state_write().wap_status = status.clone();
+                self.published = status;
             }
         }
     }

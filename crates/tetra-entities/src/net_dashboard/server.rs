@@ -2377,6 +2377,10 @@ fn handle_connection(
         let mut s = stream;
         drain_http_headers(&mut s);
         serve_geoalarm_get(s, &shared_config);
+    } else if req_line.contains("GET /api/wap") {
+        let mut s = stream;
+        drain_http_headers(&mut s);
+        serve_wap_get(s, &shared_config);
     } else if req_line.contains("POST /api/geoalarm") {
         let (inner, body_str) = read_post_body(stream);
         serve_geoalarm_post(inner, &shared_config, &config_path, &body_str);
@@ -5434,6 +5438,46 @@ fn serve_geoalarm_get(stream: TcpStream, shared_config: &Option<tetra_config::bl
     http_json_response(stream, 200, &body.to_string());
 }
 
+/// GET /api/wap — WAP gateway sessions and the domains fetched recently (never full URLs).
+fn serve_wap_get(stream: TcpStream, shared_config: &Option<tetra_config::bluestation::SharedConfig>) {
+    let (wap, status) = match shared_config {
+        Some(cfg) => (cfg.effective_wap(), cfg.state_read().wap_status.clone()),
+        None => (Default::default(), Default::default()),
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let sessions: Vec<_> = status
+        .sessions
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "issi": s.issi,
+                "ip": s.ip,
+                "via": s.via,
+                "idle_secs": now.saturating_sub(s.last_seen_unix),
+                "last_domain": s.last_domain,
+            })
+        })
+        .collect();
+    let domains: Vec<_> = status
+        .recent_domains
+        .iter()
+        .map(|(domain, count)| serde_json::json!({"domain": domain, "count": count}))
+        .collect();
+    let body = serde_json::json!({
+        "enabled": wap.enabled,
+        "running": status.running,
+        "browse_enabled": wap.browse.enabled,
+        "allowed_issis": wap.browse.allowed_issis,
+        "sessions": sessions,
+        "recent_domains": domains,
+        "fetches": status.fetches,
+    });
+    http_json_response(stream, 200, &body.to_string());
+}
+
 /// POST /api/geoalarm — update GeoAlarm settings. Applies immediately through StackState
 /// override and rewrites `[geoalarm]` in config.toml.
 fn serve_geoalarm_post(stream: TcpStream, shared_config: &Option<tetra_config::bluestation::SharedConfig>, config_path: &str, body: &str) {
@@ -5965,6 +6009,48 @@ location_area = 1
         let body = response.split("\r\n\r\n").nth(1).expect("HTTP body");
         let json: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(json["12345"], serde_json::json!({"cs": "Parrot", "fl": ""}));
+    }
+
+    /// /api/wap reports the WAP sessions and domains the SNDCP entity published.
+    #[test]
+    fn wap_status_endpoint_lists_sessions_and_domains() {
+        use std::io::Read;
+        use tetra_config::bluestation::{WapRuntimeStatus, WapSessionStatus};
+
+        let cfg = tetra_config::bluestation::parsing::from_toml_str(&format!(
+            "{MINIMAL_CONFIG}\n[wap]\nenabled = true\n\n[wap.browse]\nenabled = true\nallowed_issis = [2260618]\n"
+        ))
+        .unwrap();
+        let shared = tetra_config::bluestation::SharedConfig::from_parts(cfg, None);
+        shared.state_write().wap_status = WapRuntimeStatus {
+            running: true,
+            browse_enabled: true,
+            sessions: vec![WapSessionStatus {
+                issi: 2260618,
+                ip: "10.0.0.2".to_string(),
+                via: "air".to_string(),
+                last_seen_unix: 0,
+                last_domain: Some("text.npr.org".to_string()),
+            }],
+            recent_domains: vec![("text.npr.org".to_string(), 3)],
+            fetches: 4,
+        };
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        super::serve_wap_get(server, &Some(shared));
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+
+        let body = response.split("\r\n\r\n").nth(1).expect("HTTP body");
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(json["enabled"], true);
+        assert_eq!(json["allowed_issis"], serde_json::json!([2260618]));
+        assert_eq!(json["sessions"][0]["issi"], 2260618);
+        assert_eq!(json["sessions"][0]["last_domain"], "text.npr.org");
+        assert_eq!(json["recent_domains"], serde_json::json!([{"domain": "text.npr.org", "count": 3}]));
+        assert_eq!(json["fetches"], 4);
     }
 
     /// A bad config body posted to /api/config must be rejected (400) and must NOT touch the file on

@@ -6,8 +6,9 @@
 //! python contrib/wap-debug/wtp_client.py 127.0.0.1 9200 / /status.xhtml
 //! ```
 //!
-//! Without a config file it listens on 127.0.0.1:9200 and lets the debug ISSI 9990 browse (the
-//! Internet side of this build only answers "not available").
+//! Without a config file it listens on 127.0.0.1:9200 and lets the debug ISSI 9990 browse the
+//! Internet, e.g. `"/go?u=text.npr.org"`, then `/p/1/2` for its next page (from Git Bash, set
+//! `MSYS_NO_PATHCONV=1` so the URIs are not turned into Windows paths).
 
 use std::time::Duration;
 

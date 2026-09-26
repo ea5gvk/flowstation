@@ -8241,6 +8241,7 @@ const INTEGRATION_SVG = {
   asterisk:'<path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72c.13.96.36 1.9.7 2.81a2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45c.9.34 1.85.57 2.81.7A2 2 0 0 1 22 16.92z"/>',
   dapnet:'<rect x="5" y="2" width="14" height="20" rx="2"/><path d="M9 6h6M9 10h6M9 14h3"/>',
   geoalarm:'<path d="M12 21s-7-5.5-7-11a7 7 0 0 1 14 0c0 5.5-7 11-7 11z"/><circle cx="12" cy="10" r="2.5"/>',
+  wap:'<circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15 15 0 0 1 0 20M12 2a15 15 0 0 0 0 20"/>',
 };
 function integrationSvg(key){
   const p = INTEGRATION_SVG[key] || '<circle cx="12" cy="12" r="3"/>';
@@ -8297,7 +8298,7 @@ function renderHealthTab(h){
   });
 }
 
-let healthIntegrationState={asterisk:null,dapnet:null,geoalarm:null,lastLoad:0};
+let healthIntegrationState={asterisk:null,dapnet:null,geoalarm:null,wap:null,lastLoad:0};
 // title, iconKey (asterisk|dapnet|geoalarm), accent (blue|purple|''), level, detail, extra.
 function integrationHealthCard(title,iconKey,accent,level,detail,extra){
   const lvlCls = healthLevelClass(level);
@@ -8374,6 +8375,18 @@ function classifyGeoalarmHealth(data){
   const extra=notes.length?notes.join(' · '):('Center '+(rt.center||'—')+' · radius '+Number(rt.radius_m||data.radius_m||0).toFixed(0)+' m · routes '+paths.join(', '));
   return {level,detail,extra};
 }
+function classifyWapHealth(data){
+  // WAP gateway: open WSP sessions (ISSI and the last domain fetched) and recent domains only.
+  const s=data.sessions||[];
+  const detail=s.length+' session(s) · '+(data.fetches??0)+' page request(s)';
+  const who=s.slice(0,6).map(x=>x.issi+(x.last_domain?' → '+x.last_domain:'')+' ('+healthDur(x.idle_secs)+')').join(' · ');
+  const doms=(data.recent_domains||[]).slice(0,8).map(d=>d.domain+(d.count>1?' ×'+d.count:'')).join(', ');
+  const parts=[(data.browse_enabled?'Browsing on for '+(data.allowed_issis||[]).length+' radio(s)':'Browsing off')];
+  if(!data.running)parts.push('gateway not running');
+  if(who)parts.push('Sessions: '+who);
+  if(doms)parts.push('Domains: '+doms);
+  return {level:data.running?'ok':'degraded',detail,extra:parts.join(' · ')};
+}
 function renderHealthIntegrations(){
   const grid=document.getElementById('health-integrations-grid');
   if(!grid)return;
@@ -8396,18 +8409,25 @@ function renderHealthIntegrations(){
   } else {
     grid.appendChild(integrationHealthCard('GeoAlarm','geoalarm','purple','degraded','status unavailable','Open the GeoAlarm page or wait for the next refresh.'));
   }
+  // Shown only when [wap] is enabled, so stations without it see no change.
+  if(healthIntegrationState.wap&&healthIntegrationState.wap.enabled){
+    const w=classifyWapHealth(healthIntegrationState.wap);
+    grid.appendChild(integrationHealthCard('WAP gateway','wap','blue',w.level,w.detail,w.extra));
+  }
 }
 async function loadHealthIntegrations(){
   healthIntegrationState.lastLoad=Date.now();
   try{
-    const [ast,dap,geo]=await Promise.all([
+    const [ast,dap,geo,wap]=await Promise.all([
       fetch('/api/asterisk/status').then(r=>r.ok?r.json():null).catch(()=>null),
       fetch('/api/dapnet').then(r=>r.ok?r.json():null).catch(()=>null),
-      fetch('/api/geoalarm').then(r=>r.ok?r.json():null).catch(()=>null)
+      fetch('/api/geoalarm').then(r=>r.ok?r.json():null).catch(()=>null),
+      fetch('/api/wap').then(r=>r.ok?r.json():null).catch(()=>null)
     ]);
     healthIntegrationState.asterisk=ast;
     healthIntegrationState.dapnet=dap;
     healthIntegrationState.geoalarm=geo;
+    healthIntegrationState.wap=wap;
   }catch{}
   renderHealthIntegrations();
 }

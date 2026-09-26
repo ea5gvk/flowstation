@@ -243,6 +243,32 @@ pub struct WapRuntimeOverride {
     pub browse_allowed_issis: Vec<u32>,
 }
 
+/// A WSP session open on the WAP gateway, for `/api/wap`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WapSessionStatus {
+    pub issi: u32,
+    pub ip: String,
+    /// "air" or "debug-udp".
+    pub via: String,
+    /// Unix time of the session's last request.
+    pub last_seen_unix: u64,
+    /// Host of the last page it fetched (never the full URL).
+    pub last_domain: Option<String>,
+}
+
+/// Runtime WAP gateway status for `/api/wap`: open sessions and the domains fetched recently.
+/// Published by the SNDCP entity at most once a second, and only when it changes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WapRuntimeStatus {
+    pub running: bool,
+    pub browse_enabled: bool,
+    pub sessions: Vec<WapSessionStatus>,
+    /// Hosts fetched recently, newest first, with how many times each.
+    pub recent_domains: Vec<(String, u32)>,
+    /// Requests handed to the Internet side since start.
+    pub fetches: u64,
+}
+
 /// Runtime override for the built-in WX/METAR service, edited from the dashboard.
 ///
 /// Mirrors the editable subset of `[wx_service]` config. When `Some`, it takes precedence
@@ -542,6 +568,8 @@ pub struct StackState {
     pub dapnet_status: DapnetRuntimeStatus,
     /// Runtime GeoAlarm status for `/api/geoalarm`.
     pub geoalarm_status: GeoalarmRuntimeStatus,
+    /// Runtime WAP gateway status for `/api/wap`.
+    pub wap_status: WapRuntimeStatus,
     /// Live map "identity currently reachable on a traffic channel" → (DL timeslot, usage_marker),
     /// republished every tick by CMCE call control from the live call tables (so it is never
     /// stale). Keyed by GSSI for active group calls and by each participant ISSI for connected
@@ -725,6 +753,7 @@ impl Default for StackState {
             asterisk_status: AsteriskRuntimeStatus::default(),
             dapnet_status: DapnetRuntimeStatus::default(),
             geoalarm_status: GeoalarmRuntimeStatus::default(),
+            wap_status: WapRuntimeStatus::default(),
             active_call_ts: std::collections::HashMap::new(),
             ee_monitoring_windows: std::collections::HashMap::new(),
         }

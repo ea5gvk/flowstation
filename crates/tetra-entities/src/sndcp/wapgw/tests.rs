@@ -673,4 +673,36 @@ allowed_ports = [{port}]
 
     let linked = fetch(4, "/l/1/0");
     assert!(linked.contains("Pagina dos"), "{linked}");
+
+    // The dashboard gets the session and the domain (never the URL), at most once a second.
+    std::thread::sleep(STATUS_INTERVAL);
+    svc.tick(&config, Instant::now());
+    let status = config.state_read().wap_status.clone();
+    assert!(status.running && status.browse_enabled);
+    assert_eq!(status.fetches, 3);
+    assert_eq!(status.recent_domains, vec![("127.0.0.1".to_string(), 2)]);
+    assert_eq!(status.sessions.len(), 1);
+    assert_eq!(
+        (
+            status.sessions[0].issi,
+            status.sessions[0].via.as_str(),
+            status.sessions[0].last_domain.as_deref()
+        ),
+        (9990, "debug-udp", Some("127.0.0.1"))
+    );
+}
+
+#[test]
+fn idle_sessions_expire() {
+    let mut gw = gateway();
+    let t0 = Instant::now();
+    send(&mut gw, connect(1), t0);
+    let status = gw.status();
+    assert_eq!(status.sessions.len(), 1);
+    assert_eq!((status.sessions[0].issi, status.sessions[0].via.as_str()), (ISSI, "air"));
+    let seen = status.sessions[0].last_seen_unix;
+    gw.expire_sessions(seen + SESSION_IDLE_SECS - 1, SESSION_IDLE_SECS);
+    assert_eq!(gw.status().sessions.len(), 1);
+    gw.expire_sessions(seen + SESSION_IDLE_SECS, SESSION_IDLE_SECS);
+    assert!(gw.status().sessions.is_empty());
 }
