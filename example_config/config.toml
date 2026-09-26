@@ -441,9 +441,10 @@ voice_service = true
 #
 # restart_on_core_stall cannot recover a truly hung loop (it never reads the stop flag). For
 # that, run the unit under the systemd watchdog (Type=notify + WatchdogSec=30s, see
-# contrib/systemd); when it is armed it takes over the core-stall restart, and core_stall_secs
-# (at least 5 s, at most half of WatchdogSec) is how old the last tick may be before the
-# watchdog stops being fed.
+# contrib/systemd; tetra-live-monitor installs it on its next Flowstation update when the binary
+# supports it). When it is armed it takes over the core-stall restart, whatever
+# restart_on_core_stall says: once the last tick is older than core_stall_secs (at least 5 s, at
+# most half of WatchdogSec) the watchdog stops being fed and systemd restarts the station.
 #
 # [health]
 # enabled = true                    # master on/off for the monitor (default true)
