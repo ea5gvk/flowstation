@@ -87,6 +87,13 @@ fn request_restart(reason: &str, last_restart: &mut Option<Instant>, cooldown: D
     true
 }
 
+/// Whether the sampler itself restarts on a core stall. Under an armed systemd watchdog that is
+/// systemd's job: it also recovers a hung loop, which never reads the stop flag our request sets.
+/// The panic storm stays ours either way (the loop keeps turning, so systemd keeps being fed).
+fn core_stall_restart_allowed(restart_on_core_stall: bool, systemd_armed: bool) -> bool {
+    restart_on_core_stall && !systemd_armed
+}
+
 /// Spawn the background health sampler. `sink` is a clone of the telemetry sink.
 pub fn spawn_health_monitor(sink: TelemetrySink, cfg: HealthMonitorConfig) {
     let interval = cfg.snapshot_interval.max(Duration::from_secs(1));
@@ -120,11 +127,10 @@ pub fn spawn_health_monitor(sink: TelemetrySink, cfg: HealthMonitorConfig) {
                 interval.as_secs(),
                 if cfg.restart_on_core_stall { "ON" } else { "off" }
             );
-            // Under the systemd watchdog a core stall is systemd's job: it also recovers a hung loop,
-            // which never reads the stop flag our restart request sets. The panic storm stays ours.
             let systemd_watchdog = crate::sd_watchdog::watchdog_armed();
-            if cfg.restart_on_core_stall && systemd_watchdog {
-                tracing::info!("Health monitor: core-stall restart delegated to the systemd watchdog");
+            let core_stall_restart = core_stall_restart_allowed(cfg.restart_on_core_stall, systemd_watchdog);
+            if systemd_watchdog {
+                tracing::info!("Health monitor: core stalls are restarted by the systemd watchdog, whatever restart_on_core_stall says");
             }
             let mut stall_since: Option<Instant> = None;
             let mut panic_window_start = Instant::now();
@@ -161,7 +167,7 @@ pub fn spawn_health_monitor(sink: TelemetrySink, cfg: HealthMonitorConfig) {
 
                 // Software watchdog. Only the core-loop liveness drives a restart — a Degraded
                 // backhaul or congestion never reboots the station.
-                if systemd_watchdog {
+                if !core_stall_restart {
                     continue;
                 }
                 let age_ms = registry().tick_age_ms();
@@ -204,5 +210,13 @@ mod tests {
         assert!(last_restart_age(&path).is_none());
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn core_stall_restart_is_left_to_an_armed_systemd_watchdog() {
+        assert!(core_stall_restart_allowed(true, false));
+        assert!(!core_stall_restart_allowed(true, true));
+        assert!(!core_stall_restart_allowed(false, false));
+        assert!(!core_stall_restart_allowed(false, true));
     }
 }
