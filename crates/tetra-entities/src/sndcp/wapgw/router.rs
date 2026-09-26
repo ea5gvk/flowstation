@@ -16,7 +16,7 @@ use super::fetcher::{FetchTarget, Page};
 use super::home::{self, Browse};
 use super::wsp::{ContentKind, status};
 use crate::sndcp::wap_status::{
-    WAP_STATUS_SECTOR_QUERY, WapStatusSnapshot, render_wml_status_browser_index, render_wml_status_browser_sector, render_wml2_status,
+    WAP_STATUS_SECTOR_QUERY, WapStatusSnapshot, render_wml_status_browser_index, render_wml_status_browser_sector,
     render_wml2_status_sector,
 };
 
@@ -141,9 +141,10 @@ fn typed_url(u: &str) -> Option<String> {
 
 fn status_page(ctx: &RouteCtx<'_>, wml: bool, section: Option<usize>) -> Route {
     let snapshot = (ctx.snapshot)();
+    // XHTML: the sector pages, which carry no meta refresh (the full page reloads itself every
+    // 8 s, which would keep the data slot busy while a radio leaves it open).
     let rendered = match (wml, section) {
-        (false, None) => render_wml2_status(&snapshot, ctx.budget),
-        (false, Some(s)) => render_wml2_status_sector(&snapshot, ctx.budget, s),
+        (false, section) => render_wml2_status_sector(&snapshot, ctx.budget, section.unwrap_or(0)),
         (true, None) => render_wml_status_browser_index(&snapshot, ctx.budget),
         (true, Some(s)) => render_wml_status_browser_sector(&snapshot, ctx.budget, s),
     };
@@ -341,13 +342,20 @@ mod tests {
     }
 
     #[test]
-    fn status_pages_use_larger_budget_with_sar() {
+    fn status_pages_fit_the_budget_without_refresh() {
         let cfg = cfg(false, &[]);
-        // One 576-octet datagram without SAR vs. a segmented message.
-        let small = page(route_for("/status.xhtml", &cfg, 1, 500));
+        for uri in ["/status.xhtml", "/status", "/status.xhtml?s=1"] {
+            let p = page(route_for(uri, &cfg, 1, 4000));
+            let body = String::from_utf8(p.body).unwrap();
+            assert_eq!(p.status, status::OK, "{uri}");
+            // A radio left on the status page must not reload it by itself (air time).
+            assert!(!body.contains("refresh"), "{uri}: {body}");
+            assert!(body.contains("href=\"/status.xhtml"), "{uri}: navigation between blocks");
+        }
+        // A smaller reply budget gets a more compact rendering.
         let large = page(route_for("/status.xhtml", &cfg, 1, 4000));
+        let small = page(route_for("/status.xhtml", &cfg, 1, large.body.len() - 1));
         assert_eq!((small.status, large.status), (status::OK, status::OK));
-        assert!(small.body.len() <= 500);
         assert!(large.body.len() > small.body.len(), "{} vs {}", large.body.len(), small.body.len());
         let wml = page(route_for("/status.wml?s=1", &cfg, 1, 500));
         assert_eq!(wml.kind, ContentKind::Wml);
