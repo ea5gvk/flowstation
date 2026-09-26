@@ -13,10 +13,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Baked into the READY status, so it is in the binary: tetra-live-monitor (and the dashboard OTA)
-/// look for it in a freshly built binary before running it under `Type=notify`. Keep it in sync
-/// with tetra-live-monitor.
+/// Baked into the READY status, so it is in the binary: tetra-live-monitor looks for it in a
+/// freshly built binary before running it under `Type=notify`. Keep it in sync with
+/// tetra-live-monitor.
 pub const SD_NOTIFY_MARKER: &str = "flowstation-sd-notify-v1";
+/// This file, relative to the source tree: the dashboard OTA looks for the marker here before
+/// building under `Type=notify`, while the running binary is still intact.
+pub const SD_NOTIFY_SOURCE: &str = "crates/tetra-entities/src/sd_watchdog.rs";
 
 /// One multiframe of core ticks (18 frames x 4 timeslots, about 1 s): the stack is really up.
 const READY_TICKS: u64 = 72;
@@ -154,8 +157,9 @@ fn ota_hold_active() -> bool {
         .is_some_and(|t| Instant::now() < t)
 }
 
-/// True if the binary at `path` carries [`SD_NOTIFY_MARKER`], i.e. it speaks sd_notify.
-pub fn binary_has_marker(path: &Path) -> bool {
+/// True if the file at `path` carries [`SD_NOTIFY_MARKER`]: a binary that speaks sd_notify, or
+/// the source of one.
+pub fn file_has_marker(path: &Path) -> bool {
     let marker = SD_NOTIFY_MARKER.as_bytes();
     std::fs::read(path).is_ok_and(|bin| bin.windows(marker.len()).any(|w| w == marker))
 }
@@ -292,11 +296,17 @@ mod tests {
     fn marker_is_found_in_a_binary() {
         let path = std::env::temp_dir().join(format!("flowstation-sd-marker-{}", std::process::id()));
         std::fs::write(&path, [b"\x7fELF\0..".as_slice(), SD_NOTIFY_MARKER.as_bytes(), b"\0.."].concat()).unwrap();
-        assert!(binary_has_marker(&path));
+        assert!(file_has_marker(&path));
         std::fs::write(&path, b"\x7fELF\0flowstation-sd-notify-v\0").unwrap();
-        assert!(!binary_has_marker(&path));
+        assert!(!file_has_marker(&path));
         let _ = std::fs::remove_file(&path);
-        assert!(!binary_has_marker(&path));
+        assert!(!file_has_marker(&path));
+    }
+
+    #[test]
+    fn marker_is_in_the_source_the_ota_checks() {
+        let tree = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        assert!(file_has_marker(&tree.join(SD_NOTIFY_SOURCE)));
     }
 
     #[cfg(target_os = "linux")]

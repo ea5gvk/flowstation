@@ -820,6 +820,20 @@ fn run_update(update: SharedUpdateState, config_path: String, source_dir_overrid
         );
     }
 
+    // A Type=notify unit only turns READY for a binary that speaks sd_notify. If the tree to build
+    // doesn't (e.g. the branch went back to an older commit), don't build: the build would overwrite
+    // the binary the unit runs, and every later restart would be killed each TimeoutStartSec.
+    let marker_src = src_dir.join(crate::sd_watchdog::SD_NOTIFY_SOURCE);
+    if std::env::var_os("NOTIFY_SOCKET").is_some() && !crate::sd_watchdog::file_has_marker(&marker_src) {
+        log!(
+            update,
+            "ERROR: this unit is Type=notify but {} lacks the sd_notify marker, so the new build would never report READY; not building. Update from tetra-live-monitor (it drops the watchdog for such a build) or drop the systemd watchdog from the unit first.",
+            marker_src.display()
+        );
+        update.lock().unwrap().finish(false);
+        return;
+    }
+
     // Step 7: build. cargo lives in ~/.cargo/bin, which the systemd service PATH usually omits, so
     // resolve it explicitly and put its directory on PATH for the rustc/rustup shims (FH-BUG-037).
     // Output is streamed live so a long compile shows progress instead of looking hung (FH-BUG-035).
@@ -857,20 +871,6 @@ fn run_update(update: SharedUpdateState, config_path: String, source_dir_overrid
         }
     }
     if stream_cmd(&update, build, "$ cargo build --release".to_string()).is_none() {
-        return;
-    }
-
-    // A Type=notify unit only turns READY for a binary that speaks sd_notify. If this one doesn't
-    // (e.g. the branch went back to an older commit), restarting would leave the station killed
-    // every TimeoutStartSec, so keep the running binary.
-    let new_bin = src_dir.join("target/release/bluestation-bs");
-    if std::env::var_os("NOTIFY_SOCKET").is_some() && !crate::sd_watchdog::binary_has_marker(&new_bin) {
-        log!(
-            update,
-            "ERROR: {} does not speak sd_notify but this unit is Type=notify; not restarting. Drop the systemd watchdog from the unit first.",
-            new_bin.display()
-        );
-        update.lock().unwrap().finish(false);
         return;
     }
 
