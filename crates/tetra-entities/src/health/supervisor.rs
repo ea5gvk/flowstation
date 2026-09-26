@@ -120,6 +120,12 @@ pub fn spawn_health_monitor(sink: TelemetrySink, cfg: HealthMonitorConfig) {
                 interval.as_secs(),
                 if cfg.restart_on_core_stall { "ON" } else { "off" }
             );
+            // Under the systemd watchdog a core stall is systemd's job: it also recovers a hung loop,
+            // which never reads the stop flag our restart request sets. The panic storm stays ours.
+            let systemd_watchdog = crate::sd_watchdog::watchdog_armed();
+            if cfg.restart_on_core_stall && systemd_watchdog {
+                tracing::info!("Health monitor: core-stall restart delegated to the systemd watchdog");
+            }
             let mut stall_since: Option<Instant> = None;
             let mut panic_window_start = Instant::now();
             let mut panic_window_base = registry().caught_panics();
@@ -155,6 +161,9 @@ pub fn spawn_health_monitor(sink: TelemetrySink, cfg: HealthMonitorConfig) {
 
                 // Software watchdog. Only the core-loop liveness drives a restart — a Degraded
                 // backhaul or congestion never reboots the station.
+                if systemd_watchdog {
+                    continue;
+                }
                 let age_ms = registry().tick_age_ms();
                 if age_ms < stall_critical_ms {
                     stall_since = None;
