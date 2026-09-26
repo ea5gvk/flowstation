@@ -584,6 +584,18 @@ impl Llc {
             | LlcPduType::AlAckAlRnr
             | LlcPduType::AlReconnect
             | LlcPduType::AlDisc => {
+                // Field probe for the packet-data bearer: does the radio open an advanced link on
+                // the MCCH after an SN-DATA TRANSMIT RESPONSE without a channel?
+                if let SapMsgInner::TmaUnitdataInd(prim) = &message.msg
+                    && self.config.config().packet_data.enabled
+                {
+                    tracing::info!(
+                        "LLC: {} from ISSI {} on ts {} (advanced link not available yet)",
+                        pdu_type,
+                        prim.main_address.ssi,
+                        prim.link_id
+                    );
+                }
                 unimplemented_log!("LlcPduType Advanced Link: {}", pdu_type);
             }
 

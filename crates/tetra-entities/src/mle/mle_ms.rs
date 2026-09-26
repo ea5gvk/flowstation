@@ -6,7 +6,7 @@ use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Sap, SsiType, TdmaTime, TetraAddress, unimplemented_log};
 use tetra_saps::lcmc::LcmcMleUnitdataInd;
 use tetra_saps::lmm::LmmMleUnitdataInd;
-use tetra_saps::ltpd::LtpdMleUnitdataInd;
+use tetra_saps::ltpd::{LtpdBearer, LtpdMleUnitdataInd};
 use tetra_saps::tla::TlaTlDataReqBl;
 use tetra_saps::{SapMsg, SapMsgInner};
 
@@ -171,6 +171,7 @@ impl MleMs {
                     received_tetra_address: prim.main_address,
                     chan_change_resp_req: false, // TODO FIXME
                     chan_change_handle: None,    // TODO FIXME
+                    bearer: LtpdBearer::BasicAck,
                 };
                 let msg = SapMsg {
                     sap: Sap::LcmcSap,
@@ -271,6 +272,7 @@ impl MleMs {
                     received_tetra_address: prim.main_address,
                     chan_change_resp_req: false, // TODO FIXME
                     chan_change_handle: None,    // TODO FIXME
+                    bearer: LtpdBearer::BasicUnack,
                 };
                 let msg = SapMsg {
                     sap: Sap::LcmcSap,

@@ -216,6 +216,15 @@ pub struct LtpdMleUnitdataReq {
     pub fcs_flag: bool,
 }
 
+/// Layer 2 service an SNDCP PDU came in on (clause 28.3.4.2, tables 28.16 and 28.17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LtpdBearer {
+    /// Acknowledged basic link (TL-DATA).
+    BasicAck,
+    /// Unacknowledged basic link (TL-UNITDATA).
+    BasicUnack,
+}
+
 #[derive(Debug, Clone)]
 pub struct LtpdMleUnitdataInd {
     pub sdu: BitBuffer,
@@ -224,4 +233,5 @@ pub struct LtpdMleUnitdataInd {
     pub received_tetra_address: TetraAddress, // ITSI/GSSI
     pub chan_change_resp_req: bool,
     pub chan_change_handle: Option<Todo>,
+    pub bearer: LtpdBearer,
 }

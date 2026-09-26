@@ -5,7 +5,7 @@ use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Layer2Service, Sap, TdmaTime, unimplemented_log};
 use tetra_saps::lcmc::LcmcMleUnitdataInd;
 use tetra_saps::lmm::LmmMleUnitdataInd;
-use tetra_saps::ltpd::LtpdMleUnitdataInd;
+use tetra_saps::ltpd::{LtpdBearer, LtpdMleUnitdataInd};
 use tetra_saps::tla::{TlaTlDataReqBl, TlaTlUnitdataReqBl};
 use tetra_saps::{SapMsg, SapMsgInner};
 
@@ -94,14 +94,47 @@ impl MleBs {
                 self.rx_tla_data_ind_bl(queue, message);
             }
             SapMsgInner::TlaTlUnitdataIndBl(_) => {
-                // self.rx_tla_unitdata_ind_bl(queue, message);
-                tracing::warn!("MLE: BS received unexpected TL-UNITDATA, ignoring");
+                self.rx_tla_unitdata_ind_bl(queue, message);
             }
             _ => {
                 tracing::error!("BUG: unexpected message or state -- routing error");
                 return;
             }
         }
+    }
+
+    /// TL-UNITDATA: only SNDCP uses it uplink (SN-UNITDATA, unacknowledged basic link), and only
+    /// with `[packet_data]` on; anything else is ignored as before.
+    fn rx_tla_unitdata_ind_bl(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
+        let SapMsgInner::TlaTlUnitdataIndBl(prim) = &mut message.msg else {
+            tracing::error!("BUG: unexpected message or state -- routing error");
+            return;
+        };
+        let for_sndcp = prim
+            .tl_sdu
+            .as_ref()
+            .is_some_and(|sdu| sdu.peek_bits_startoffset(0, 3) == Some(MleProtocolDiscriminator::Sndcp.into_raw()));
+        if !for_sndcp || !self.config.config().packet_data.enabled {
+            tracing::warn!("MLE: BS received unexpected TL-UNITDATA, ignoring");
+            return;
+        }
+        let Some(mut sdu) = prim.tl_sdu.take() else { return };
+        sdu.seek(3);
+        let m = LtpdMleUnitdataInd {
+            sdu,
+            endpoint_id: prim.endpoint_id,
+            link_id: prim.link_id,
+            received_tetra_address: prim.main_address,
+            chan_change_resp_req: false,
+            chan_change_handle: None,
+            bearer: LtpdBearer::BasicUnack,
+        };
+        queue.push_back(SapMsg {
+            sap: Sap::TlpdSap,
+            src: TetraEntity::Mle,
+            dest: TetraEntity::Sndcp,
+            msg: SapMsgInner::LtpdMleUnitdataInd(m),
+        });
     }
 
     fn rx_tla_data_ind_bl(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
@@ -172,6 +205,7 @@ impl MleBs {
                     received_tetra_address: prim.main_address,
                     chan_change_resp_req: false, // TODO FIXME
                     chan_change_handle: None,    // TODO FIXME
+                    bearer: LtpdBearer::BasicAck,
                 };
                 // SNDCP (packet data, MLE protocol discriminator 4) belongs to the SNDCP entity,
                 // not CMCE. Route it over the TLPD SAP so the packet-data layer receives it.

@@ -419,6 +419,7 @@ mod tests {
             received_tetra_address: tetra_core::TetraAddress::new(2_260_618, tetra_core::SsiType::Issi),
             chan_change_resp_req: false,
             chan_change_handle: None,
+            bearer: tetra_saps::ltpd::LtpdBearer::BasicAck,
         };
         sndcp.rx_prim(
             &mut queue,
