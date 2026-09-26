@@ -154,7 +154,8 @@ class Client:
         """Run one class 2 transaction; returns (reply, stats) or (None, stats)."""
         self.tid = (self.tid + 1) & 0x7FFF
         tid = self.tid
-        request = invoke(tid, wsp, tid_new=self.first)
+        tid_new = self.first
+        request = invoke(tid, wsp, tid_new=tid_new)
         self.first = False
         stats = {"packets": 0, "retransmitted": 0, "nacks": 0, "hold_on": 0, "start": time.time()}
         parts = {}
@@ -170,7 +171,8 @@ class Client:
             except socket.timeout:
                 if not got_anything and time.time() >= next_retry:
                     print("  (no answer, Invoke again)")
-                    self.send(invoke(tid, wsp, rid=True))
+                    # A retransmission is the same PDU with RID set (TIDnew included).
+                    self.send(invoke(tid, wsp, rid=True, tid_new=tid_new))
                     next_retry = time.time() + self.retry
                 continue
             if self.verbose:
