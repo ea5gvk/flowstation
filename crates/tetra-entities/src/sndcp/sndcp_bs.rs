@@ -289,7 +289,9 @@ impl TetraEntityTrait for Sndcp {
 
     fn tick_start(&mut self, _queue: &mut MessageQueue, _ts: TdmaTime) {
         if let Some(wap) = self.wap.as_mut() {
-            wap.tick(&self.config, Instant::now());
+            for out in wap.tick(&self.config, Instant::now()) {
+                tracing::debug!("WAP: no bearer to ISSI {} yet, reply dropped", out.peer.issi);
+            }
         }
     }
 

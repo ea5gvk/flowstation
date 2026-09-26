@@ -353,6 +353,14 @@ impl WapGateway {
         self.paused.remove(&issi);
     }
 
+    /// Whether `issi` has a transaction under way: a request being reassembled, a download or a
+    /// result not yet acknowledged.
+    pub fn has_open_transactions(&self, issi: u32) -> bool {
+        self.txs
+            .values()
+            .any(|t| t.peer.issi == issi && !matches!(t.state, TxState::Done { .. }))
+    }
+
     /// The bearer cannot carry data to `issi` for now (voice took the data slot): the
     /// retransmission timers of its results stop until [`Self::resume_timers`].
     pub fn pause_timers(&mut self, issi: u32) {
@@ -1057,8 +1065,49 @@ impl WapService {
         self.debug.as_ref().map(DebugUdp::local_addr)
     }
 
-    /// One stack tick: take the debug datagrams, run the gateway, hand out the answers.
-    pub fn tick(&mut self, config: &SharedConfig, now: Instant) {
+    /// Address the radios send their WAP requests to.
+    pub fn gateway_ipv4(&self) -> Ipv4Addr {
+        self.gateway.cfg.gateway_ipv4
+    }
+
+    /// An uplink IPv4 N-PDU of `issi` from the SNDCP bearer, which can carry datagrams of up to
+    /// `max_reply_bytes` back.
+    pub fn on_air_ipv4(
+        &mut self,
+        config: &SharedConfig,
+        issi: u32,
+        npdu: &[u8],
+        max_reply_bytes: Option<usize>,
+        now: Instant,
+    ) -> Result<(), WapInputError> {
+        // The dashboard may have changed who can browse.
+        self.gateway.set_browse(config.effective_wap().browse);
+        self.gateway.on_ipv4(issi, npdu, max_reply_bytes, now)
+    }
+
+    /// The radio deregistered or dropped its PDP context.
+    pub fn peer_lost(&mut self, issi: u32) {
+        self.gateway.on_peer_lost(issi);
+    }
+
+    /// See [`WapGateway::pause_timers`].
+    pub fn pause_timers(&mut self, issi: u32) {
+        self.gateway.pause_timers(issi);
+    }
+
+    /// See [`WapGateway::resume_timers`].
+    pub fn resume_timers(&mut self, issi: u32, now: Instant) {
+        self.gateway.resume_timers(issi, now);
+    }
+
+    /// See [`WapGateway::has_open_transactions`].
+    pub fn has_open_transactions(&self, issi: u32) -> bool {
+        self.gateway.has_open_transactions(issi)
+    }
+
+    /// One stack tick: take the debug datagrams, run the gateway, send the debug bearer's answers
+    /// and return the ones for the air, which the SNDCP bearer carries.
+    pub fn tick(&mut self, config: &SharedConfig, now: Instant) -> Vec<UdpOut> {
         if let Some(debug) = &self.debug {
             let port = debug.local_addr().port();
             for i in 0..MAX_DEBUG_IN_PER_TICK {
@@ -1083,10 +1132,12 @@ impl WapService {
                 );
             }
         }
+        let mut air = Vec::new();
         for out in self.gateway.poll(now) {
             match (&self.debug, out.peer.via) {
                 (Some(debug), WapVia::DebugUdp) => debug.send(SocketAddrV4::new(out.peer.ip, out.dst_port), out.payload),
-                _ => tracing::debug!("WAP: no bearer to ISSI {} yet, reply dropped", out.peer.issi),
+                (_, WapVia::Air) => air.push(out),
+                (None, WapVia::DebugUdp) => tracing::debug!("WAP: debug bearer gone, reply to ISSI {} dropped", out.peer.issi),
             }
         }
         if self.last_status.is_none_or(|t| now.duration_since(t) >= STATUS_INTERVAL) {
@@ -1100,6 +1151,7 @@ impl WapService {
                 self.published = status;
             }
         }
+        air
     }
 }
 

@@ -701,6 +701,78 @@ fn peer_lost_drops_state() {
     assert!(gw.sessions.is_empty() && gw.txs.is_empty() && gw.path_limits.is_empty());
 }
 
+#[test]
+fn open_transactions_while_fetching_and_sending() {
+    let t0 = Instant::now();
+    let (fetcher, _) = PageFetcher::boxed(100, true);
+    let mut gw = gateway_with(cfg(), fetcher);
+    assert!(!gw.has_open_transactions(ISSI));
+    assert!(send(&mut gw, get(3, "/go?u=wiby.me"), t0).is_empty());
+    assert!(gw.has_open_transactions(ISSI), "download under way");
+    gw.on_peer_lost(ISSI);
+    assert!(!gw.has_open_transactions(ISSI));
+
+    let mut gw = gateway();
+    assert_eq!(send(&mut gw, get(4, "/status.wml"), t0).len(), 1);
+    assert!(gw.has_open_transactions(ISSI), "result not acknowledged yet");
+    assert!(send(&mut gw, initiator::ack(4, None), t0).is_empty());
+    assert!(!gw.has_open_transactions(ISSI), "done");
+}
+
+/// The SNDCP bearer's side of the service: a datagram in through `on_air_ipv4` sets the path
+/// limit, and the answer comes out of `tick` for the air.
+#[test]
+fn air_datagram_answer_comes_out_of_tick() {
+    let toml = r#"
+config_version = "0.6"
+stack_mode = "Bs"
+
+[phy_io]
+backend = "None"
+
+[net_info]
+mcc = 901
+mnc = 9999
+
+[cell_info]
+main_carrier = 1584
+freq_band = 4
+freq_offset = 0
+duplex_spacing = 4
+reverse_operation = false
+location_area = 1
+
+[wap]
+enabled = true
+"#;
+    let config = SharedConfig::from_parts(tetra_config::bluestation::from_toml_str(toml).unwrap(), None);
+    let mut svc = WapService::start(&config).expect("[wap] enabled");
+    assert_eq!(svc.gateway_ipv4(), Ipv4Addr::new(10, 0, 0, 1));
+    let t0 = Instant::now();
+    let npdu = build_ipv4_udp_npdu(MS_IP.octets(), [10, 0, 0, 1], MS_PORT, WAP_PORT_CONNECTION, &get(9, "/"), 1, 64).unwrap();
+    svc.on_air_ipv4(&config, ISSI, &npdu, Some(296), t0).unwrap();
+    let out = svc.tick(&config, t0);
+    assert!(!out.is_empty());
+    for o in &out {
+        assert_eq!((o.peer.issi, o.peer.ip, o.peer.via), (ISSI, MS_IP, WapVia::Air));
+        assert!(o.to_ipv4(svc.gateway_ipv4(), 1).unwrap().len() <= 296, "path limit from the bearer");
+    }
+    assert!(svc.has_open_transactions(ISSI));
+    svc.pause_timers(ISSI);
+    assert!(
+        svc.tick(&config, t0 + Duration::from_secs(60)).is_empty(),
+        "paused: no retransmission"
+    );
+    svc.resume_timers(ISSI, t0 + Duration::from_secs(60));
+    svc.peer_lost(ISSI);
+    assert!(!svc.has_open_transactions(ISSI));
+    let to_http = build_ipv4_udp_npdu(MS_IP.octets(), [10, 0, 0, 1], MS_PORT, 80, b"x", 1, 64).unwrap();
+    assert_eq!(
+        svc.on_air_ipv4(&config, ISSI, &to_http, None, t0),
+        Err(WapInputError::WrongPort { port: 80 })
+    );
+}
+
 /// Debug UDP bearer in-process: a UDP client on 127.0.0.1 against the service the SNDCP entity
 /// runs, with Connect, the home page in two groups and a lost packet recovered by a Nack.
 #[test]
