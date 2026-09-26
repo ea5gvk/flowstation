@@ -32,6 +32,9 @@ impl CcBsSubentity {
     pub fn tick_start(&mut self, queue: &mut MessageQueue, dltime: TdmaTime) {
         self.dltime = dltime;
 
+        // Parrot playback: one frame per tick of its slot, then the release.
+        self.drive_parrot_session(queue);
+
         // ETSI T310 equivalent for active calls.
         self.check_call_timeout_expiry(queue);
         // ETSI T301/T302 equivalent while waiting for call completion.

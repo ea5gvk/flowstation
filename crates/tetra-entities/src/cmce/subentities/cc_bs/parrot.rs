@@ -13,6 +13,7 @@
 
 use std::collections::VecDeque;
 
+use tetra_saps::lcmc::LcmcMleUnitdataInd;
 use tetra_saps::tmd::TmdCircuitDataReq;
 
 use super::*;
@@ -201,6 +202,397 @@ impl ParrotSession {
 }
 
 impl CcBsSubentity {
+    /// True when a private U-SETUP to `called_ssi` is for the parrot service. This is the only
+    /// place that reads `parrot_enabled`: a session already running always runs to its end.
+    pub(super) fn parrot_intercepts(&self, called_ssi: u32) -> bool {
+        let config = self.config.config();
+        config.cell.parrot_enabled && called_ssi == config.cell.parrot_issi
+    }
+
+    /// Answer a U-SETUP toward `parrot_issi` locally: simplex only, one session for the whole
+    /// BS. The caller gets the floor at once; its voice is recorded until U-TX CEASED.
+    pub(super) fn fsm_on_u_setup_parrot(&mut self, queue: &mut MessageQueue, message: &SapMsg, pdu: &USetup, calling_party: TetraAddress) {
+        let SapMsgInner::LcmcMleUnitdataInd(prim) = &message.msg else {
+            tracing::error!("BUG: unexpected message in fsm_on_u_setup_parrot");
+            return;
+        };
+        let (parrot_issi, max_secs) = {
+            let config = self.config.config();
+            (config.cell.parrot_issi, config.cell.parrot_max_secs)
+        };
+
+        if calling_party.ssi == parrot_issi {
+            self.parrot_reject_setup(
+                queue,
+                prim,
+                calling_party,
+                DisconnectCause::RequestedServiceNotAvailable,
+                "caller is the parrot ISSI",
+            );
+            return;
+        }
+        if pdu.simplex_duplex_selection {
+            self.parrot_reject_setup(
+                queue,
+                prim,
+                calling_party,
+                DisconnectCause::IncompatibleTrafficCase,
+                "service is simplex-only",
+            );
+            return;
+        }
+        if let Some((call_id, state)) = self.find_individual_call_by_issi(calling_party.ssi) {
+            tracing::info!(
+                "CMCE: parrot: ISSI {} already in individual call_id={} state={:?}",
+                calling_party.ssi,
+                call_id,
+                state
+            );
+            self.parrot_reject_setup(
+                queue,
+                prim,
+                calling_party,
+                DisconnectCause::ConcurrentSetUpNotSupported,
+                "caller busy",
+            );
+            return;
+        }
+        if self.parrot_session.is_some() {
+            self.parrot_reject_setup(queue, prim, calling_party, DisconnectCause::CalledPartyBusy, "parrot busy");
+            return;
+        }
+        if self.is_locally_registered_issi(parrot_issi) {
+            tracing::warn!(
+                "CMCE: ISSI {} is registered locally but is also the parrot ISSI: the parrot answers the call",
+                parrot_issi
+            );
+        }
+
+        let allocated = {
+            let mut state = self.config.state_write();
+            self.circuits
+                .allocate_circuit_with_allocator(
+                    Direction::Both,
+                    pdu.basic_service_information.communication_type,
+                    false,
+                    &mut state.timeslot_alloc,
+                    TimeslotOwner::Cmce,
+                )
+                .cloned()
+        };
+        let circuit = match allocated {
+            Ok(circuit) => circuit,
+            Err(err) => {
+                tracing::info!("CMCE: parrot: no circuit for ISSI {}: {:?}", calling_party.ssi, err);
+                self.parrot_reject_setup(
+                    queue,
+                    prim,
+                    calling_party,
+                    DisconnectCause::CongestionInInfrastructure,
+                    "no circuit",
+                );
+                return;
+            }
+        };
+        let (call_id, carrier_num, ts, usage) = (circuit.call_id, circuit.carrier_num, circuit.ts, circuit.usage);
+        let parrot_addr = TetraAddress::new(parrot_issi, SsiType::Issi);
+
+        let call = IndividualCall {
+            calling_addr: calling_party,
+            called_addr: parrot_addr,
+            calling_handle: prim.handle,
+            calling_link_id: prim.link_id,
+            calling_endpoint_id: prim.endpoint_id,
+            called_handle: None,
+            called_link_id: None,
+            called_endpoint_id: None,
+            calling_carrier_num: carrier_num,
+            calling_ts: ts,
+            called_carrier_num: carrier_num,
+            called_ts: ts,
+            calling_usage: usage,
+            called_usage: usage,
+            simplex_duplex: false,
+            priority: pdu.call_priority,
+            state: IndividualCallState::CallSetupPending,
+            formal_state: CcFormalState::Idle.after(CcFormalEvent::SetupRequest),
+            setup_timer_started: Some(self.dltime),
+            setup_timeout: Some(CallTimeoutSetupPhase::T10s),
+            active_timer_started: None,
+            call_timeout: Self::p2p_call_timeout(false),
+            called_over_brew: false,
+            calling_over_brew: false,
+            // No network leg: the parrot is local.
+            network_entity: TetraEntity::Brew,
+            brew_uuid: None,
+            network_call: None,
+            connect_request_sent: false,
+            // The caller holds the floor from set-up.
+            floor_holder: Some(calling_party.ssi),
+            queued_tx_demand: None,
+            floor_released_at: None,
+        };
+        if let Err(err) = self.fsm_individual_create_setup_call(call_id, call) {
+            tracing::warn!("CMCE: parrot call_id={} could not be created: {:?}", call_id, err);
+            let _ = self.circuits.close_circuit_slot(Direction::Both, carrier_num, ts);
+            self.release_timeslot_slot(CarrierSlot { carrier_num, ts });
+            self.parrot_reject_setup(queue, prim, calling_party, DisconnectCause::NoIdleCcEntity, "call not created");
+            return;
+        }
+        if let Err(err) = self.fsm_individual_transition_to_active(call_id) {
+            tracing::warn!("CMCE: parrot call_id={} could not be activated: {:?}", call_id, err);
+        }
+
+        // Same line as a local P2P set-up, so log monitors show the call.
+        tracing::info!(
+            "rx_u_setup_p2p: call from ISSI {} to ISSI {} -> call_id={} carrier={} ts={} usage={} (parrot service answering)",
+            calling_party.ssi,
+            parrot_issi,
+            call_id,
+            carrier_num,
+            ts,
+            usage
+        );
+
+        Self::signal_umac_circuit_open(queue, &circuit, self.dltime, None, None, CircuitDlMediaSource::LocalParrot);
+
+        // Keep the caller's hook method, so the answer is not shown as a modified call.
+        self.send_d_call_proceeding(queue, message, pdu, call_id, CallTimeoutSetupPhase::T10s, pdu.hook_method_selection);
+
+        let d_connect = DConnect {
+            call_identifier: call_id,
+            call_time_out: Self::p2p_call_timeout(false),
+            hook_method_selection: pdu.hook_method_selection,
+            simplex_duplex_selection: false,
+            transmission_grant: TransmissionGrant::Granted,
+            transmission_request_permission: false,
+            call_ownership: true,
+            call_priority: None,
+            basic_service_information: None,
+            temporary_address: None,
+            notification_indicator: None,
+            facility: None,
+            proprietary: None,
+        };
+        tracing::info!("-> {:?}", d_connect);
+        let mut connect_sdu = BitBuffer::new_autoexpand(30);
+        d_connect.to_bitbuf(&mut connect_sdu).expect("Failed to serialize DConnect");
+        connect_sdu.seek(0);
+
+        let mut timeslots = [false; 4];
+        timeslots[ts as usize - 1] = true;
+        queue.push_back(SapMsg {
+            sap: Sap::LcmcSap,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
+                sdu: connect_sdu,
+                handle: prim.handle,
+                endpoint_id: prim.endpoint_id,
+                link_id: prim.link_id,
+                layer2service: Layer2Service::Unacknowledged,
+                pdu_prio: 0,
+                layer2_qos: 0,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                chan_alloc: Some(CmceChanAllocReq {
+                    usage: Some(usage),
+                    alloc_type: ChanAllocType::Replace,
+                    carrier: Some(carrier_num),
+                    timeslots,
+                    ul_dl_assigned: UlDlAssignment::Both,
+                }),
+                main_address: calling_party,
+                tx_reporter: None,
+            }),
+        });
+
+        self.parrot_session = Some(ParrotSession::new(carrier_num, ts, call_id, calling_party, parrot_issi, max_secs));
+
+        // notify_umac = true arms the UL inactivity timer: a caller who never talks is released.
+        self.notify_floor_granted(
+            queue,
+            GroupFloorGrant {
+                call_id,
+                source_issi: calling_party.ssi,
+                dest_gssi: parrot_issi,
+                carrier_num,
+                ts,
+                is_group: false,
+            },
+            true,
+            BrewNotification::Never,
+        );
+    }
+
+    fn parrot_reject_setup(
+        &mut self,
+        queue: &mut MessageQueue,
+        prim: &LcmcMleUnitdataInd,
+        calling_party: TetraAddress,
+        cause: DisconnectCause,
+        reason: &str,
+    ) {
+        let call_id = self.circuits.get_next_call_id();
+        tracing::info!(
+            "CMCE: parrot rejecting U-SETUP from ISSI {} call_id={} cause={} ({})",
+            calling_party.ssi,
+            call_id,
+            cause,
+            reason
+        );
+        let sdu = Self::build_d_release(call_id, cause);
+        queue.push_back(Self::build_sapmsg_direct(
+            sdu,
+            self.dltime,
+            calling_party,
+            prim.handle,
+            prim.link_id,
+            prim.endpoint_id,
+        ));
+    }
+
+    /// U-TX CEASED hook, called before the generic individual handling. Returns true when the
+    /// parrot handled it. Anything that is not the parrot caller's own call returns false.
+    pub(super) fn parrot_on_u_tx_ceased(&mut self, queue: &mut MessageQueue, call_id: u16, sender: TetraAddress) -> bool {
+        let Some(session) = self.parrot_session.as_mut() else {
+            return false;
+        };
+        if session.call_id() != call_id {
+            return false;
+        }
+        // Forced by the UL inactivity timer while the parrot "talks": nothing to do.
+        if sender.ssi == session.parrot_issi() {
+            return true;
+        }
+        if sender.ssi != session.caller_issi() {
+            return false;
+        }
+        let Some(call) = self.individual_calls.get(&call_id).cloned() else {
+            return false;
+        };
+
+        match session.state() {
+            ParrotState::Recording => {
+                let recorded = session.recorded_len();
+                if recorded == 0 {
+                    session.finish_without_playback();
+                    tracing::warn!(
+                        "U-TX CEASED (parrot) call_id={} from ISSI {} -> no recorded frames, releasing",
+                        call_id,
+                        sender.ssi
+                    );
+                    self.release_individual_call(queue, call_id, DisconnectCause::SwmiRequestedDisconnection);
+                    return true;
+                }
+                session.start_playback(self.dltime);
+                tracing::info!(
+                    "U-TX CEASED (parrot) call_id={} from ISSI {} -> starting paced playback; recorded_frames={}",
+                    call_id,
+                    sender.ssi,
+                    recorded
+                );
+                if let Some(call) = self.individual_calls.get_mut(&call_id) {
+                    call.grant_floor(call.called_addr);
+                }
+                self.send_parrot_d_tx_granted(queue, &call, call_id);
+                let slot = CallTimeslot {
+                    call_id,
+                    carrier_num: call.calling_carrier_num,
+                    ts: call.calling_ts,
+                };
+                self.notify_remote_floor_granted(queue, slot);
+                // Dashboard only: the parrot is now the speaker.
+                self.notify_floor_granted(
+                    queue,
+                    GroupFloorGrant {
+                        call_id,
+                        source_issi: call.called_addr.ssi,
+                        dest_gssi: call.calling_addr.ssi,
+                        carrier_num: slot.carrier_num,
+                        ts: slot.ts,
+                        is_group: false,
+                    },
+                    false,
+                    BrewNotification::Never,
+                );
+            }
+            // The radio repeats U-TX CEASED until it is answered: confirm the parrot's turn again.
+            ParrotState::Playing => self.send_parrot_d_tx_granted(queue, &call, call_id),
+            ParrotState::Releasing => {}
+        }
+        true
+    }
+
+    /// D-TX GRANTED (granted to other user = the parrot) to the caller on its traffic channel.
+    fn send_parrot_d_tx_granted(&self, queue: &mut MessageQueue, call: &IndividualCall, call_id: u16) {
+        let d_tx_granted = DTxGranted {
+            call_identifier: call_id,
+            transmission_grant: TransmissionGrant::GrantedToOtherUser.into_raw() as u8,
+            transmission_request_permission: false,
+            encryption_control: false,
+            reserved: false,
+            notification_indicator: None,
+            transmitting_party_type_identifier: Some(1),
+            transmitting_party_address_ssi: Some(call.called_addr.ssi as u64),
+            transmitting_party_extension: None,
+            external_subscriber_number: None,
+            facility: None,
+            dm_ms_address: None,
+            proprietary: None,
+        };
+        tracing::info!(
+            "FSM -> D-TX GRANTED (parrot, GrantedToOtherUser) call_id={} to ISSI {}",
+            call_id,
+            call.calling_addr.ssi
+        );
+        let mut sdu = BitBuffer::new_autoexpand(50);
+        d_tx_granted.to_bitbuf(&mut sdu).expect("Failed to serialize DTxGranted");
+        sdu.seek(0);
+        queue.push_back(Self::build_sapmsg_stealing_ul_dl(
+            sdu,
+            self.dltime,
+            call.calling_addr,
+            call.calling_carrier_num,
+            call.calling_ts,
+            Some(call.calling_usage),
+            UlDlAssignment::Dl,
+        ));
+    }
+
+    /// Per tick: send the next playback frame and release the call once playback has drained.
+    pub(super) fn drive_parrot_session(&mut self, queue: &mut MessageQueue) {
+        let Some(session) = self.parrot_session.as_mut() else {
+            return;
+        };
+        let call_id = session.call_id();
+        // A call removed without release_individual_call (e.g. the circuit manager's safety
+        // close) must not leave the service busy forever.
+        if !self.individual_calls.contains_key(&call_id) {
+            tracing::info!("CMCE: parrot call_id={} is gone, dropping its session", call_id);
+            self.parrot_session = None;
+            return;
+        }
+        if let Some(msg) = session.next_playback_msg(self.dltime) {
+            queue.push_back(msg);
+        }
+        if session.take_playback_finished() {
+            tracing::info!("CMCE: parrot playback complete, releasing call_id={}", call_id);
+            self.release_individual_call(queue, call_id, DisconnectCause::SwmiRequestedDisconnection);
+        }
+    }
+
+    /// Drop the parrot session if it belongs to `call_id`. True when it did: the call's called
+    /// party is the virtual parrot and gets no D-RELEASE.
+    pub(super) fn take_parrot_session_if(&mut self, call_id: u16) -> bool {
+        if !self.parrot_session.as_ref().is_some_and(|session| session.call_id() == call_id) {
+            return false;
+        }
+        tracing::info!("CMCE: parrot session released call_id={}", call_id);
+        self.parrot_session = None;
+        true
+    }
+
     /// UL voice of a LocalParrot circuit, already packed by UMAC. Recorded while the caller
     /// talks; afterwards it is consumed and dropped.
     pub fn handle_parrot_ul_frame(&mut self, carrier_num: u16, ts: u8, data: Vec<u8>) {
@@ -318,5 +710,41 @@ mod tests {
         let after_drain = next_multiframe_t2.add_timeslots(PARROT_PLAYBACK_DRAIN_TIMESLOTS + 4);
         assert!(session.next_playback_msg(after_drain).is_none());
         assert!(session.take_playback_finished());
+    }
+
+    /// A parrot call removed without `release_individual_call` (the circuit manager's safety
+    /// close does that) must not keep the service busy: the next tick drops the session.
+    #[test]
+    fn parrot_session_of_a_vanished_call_is_dropped_on_the_next_tick() {
+        let toml = r#"
+config_version = "0.6"
+stack_mode = "Bs"
+
+[phy_io]
+backend = "None"
+
+[net_info]
+mcc = 901
+mnc = 9999
+
+[cell_info]
+main_carrier = 1584
+freq_band = 4
+freq_offset = 0
+duplex_spacing = 4
+reverse_operation = false
+location_area = 1
+parrot_enabled = true
+"#;
+        let cfg = tetra_config::bluestation::parsing::from_toml_str(toml).expect("parrot test config must parse");
+        let mut cc = CcBsSubentity::new(SharedConfig::from_parts(cfg, None));
+        cc.parrot_session = Some(ParrotSession::new(1584, 2, 42, TetraAddress::issi(1001), 99_999, 20));
+        assert!(!cc.individual_calls.contains_key(&42));
+
+        let mut queue = MessageQueue::new();
+        cc.tick_start(&mut queue, TdmaTime { h: 0, m: 1, f: 1, t: 2 });
+
+        assert!(cc.parrot_session.is_none(), "the orphaned session must be dropped");
+        assert!(queue.pop_front().is_none(), "nothing to send for a call that no longer exists");
     }
 }

@@ -17,7 +17,7 @@ use tetra_pdus::cmce::pdus::{
     u_setup::USetup, u_tx_ceased::UTxCeased, u_tx_demand::UTxDemand,
 };
 use tetra_saps::control::brew::{BrewSubscriberAction, MmSubscriberUpdate};
-use tetra_saps::control::call_control::{CallControl, NetworkCircuitCall};
+use tetra_saps::control::call_control::{CallControl, CircuitDlMediaSource, NetworkCircuitCall};
 use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
 use tetra_saps::control::enums::communication_type::CommunicationType;
 use tetra_saps::lcmc::LcmcMleUnitdataInd;
@@ -2635,4 +2635,58 @@ fn test_simplex_individual_call_released_after_individual_hangtime() {
     let called_release = DRelease::from_bitbuf(&mut called_sdu).expect("Failed to parse called DRelease");
     assert_eq!(called_release.call_identifier, call_id);
     assert_eq!(called_release.disconnect_cause, DisconnectCause::SwmiRequestedDisconnection);
+}
+
+/// The parrot service is off by default: a private call to 99999 takes the same path as before
+/// (over Brew when Brew is configured, rejected otherwise) and no LocalParrot circuit is opened.
+#[test]
+fn test_call_to_99999_is_routed_as_before_when_parrot_is_disabled() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let opens_parrot = |msgs: &[SapMsg]| {
+        msgs.iter().any(|msg| {
+            matches!(&msg.msg, SapMsgInner::CmceCallControl(CallControl::Open(circuit))
+                if circuit.dl_media_source == CircuitDlMediaSource::LocalParrot)
+        })
+    };
+
+    // Without Brew the call is rejected.
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+    assert!(!test.config.config().cell.parrot_enabled, "the parrot is off by default");
+    test.submit_message(build_u_setup_p2p_msg(TEST_ISSI, 99_999));
+    test.run_stack(Some(1));
+    let msgs = test.dump_sinks();
+    let (mut sdu, _) = find_lcmc_req(&msgs, TEST_ISSI, CmcePduTypeDl::DRelease).expect("Expected D-RELEASE to the caller");
+    let release = DRelease::from_bitbuf(&mut sdu).expect("Failed to parse DRelease");
+    assert_eq!(release.disconnect_cause, DisconnectCause::RequestedServiceNotAvailable);
+    assert!(find_lcmc_req(&msgs, TEST_ISSI, CmcePduTypeDl::DConnect).is_none());
+    assert!(!opens_parrot(&msgs));
+
+    // With Brew the call goes to Brew.
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.brew = Some(test_brew_cfg());
+    let mut test = ComponentTest::from_config(config, Some(dltime));
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+    test.config.state_write().network_connected = true;
+    test.submit_message(build_u_setup_p2p_msg(TEST_ISSI, 99_999));
+    test.run_stack(Some(1));
+    let msgs = test.dump_sinks();
+    let network_call = msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupRequest { call, .. }) => Some(call.clone()),
+            _ => None,
+        })
+        .expect("Expected the call to 99999 to be forwarded over Brew");
+    assert_eq!(network_call.destination, 99_999);
+    assert!(find_lcmc_req(&msgs, TEST_ISSI, CmcePduTypeDl::DRelease).is_none());
+    assert!(!opens_parrot(&msgs));
 }

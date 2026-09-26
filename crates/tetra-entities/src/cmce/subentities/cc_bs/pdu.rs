@@ -1042,7 +1042,9 @@ impl CcBsSubentity {
         };
 
         let send_calling_leg = !call.calling_over_brew;
-        let send_called_leg = !call.called_over_brew;
+        // The parrot is a virtual called party: only the caller gets the D-RELEASE.
+        let is_parrot = self.take_parrot_session_if(call_id);
+        let send_called_leg = !call.called_over_brew && !is_parrot;
 
         const SETUP_RELEASE_REPEATS: usize = 3;
 

@@ -481,6 +481,10 @@ impl CcBsSubentity {
     ) {
         let call_id = pdu.call_identifier;
 
+        if self.parrot_on_u_tx_ceased(queue, call_id, sender) {
+            return;
+        }
+
         if let Some(call_snapshot) = self.individual_calls.get(&call_id).cloned() {
             if !call_snapshot.is_active() {
                 tracing::debug!("U-TX CEASED for inactive individual call_id={}, ignoring", call_id);

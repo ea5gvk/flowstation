@@ -535,6 +535,12 @@ impl CcBsSubentity {
             return;
         }
 
+        // Parrot service (off by default): answered locally, before any local or network routing.
+        if self.parrot_intercepts(called_ssi) {
+            self.fsm_on_u_setup_parrot(queue, message, pdu, calling_party);
+            return;
+        }
+
         if !self.is_locally_registered_issi(called_addr.ssi) {
             tracing::info!(
                 "CMCE: called ISSI {} not registered locally (known registry ISSIs={:?}), routing U-SETUP over Brew",
