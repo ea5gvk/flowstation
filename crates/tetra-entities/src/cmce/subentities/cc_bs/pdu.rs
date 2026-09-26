@@ -12,6 +12,7 @@ impl CcBsSubentity {
             subscriber_groups: HashMap::new(),
             group_listeners: HashMap::new(),
             telemetry: None,
+            parrot_session: None,
         }
     }
 

@@ -45,6 +45,7 @@ use crate::{
 
 mod dtmf;
 mod lifecycle;
+mod parrot;
 mod pdu;
 mod procedures;
 mod routes;
@@ -76,4 +77,6 @@ pub struct CcBsSubentity {
     group_listeners: HashMap<u32, usize>,
     /// Dashboard telemetry sink (call-lifecycle events). `None` when telemetry is disabled.
     telemetry: Option<crate::net_telemetry::TelemetrySink>,
+    /// The parrot call in progress, if any (one for the whole BS).
+    parrot_session: Option<parrot::ParrotSession>,
 }
