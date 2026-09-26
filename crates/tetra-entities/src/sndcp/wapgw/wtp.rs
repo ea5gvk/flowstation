@@ -28,6 +28,7 @@ pub const ABORT_PROVIDER: u8 = 0;
 pub const ABORT_USER: u8 = 1;
 pub const ABORT_REASON_PROTOERR: u8 = 1;
 pub const ABORT_REASON_NOTIMPLEMENTEDSAR: u8 = 4;
+pub const ABORT_REASON_WTPVERSIONONE: u8 = 6;
 pub const ABORT_REASON_NORESPONSE: u8 = 8;
 pub const ABORT_REASON_MESSAGETOOLARGE: u8 = 9;
 
@@ -84,8 +85,12 @@ pub enum WtpError {
     TooShort,
     /// PDU type 0 outside a concatenation, or a malformed concatenation.
     BadType,
-    /// Invoke with version != 0, reserved bits set or class 3.
+    /// Invoke with reserved bits set or class 3.
     BadInvokeHeader,
+    /// Invoke of a WTP version other than 0 (answered with Abort WTPVERSIONONE).
+    UnsupportedVersion {
+        tid: u16,
+    },
     BadTpi,
 }
 
@@ -127,8 +132,11 @@ pub fn parse_pdu(pdu: &[u8]) -> Result<WtpPdu<'_>, WtpError> {
         WTP_PDU_INVOKE => {
             let b3 = *pdu.get(3).ok_or(WtpError::TooShort)?;
             let class = b3 & 0x03;
-            if b3 >> 6 != 0 || b3 & 0x0c != 0 || class == 3 {
+            if b3 & 0x0c != 0 || class == 3 {
                 return Err(WtpError::BadInvokeHeader);
+            }
+            if b3 >> 6 != 0 {
+                return Err(WtpError::UnsupportedVersion { tid });
             }
             let data_start = if con {
                 parse_wtp_variable_header_end(pdu, 4).map_err(|_| WtpError::BadTpi)?
@@ -324,9 +332,10 @@ mod tests {
         assert_eq!(parse_pdu(&[0x0a, 0, 1, 0x13]), Err(WtpError::BadInvokeHeader), "class 3 is invalid");
         assert_eq!(
             parse_pdu(&[0x0a, 0, 1, 0x52]),
-            Err(WtpError::BadInvokeHeader),
+            Err(WtpError::UnsupportedVersion { tid: 1 }),
             "version 1 is not WTP 1.x"
         );
+        assert_eq!(parse_pdu(&[0x0a, 0, 1, 0x56]), Err(WtpError::BadInvokeHeader), "reserved bits too");
     }
 
     #[test]

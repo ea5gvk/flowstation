@@ -492,10 +492,10 @@ voice_service = true
 # [wap]
 # enabled = false                                # master on/off for the gateway
 # gateway_ipv4 = "10.0.0.1"                      # address the radios send WAP requests to
-# mtu = 576                                      # largest IPv4 datagram sent: 296, 576, 1006, 1500 or 2002
+# mtu = 576                                      # largest IPv4 datagram sent: 576, 1006, 1500, 2002 or 296 (untested: IP fragments are dropped)
 # max_message_bytes = 8192                       # largest response (caps the Client-SDU)
 # max_request_bytes = 1024                       # largest request (caps the Server-SDU)
-# content_type = "short"                         # XHTML Content-Type: "short" (0xC5) or "text"
+# content_type = "short"                         # Content-Type: "short" (0xC5 + charset), "text" or "bare" (0xC5 alone, as Nexus-BS)
 # debug_udp_listen = ""                          # debug UDP bearer, e.g. "127.0.0.1:9200"; empty = off
 # debug_udp_allowed_sources = ["127.0.0.1/32"]   # sources (CIDR) the debug bearer accepts
 # debug_issi = 0                                 # ISSI the debug bearer's requests are handled as
@@ -503,9 +503,11 @@ voice_service = true
 # [wap.wtp]
 # sar = "auto"                                   # segment large replies: "auto", "off" or "on"
 # group_size = 3                                 # packets sent before waiting for an Ack (1..=32)
-# retry_base_ms = 4000                           # retransmission timer; the group's air time is added
+# retry_base_ms = 4000                           # retransmission timer (longer if the measured round trip asks); + air time
 # air_rate_bytes_per_sec = 450                   # expected useful air rate, stretches the timer
 # max_retries = 4                                # retransmissions before the transaction is aborted
+# retransmit_rid = true                          # RID on retransmitted results; false = RID clear, as Nexus-BS
+# hold_on_ms = 2000                              # hold-on Ack only when a download takes longer (0 = at once)
 #
 # [wap.browse]
 # enabled = false                                # Internet browsing (needs [wap] enabled = true)

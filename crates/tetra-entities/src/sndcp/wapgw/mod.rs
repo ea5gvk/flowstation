@@ -11,7 +11,9 @@
 //! Bearer contract: the SNDCP bearer hands over each uplink IPv4 N-PDU of a radio with its ISSI
 //! and the largest datagram it can carry back (`on_ipv4`), turns each [`UdpOut`] of that ISSI
 //! into a downlink N-PDU ([`UdpOut::to_ipv4`]), and reports a radio that deregisters or drops its
-//! PDP context (`on_peer_lost`).
+//! PDP context (`on_peer_lost`). While it cannot carry data to a radio (voice took the data slot)
+//! it calls `pause_timers`, and `resume_timers` when it can again, so the WTP retransmission
+//! timers do not run out while its datagrams wait.
 
 pub mod convert;
 pub mod debug_udp;
@@ -40,7 +42,7 @@ use self::netpolicy::NetPolicy;
 use self::router::{Route, RouteCtx};
 use self::wsp::{ContentKind, WspRequest, status};
 use self::wtp::{Invoke, WtpPdu};
-use self::wtp_sar::{AckOutcome, InMessage, MAX_PACKETS, OutMessage, Reassembly, TimerOutcome};
+use self::wtp_sar::{AckOutcome, InMessage, MAX_PACKETS, OutMessage, Reassembly, Rtt, TimerOutcome};
 use crate::sndcp::ip::{IPV4_PROTOCOL_UDP, IpPrimitiveError, build_ipv4_udp_npdu, parse_ipv4_packet, parse_udp_datagram};
 use crate::sndcp::wap_ip::{WtpAbortInfo, wtp_abort_reason_name};
 use crate::sndcp::wap_status::WapStatusSnapshot;
@@ -61,6 +63,13 @@ const REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(30);
 const FETCH_GUARD: Duration = Duration::from_secs(45);
 /// Bound on open transactions (a flood must not grow memory).
 const MAX_TRANSACTIONS: usize = 256;
+/// Bound on half-received segmented Invokes of one radio (each waits REASSEMBLY_TIMEOUT).
+const MAX_REASSEMBLING_PER_PEER: usize = 4;
+/// Ceiling of the measured part of the retransmission timer.
+const MAX_ADAPTIVE_TIMER: Duration = Duration::from_secs(30);
+/// IPv4 size of the MXP600's captured WSP Connect (394 octets of UDP payload): a smaller MTU
+/// needs the terminal to segment it with WTP SAR, as IPv4 fragments are not reassembled.
+const CONNECT_IPV4_BYTES: usize = 422;
 /// Bound on WSP sessions; the least recently used one goes first.
 const MAX_SESSIONS: usize = 256;
 /// A session with no request for this long is forgotten (the terminal starts a new one).
@@ -146,10 +155,11 @@ enum TxState {
         msg: InMessage,
         class: Option<u8>,
     },
-    /// Waiting for the fetcher (a hold-on Ack was sent).
+    /// Waiting for the fetcher; the hold-on Ack goes out if it takes longer than `hold_on_ms`.
     Fetching {
         id: u64,
         since: Instant,
+        held: bool,
     },
     Sending(OutMessage),
     Done {
@@ -199,6 +209,14 @@ pub struct WapGateway {
     path_limits: HashMap<u32, usize>,
     /// ISSIs whose terminal refused a segmented result (`sar = "auto"`).
     no_sar: HashSet<u32>,
+    /// Transactions whose Invoke said the terminal does no SAR (GTR and TTR both set).
+    no_sar_txs: HashSet<TxKey>,
+    /// ISSIs that answered a segmented result: a later silent one means a lost radio, not SAR.
+    sar_answered: HashSet<u32>,
+    /// Round trip measured with each radio (adaptive retransmission timer).
+    rtt: HashMap<u32, Rtt>,
+    /// Radios the bearer cannot reach for now: their retransmission timers wait.
+    paused: HashSet<u32>,
     next_session_id: u32,
     next_fetch_id: u64,
     out: Vec<UdpOut>,
@@ -216,11 +234,19 @@ fn push(out: &mut Vec<UdpOut>, peer: WapPeer, server_port: u16, client_port: u16
     });
 }
 
-/// WTP retransmission timer: the fixed part plus the air time of what was sent.
-fn retry_timer(wtp: &CfgWapWtp) -> impl Fn(usize) -> Duration + use<> {
-    let base = wtp.retry_base_ms;
-    let rate = u64::from(wtp.air_rate_bytes_per_sec.max(1));
-    move |bytes| Duration::from_millis(base + bytes as u64 * 1000 / rate)
+/// Expected air time of `bytes` octets at `rate` octets per second.
+fn air_time(rate: u32, bytes: usize) -> Duration {
+    Duration::from_millis(bytes as u64 * 1000 / u64::from(rate.max(1)))
+}
+
+/// WTP retransmission timer (R): a fixed part plus the air time of what was sent. The fixed part
+/// is `retry_base_ms`, or the wait the round trips measured with the terminal call for when that
+/// is longer (air time taken out of them, capped at MAX_ADAPTIVE_TIMER).
+fn retry_timer(wtp: &CfgWapWtp, rtt: Option<&Rtt>) -> impl Fn(usize) -> Duration + use<> {
+    let measured = rtt.map_or(Duration::ZERO, |rtt| rtt.timeout().min(MAX_ADAPTIVE_TIMER));
+    let base = Duration::from_millis(wtp.retry_base_ms).max(measured);
+    let rate = wtp.air_rate_bytes_per_sec;
+    move |bytes| base + air_time(rate, bytes)
 }
 
 /// Domain-level log of what a radio asked the Internet side for (never the full URL).
@@ -250,6 +276,10 @@ impl WapGateway {
             txs: HashMap::new(),
             path_limits: HashMap::new(),
             no_sar: HashSet::new(),
+            no_sar_txs: HashSet::new(),
+            sar_answered: HashSet::new(),
+            rtt: HashMap::new(),
+            paused: HashSet::new(),
             next_session_id: 1,
             next_fetch_id: 1,
             out: Vec::new(),
@@ -318,6 +348,45 @@ impl WapGateway {
         self.txs.retain(|_, t| t.peer.issi != issi);
         self.path_limits.remove(&issi);
         self.no_sar.remove(&issi);
+        self.sar_answered.remove(&issi);
+        self.rtt.remove(&issi);
+        self.paused.remove(&issi);
+    }
+
+    /// The bearer cannot carry data to `issi` for now (voice took the data slot): the
+    /// retransmission timers of its results stop until [`Self::resume_timers`].
+    pub fn pause_timers(&mut self, issi: u32) {
+        self.paused.insert(issi);
+    }
+
+    /// The bearer carries data to `issi` again: the timers of its results start afresh, as the
+    /// datagrams it held go out now.
+    pub fn resume_timers(&mut self, issi: u32, now: Instant) {
+        if !self.paused.remove(&issi) {
+            return;
+        }
+        let timer = self.timer_for(issi);
+        for tx in self.txs.values_mut().filter(|t| t.peer.issi == issi) {
+            if let TxState::Sending(out) = &mut tx.state {
+                out.restart_timer(now, &timer);
+            }
+        }
+    }
+
+    fn timer_for(&self, issi: u32) -> impl Fn(usize) -> Duration + use<> {
+        retry_timer(&self.cfg.wtp, self.rtt.get(&issi))
+    }
+
+    /// Feed a round trip (and the octets of its group) into the radio's estimate.
+    fn note_rtt(&mut self, issi: u32, sample: Option<(Duration, usize)>) {
+        let Some((rtt, bytes)) = sample else { return };
+        let rtt = rtt.saturating_sub(air_time(self.cfg.wtp.air_rate_bytes_per_sec, bytes));
+        match self.rtt.get_mut(&issi) {
+            Some(estimate) => estimate.update(rtt),
+            None => {
+                self.rtt.insert(issi, Rtt::new(rtt));
+            }
+        }
     }
 
     /// An uplink IPv4 N-PDU from `issi`. Only unfragmented UDP to the gateway address on the WAP
@@ -363,6 +432,12 @@ impl WapGateway {
     pub fn on_udp(&mut self, input: UdpIn, now: Instant) {
         let pdus = match wtp::parse_datagram(&input.payload) {
             Ok(pdus) => pdus,
+            Err(wtp::WtpError::UnsupportedVersion { tid }) => {
+                tracing::debug!("WAP: ISSI {} used another WTP version (TID {})", input.peer.issi, tid);
+                let abort = wtp::abort(tid, wtp::ABORT_PROVIDER, wtp::ABORT_REASON_WTPVERSIONONE);
+                push(&mut self.out, input.peer, input.dst_port, input.src_port, abort);
+                return;
+            }
             Err(e) => {
                 tracing::debug!("WAP: ISSI {} sent a datagram that is not WTP ({:?})", input.peer.issi, e);
                 return;
@@ -381,6 +456,10 @@ impl WapGateway {
                 } => {
                     let flags = if gtr { wtp::GTR } else { 0 } | if ttr { wtp::TTR } else { 0 };
                     if !self.txs.contains_key(&key(tid)) {
+                        if !self.has_room(input.peer.issi, true) {
+                            self.refuse(input.peer, input.dst_port, input.src_port, tid);
+                            continue;
+                        }
                         // The first packet (the Invoke) was lost: collect anyway, the Nack asks for it.
                         self.insert_tx(
                             key(tid),
@@ -419,11 +498,34 @@ impl WapGateway {
                 self.run_timer(key, now);
             }
         }
+        if !self.no_sar_txs.is_empty() {
+            let txs = &self.txs;
+            self.no_sar_txs.retain(|key| txs.contains_key(key));
+        }
         std::mem::take(&mut self.out)
     }
 
     fn insert_tx(&mut self, key: TxKey, peer: WapPeer, server_port: u16, state: TxState) {
         self.txs.insert(key, Tx { peer, server_port, state });
+    }
+
+    /// Whether a new transaction of `issi` fits: the gateway-wide bound and, for a segmented
+    /// Invoke (which may wait half-received for REASSEMBLY_TIMEOUT), a bound per radio.
+    fn has_room(&self, issi: u32, reassembling: bool) -> bool {
+        self.txs.len() < MAX_TRANSACTIONS
+            && (!reassembling
+                || self
+                    .txs
+                    .values()
+                    .filter(|t| t.peer.issi == issi && matches!(t.state, TxState::Reassembling { .. }))
+                    .count()
+                    < MAX_REASSEMBLING_PER_PEER)
+    }
+
+    fn refuse(&mut self, peer: WapPeer, server_port: u16, port: u16, tid: u16) {
+        tracing::warn!("WAP: too many open transactions, ISSI {} refused", peer.issi);
+        let abort = wtp::abort(tid, wtp::ABORT_PROVIDER, ABORT_REASON_CAPTEMPEXCEEDED);
+        push(&mut self.out, peer, server_port, port, abort);
     }
 
     fn sar_enabled(&self, issi: u32) -> bool {
@@ -440,16 +542,21 @@ impl WapGateway {
         datagram.saturating_sub(IPV4_UDP_HEADERS + SEGMENTED_RESULT_HEADER).max(1)
     }
 
+    /// Whether the result of this transaction may be segmented.
+    fn sar_for(&self, key: TxKey, issi: u32) -> bool {
+        self.sar_enabled(issi) && !self.no_sar_txs.contains(&key)
+    }
+
     /// Largest WSP message to this terminal: one packet without SAR, else the negotiated
     /// Client-SDU and `max_message_bytes`.
-    fn message_limit(&self, peer: WapPeer, port: u16) -> usize {
-        let seg = self.segment_bytes(peer.issi);
+    fn message_limit(&self, key: TxKey, issi: u32) -> usize {
+        let seg = self.segment_bytes(issi);
         let client_sdu = self
             .sessions
-            .get(&(peer.ip, port))
+            .get(&(key.ip, key.port))
             .map(|s| s.client_sdu)
             .unwrap_or(self.cfg.max_message_bytes);
-        if self.sar_enabled(peer.issi) {
+        if self.sar_for(key, issi) {
             client_sdu.min(self.cfg.max_message_bytes).min(seg * MAX_PACKETS)
         } else {
             // A Result carries one octet more than a Segmented Result.
@@ -457,8 +564,8 @@ impl WapGateway {
         }
     }
 
-    fn body_budget(&self, peer: WapPeer, port: u16) -> usize {
-        self.message_limit(peer, port).saturating_sub(wsp::REPLY_OVERHEAD_MAX)
+    fn body_budget(&self, key: TxKey, issi: u32) -> usize {
+        self.message_limit(key, issi).saturating_sub(wsp::REPLY_OVERHEAD_MAX)
     }
 
     fn on_invoke(&mut self, peer: WapPeer, port: u16, server_port: u16, inv: Invoke<'_>, now: Instant) {
@@ -468,7 +575,9 @@ impl WapGateway {
             tid: inv.tid,
         };
         let flags = if inv.gtr { wtp::GTR } else { 0 } | if inv.ttr { wtp::TTR } else { 0 };
-        if inv.tid_new {
+        // A retransmitted Invoke (RID) keeps the TIDnew of the original: it only resets the cache
+        // when its own transaction is not known (the original was lost).
+        if inv.tid_new && (!inv.rid || !self.txs.contains_key(&key)) {
             // The terminal restarted its TIDs: forget the ones cached for it.
             self.txs.retain(|k, _| !(k.ip == peer.ip && k.port == port));
         }
@@ -477,18 +586,32 @@ impl WapGateway {
             self.handle_request(key, peer, server_port, 0, inv.data, now);
             return;
         }
+        let timer = self.timer_for(peer.issi);
+        let max_retries = self.cfg.wtp.max_retries;
         if let Some(tx) = self.txs.get_mut(&key) {
             match &mut tx.state {
                 TxState::Done { .. } if inv.rid => return, // late duplicate
                 TxState::Done { .. } => {
                     self.txs.remove(&key); // TID reused for a new transaction
                 }
-                TxState::Fetching { .. } => {
-                    // The terminal did not get the hold-on Ack: repeat it, nothing else.
+                TxState::Fetching { held, .. } => {
+                    // The terminal did not get a hold-on Ack: send it now, nothing else.
+                    *held = true;
                     push(&mut self.out, peer, server_port, port, wtp::ack(inv.tid, None, true));
                     return;
                 }
-                TxState::Sending(_) => return, // the Result timers cover it
+                TxState::Sending(out) => {
+                    // Before any Ack a repeated Invoke means the Result was lost: send it again
+                    // at once instead of waiting for the timer.
+                    if inv.rid
+                        && let Some(packets) = out.on_repeated_invoke(max_retries, now, &timer)
+                    {
+                        for packet in packets {
+                            push(&mut self.out, peer, server_port, port, packet);
+                        }
+                    }
+                    return;
+                }
                 TxState::Reassembling { class, .. } => {
                     *class = Some(inv.class);
                     self.on_segment(key, 0, flags, inv.data, now);
@@ -496,16 +619,23 @@ impl WapGateway {
                 }
             }
         }
-        if self.txs.len() >= MAX_TRANSACTIONS {
-            tracing::warn!("WAP: too many open transactions, ISSI {} refused", peer.issi);
-            let abort = wtp::abort(inv.tid, wtp::ABORT_PROVIDER, ABORT_REASON_CAPTEMPEXCEEDED);
-            push(&mut self.out, peer, server_port, port, abort);
+        if !self.has_room(peer.issi, !inv.ttr) {
+            self.refuse(peer, server_port, port, inv.tid);
             return;
         }
         if inv.data.len() > self.cfg.max_request_bytes {
             let abort = wtp::abort(inv.tid, wtp::ABORT_PROVIDER, wtp::ABORT_REASON_MESSAGETOOLARGE);
             push(&mut self.out, peer, server_port, port, abort);
             return;
+        }
+        // GTR and TTR together: the terminal does not do SAR (WAP-224, GTR/TTR flags).
+        if inv.gtr && inv.ttr {
+            self.no_sar_txs.insert(key);
+            if self.cfg.wtp.sar == WapSarMode::Auto && self.no_sar.insert(peer.issi) {
+                tracing::info!("WAP: ISSI {} does not do SAR, single datagrams from now on", peer.issi);
+            }
+        } else {
+            self.no_sar_txs.remove(&key);
         }
         if inv.ttr {
             if inv.class == 1 {
@@ -559,8 +689,9 @@ impl WapGateway {
             WspRequest::Connect(connect) => {
                 let id = self.next_session_id;
                 self.next_session_id = self.next_session_id.wrapping_add(1).max(1);
+                // Not negotiated: the WSP default.
                 let client_sdu = wsp::requested_client_sdu(&connect)
-                    .unwrap_or(self.cfg.max_message_bytes)
+                    .unwrap_or(wsp::DEFAULT_SDU)
                     .min(self.cfg.max_message_bytes);
                 if self.sessions.len() >= MAX_SESSIONS
                     && !self.sessions.contains_key(&(peer.ip, key.port))
@@ -574,8 +705,9 @@ impl WapGateway {
                 self.respond(key, peer, server_port, class, reply, now);
             }
             WspRequest::Resume { session_id } => {
-                let max = self.cfg.max_message_bytes;
-                self.sessions.entry((peer.ip, key.port)).or_insert_with(|| Session::new(peer, max));
+                // A session this gateway does not know: nothing negotiated, the WSP default.
+                let sdu = wsp::DEFAULT_SDU.min(self.cfg.max_message_bytes);
+                self.sessions.entry((peer.ip, key.port)).or_insert_with(|| Session::new(peer, sdu));
                 tracing::info!("WAP: ISSI {} resumed session {}", peer.issi, session_id);
                 self.respond(key, peer, server_port, class, wsp::empty_reply(status::OK), now);
             }
@@ -586,9 +718,9 @@ impl WapGateway {
             }
             WspRequest::Suspend => self.respond(key, peer, server_port, class, wsp::empty_reply(status::OK), now),
             WspRequest::Get { uri } => {
-                let budget = self.body_budget(peer, key.port);
+                let budget = self.body_budget(key, peer.issi);
                 let route = router::route(
-                    uri,
+                    &uri,
                     &RouteCtx {
                         cfg: &self.cfg,
                         issi: peer.issi,
@@ -607,8 +739,8 @@ impl WapGateway {
                     status::METHOD_NOT_ALLOWED,
                     "No admitido",
                     "Solo se admiten peticiones GET.",
-                    peer,
-                    key.port,
+                    key,
+                    peer.issi,
                 );
                 self.respond_page(key, peer, server_port, class, page, now);
             }
@@ -622,8 +754,8 @@ impl WapGateway {
         }
     }
 
-    fn notice(&self, status: u8, title: &str, text: &str, peer: WapPeer, port: u16) -> Page {
-        let body = home::notice_page(title, text, &home::home_url(self.cfg.gateway_ipv4), self.body_budget(peer, port));
+    fn notice(&self, status: u8, title: &str, text: &str, key: TxKey, issi: u32) -> Page {
+        let body = home::notice_page(title, text, &home::home_url(self.cfg.gateway_ipv4), self.body_budget(key, issi));
         Page {
             status,
             kind: ContentKind::Xhtml,
@@ -651,16 +783,21 @@ impl WapGateway {
                 status::SERVICE_UNAVAILABLE,
                 "Ocupado",
                 "La estación está atendiendo otras páginas.",
-                peer,
-                key.port,
+                key,
+                peer.issi,
             );
             self.respond_page(key, peer, server_port, class, page, now);
             return;
         }
         self.fetches += 1;
-        self.insert_tx(key, peer, server_port, TxState::Fetching { id, since: now });
-        // Hold-on: the request is accepted (the WSP user's acknowledgement when U/P is set).
-        push(&mut self.out, peer, server_port, key.port, wtp::ack(key.tid, None, false));
+        // A Result ready soon acknowledges the Invoke itself; the timer sends the hold-on Ack
+        // (the WSP user's acknowledgement when U/P is set) if the download takes longer.
+        let state = TxState::Fetching {
+            id,
+            since: now,
+            held: false,
+        };
+        self.insert_tx(key, peer, server_port, state);
     }
 
     fn on_fetch_reply(&mut self, reply: FetchReply, now: Instant) {
@@ -690,30 +827,37 @@ impl WapGateway {
         if class != 2 {
             return;
         }
-        let limit = self.message_limit(peer, key.port);
+        let limit = self.message_limit(key, peer.issi);
         let message = if message.len() > limit {
             tracing::warn!("WAP: reply of {} bytes exceeds {} for ISSI {}", message.len(), limit, peer.issi);
             wsp::empty_reply(status::INTERNAL_ERROR)
         } else {
             message
         };
-        let segment = if self.sar_enabled(peer.issi) {
+        let segment = if self.sar_for(key, peer.issi) {
             self.segment_bytes(peer.issi)
         } else {
             message.len()
         };
-        let mut out = OutMessage::new(key.tid, &message, segment, self.cfg.wtp.group_size as usize, now);
-        for packet in out.send_group(now, retry_timer(&self.cfg.wtp)) {
+        let mut out = OutMessage::new(key.tid, &message, segment, self.cfg.wtp.group_size as usize, now)
+            .with_retransmit_rid(self.cfg.wtp.retransmit_rid);
+        for packet in out.send_group(now, self.timer_for(peer.issi)) {
             push(&mut self.out, peer, server_port, key.port, packet);
         }
         self.insert_tx(key, peer, server_port, TxState::Sending(out));
     }
 
     fn on_ack(&mut self, key: TxKey, psn: Option<u8>, now: Instant) {
-        let timer = retry_timer(&self.cfg.wtp);
+        let Some(issi) = self.txs.get(&key).map(|t| t.peer.issi) else {
+            return;
+        };
+        let timer = self.timer_for(issi);
         let Some(tx) = self.txs.get_mut(&key) else { return };
         let TxState::Sending(out) = &mut tx.state else { return };
-        match out.on_ack(psn, now, timer) {
+        let outcome = out.on_ack(psn, now, timer);
+        let sample = out.take_rtt_sample();
+        let sar_answered = out.packet_count() > 1 && out.heard_back();
+        match outcome {
             AckOutcome::Done => tx.state = TxState::Done { until: now + DONE_HOLD },
             AckOutcome::Next(packets) => {
                 for packet in packets {
@@ -722,14 +866,24 @@ impl WapGateway {
             }
             AckOutcome::Ignored => {}
         }
+        self.note_rtt(issi, sample);
+        if sar_answered {
+            self.sar_answered.insert(issi);
+        }
     }
 
     fn on_nack(&mut self, key: TxKey, missing: &[u8], now: Instant) {
-        let timer = retry_timer(&self.cfg.wtp);
+        let Some(issi) = self.txs.get(&key).map(|t| t.peer.issi) else {
+            return;
+        };
+        let timer = self.timer_for(issi);
         let max_retries = self.cfg.wtp.max_retries;
         let Some(tx) = self.txs.get_mut(&key) else { return };
         let (peer, server_port) = (tx.peer, tx.server_port);
         let TxState::Sending(out) = &mut tx.state else { return };
+        if out.packet_count() > 1 {
+            self.sar_answered.insert(issi);
+        }
         match out.on_nack(missing, max_retries, now, timer) {
             Some(packets) => {
                 for packet in packets {
@@ -765,19 +919,34 @@ impl WapGateway {
     }
 
     fn run_timer(&mut self, key: TxKey, now: Instant) {
-        let timer = retry_timer(&self.cfg.wtp);
+        let Some(issi) = self.txs.get(&key).map(|t| t.peer.issi) else {
+            return;
+        };
+        let timer = self.timer_for(issi);
+        let paused = self.paused.contains(&issi);
         let max_retries = self.cfg.wtp.max_retries;
+        let hold_on = Duration::from_millis(self.cfg.wtp.hold_on_ms);
         let Some(tx) = self.txs.get_mut(&key) else { return };
         let (peer, server_port) = (tx.peer, tx.server_port);
         match &mut tx.state {
+            TxState::Sending(_) if paused => {}
             TxState::Sending(out) => match out.on_timer(max_retries, now, timer) {
                 TimerOutcome::Idle => {}
                 TimerOutcome::Retransmit(packet) => push(&mut self.out, peer, server_port, key.port, packet),
                 TimerOutcome::GiveUp => {
                     tracing::info!("WAP: ISSI {} stopped answering TID {}, transaction aborted", peer.issi, key.tid);
+                    // Not a single Ack or Nack of a segmented result, from a radio that never
+                    // answered one: it may be dropping Segmented Results without saying so.
+                    let unheard = out.packet_count() > 1 && !out.heard_back() && !self.sar_answered.contains(&issi);
                     self.txs.remove(&key);
                     let abort = wtp::abort(key.tid, wtp::ABORT_PROVIDER, wtp::ABORT_REASON_NORESPONSE);
                     push(&mut self.out, peer, server_port, key.port, abort);
+                    if unheard && self.cfg.wtp.sar == WapSarMode::Auto && self.no_sar.insert(issi) {
+                        tracing::info!(
+                            "WAP: ISSI {} never acknowledged a segmented result, single datagrams from now on",
+                            issi
+                        );
+                    }
                 }
             },
             TxState::Done { until } => {
@@ -790,20 +959,24 @@ impl WapGateway {
                     self.txs.remove(&key);
                 }
             }
-            TxState::Fetching { since, .. } => {
-                if now.duration_since(*since) > FETCH_GUARD {
-                    let page = self.notice(
-                        status::GATEWAY_TIMEOUT,
-                        "Sin respuesta",
-                        "La página tarda demasiado.",
-                        peer,
-                        key.port,
-                    );
+            TxState::Fetching { since, held, .. } => {
+                let waited = now.duration_since(*since);
+                if !*held && waited >= hold_on {
+                    *held = true;
+                    push(&mut self.out, peer, server_port, key.port, wtp::ack(key.tid, None, false));
+                }
+                if waited > FETCH_GUARD {
+                    let page = self.notice(status::GATEWAY_TIMEOUT, "Sin respuesta", "La página tarda demasiado.", key, issi);
                     self.respond_page(key, peer, server_port, 2, page, now);
                 }
             }
         }
     }
+}
+
+/// Whether an `mtu` is too small for a terminal's WSP Connect to arrive unfragmented.
+fn fragments_requests(mtu: u16) -> bool {
+    usize::from(mtu) < CONNECT_IPV4_BYTES
 }
 
 /// Helper threads of the gateway leave the station's SCHED_FIFO (inherited from the stack): a
@@ -839,6 +1012,13 @@ impl WapService {
         let cfg = config.effective_wap();
         if !cfg.enabled {
             return None;
+        }
+        if fragments_requests(cfg.mtu) {
+            tracing::warn!(
+                "WAP: mtu {} is below a WSP Connect ({} octets): the terminal must segment it with WTP SAR, IPv4 fragments are dropped",
+                cfg.mtu,
+                CONNECT_IPV4_BYTES
+            );
         }
         let thresholds = snapshot::thresholds(&config.config());
         // The pool runs even with browsing off: the dashboard can switch browsing on at runtime.

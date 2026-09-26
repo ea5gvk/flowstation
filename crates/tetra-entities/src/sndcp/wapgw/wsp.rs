@@ -2,6 +2,8 @@
 //! terminal sends (Connect, Resume, Disconnect, Suspend, Get and the unsupported methods) and
 //! the Connect Reply and Reply the gateway sends back.
 
+use std::borrow::Cow;
+
 use tetra_config::bluestation::WapContentTypeForm;
 
 use crate::sndcp::wap_ip::{
@@ -35,6 +37,9 @@ pub mod status {
 /// WSP abort reason for a malformed PDU (WAP-230-WSP table 35), sent as a WTP user abort.
 pub const ABORT_PROTOERR: u8 = 0xe0;
 
+/// Client-SDU and Server-SDU of a session that did not negotiate them (WAP-230-WSP default).
+pub const DEFAULT_SDU: usize = 1400;
+
 /// Largest header a Reply built here can carry: PDU type, status, HeadersLen and the text-form
 /// Content-Type with its charset (1F 20 + 30 octets of media type + 81 EA).
 pub const REPLY_OVERHEAD_MAX: usize = 3 + 34;
@@ -47,8 +52,10 @@ pub(crate) enum WspRequest<'a> {
     },
     Disconnect,
     Suspend,
+    /// A URI that is not UTF-8 (Latin-1 typed in the address bar) comes with its non-ASCII
+    /// octets percent-encoded.
     Get {
-        uri: &'a str,
+        uri: Cow<'a, str>,
     },
     /// A method this gateway does not serve (Post, Put, Options, Head, ...): answer 405.
     Unsupported {
@@ -78,9 +85,21 @@ pub(crate) fn parse_request(wsp: &[u8]) -> WspRequest<'_> {
             let Some(uri) = wsp.get(1 + octets..1 + octets + len) else {
                 return WspRequest::Malformed;
             };
-            std::str::from_utf8(uri)
-                .map(|uri| WspRequest::Get { uri })
-                .unwrap_or(WspRequest::Malformed)
+            let uri = match std::str::from_utf8(uri) {
+                Ok(uri) => Cow::Borrowed(uri),
+                Err(_) => Cow::Owned(
+                    uri.iter()
+                        .map(|&b| {
+                            if b.is_ascii() {
+                                char::from(b).to_string()
+                            } else {
+                                format!("%{b:02X}")
+                            }
+                        })
+                        .collect(),
+                ),
+            };
+            WspRequest::Get { uri }
         }
         0x41..=0x4f | 0x60..=0x7f => WspRequest::Unsupported { pdu_type },
         _ => WspRequest::Malformed,
@@ -125,20 +144,30 @@ pub enum ContentKind {
     Wml,
 }
 
-/// Content-Type in the general form with a UTF-8 charset (Well-known-charset 0x81, utf-8 = 106).
+/// Content-Type: the well-known value alone (`Bare`), or the general form with a UTF-8 charset
+/// (Well-known-charset 0x81, utf-8 = 106) and the media type as that value or as text.
 fn content_type(kind: ContentKind, form: WapContentTypeForm) -> Vec<u8> {
-    match (kind, form) {
-        (ContentKind::Xhtml, WapContentTypeForm::Short) => vec![0x03, 0xc5, 0x81, 0xea],
-        (ContentKind::Xhtml, WapContentTypeForm::Text) => {
-            let media = b"application/vnd.wap.xhtml+xml\0";
-            // 32 octets do not fit a Short-length (<= 30): Length-quote (0x1F) + uintvar.
-            let mut out = vec![0x1f];
-            write_uintvar(media.len() + 2, &mut out);
+    let (code, media): (u8, &[u8]) = match kind {
+        ContentKind::Xhtml => (0xc5, b"application/vnd.wap.xhtml+xml\0"),
+        ContentKind::Wml => (0x88, b"text/vnd.wap.wml\0"),
+    };
+    match form {
+        WapContentTypeForm::Bare => vec![code],
+        WapContentTypeForm::Short => vec![0x03, code, 0x81, 0xea],
+        WapContentTypeForm::Text => {
+            let len = media.len() + 2;
+            // Short-length up to 30 octets, else Length-quote (0x1F) + uintvar.
+            let mut out = Vec::new();
+            if len <= 30 {
+                out.push(len as u8);
+            } else {
+                out.push(0x1f);
+                write_uintvar(len, &mut out);
+            }
             out.extend_from_slice(media);
             out.extend_from_slice(&[0x81, 0xea]);
             out
         }
-        (ContentKind::Wml, _) => vec![0x03, 0x88, 0x81, 0xea],
     }
 }
 
@@ -211,6 +240,18 @@ mod tests {
         expected.extend_from_slice(&[0x81, 0xea, b'x']);
         assert_eq!(reply, expected);
         assert_eq!(reply.len() - 1, REPLY_OVERHEAD_MAX);
+        let wml = super::reply(status::OK, ContentKind::Wml, WapContentTypeForm::Text, b"");
+        assert_eq!(&wml[..4], &[0x04, 0x20, 20, 19]);
+        assert_eq!(&wml[4..], &[&b"text/vnd.wap.wml\0"[..], &[0x81, 0xea]].concat()[..]);
+    }
+
+    #[test]
+    fn reply_content_type_bare_like_nexus() {
+        // Nexus-BS vectors (Docs/wap-port-spec.md 7.4): HeadersLen 1 and the well-known value.
+        let xhtml = reply(status::OK, ContentKind::Xhtml, WapContentTypeForm::Bare, b"<p/>");
+        assert_eq!(xhtml, [&[0x04, 0x20, 0x01, 0xc5][..], b"<p/>"].concat());
+        let wml = reply(status::OK, ContentKind::Wml, WapContentTypeForm::Bare, b"");
+        assert_eq!(wml, vec![0x04, 0x20, 0x01, 0x88]);
     }
 
     #[test]
@@ -218,7 +259,20 @@ mod tests {
         let mut get = vec![0x40, 0x0d];
         get.extend_from_slice(b"/status.xhtml");
         get.extend_from_slice(&[0x80, 0x81]); // headers are ignored
-        assert_eq!(parse_request(&get), WspRequest::Get { uri: "/status.xhtml" });
+        assert_eq!(
+            parse_request(&get),
+            WspRequest::Get {
+                uri: "/status.xhtml".into()
+            }
+        );
+        // Latin-1 in the address bar is not UTF-8: its octets come percent-encoded.
+        let latin1 = [&[0x40, 0x0c][..], b"/go?u=Espa", &[0xf1], b"a"].concat();
+        assert_eq!(
+            parse_request(&latin1),
+            WspRequest::Get {
+                uri: "/go?u=Espa%F1a".into()
+            }
+        );
         assert_eq!(parse_request(&[0x40, 0x05, b'/']), WspRequest::Malformed);
         assert_eq!(parse_request(&[0x60, 0x01, 0x00]), WspRequest::Unsupported { pdu_type: 0x60 });
         assert_eq!(parse_request(&[0x09, 0x01, 0x00]), WspRequest::Resume { session_id: 1 });

@@ -127,9 +127,10 @@ pub fn query_param(query: Option<&str>, key: &str) -> Option<String> {
 }
 
 /// The URL typed in the home page's form: http/https only, `http://` when no scheme is given.
+/// Octets that were not UTF-8 (decoded as U+FFFD) make it invalid.
 fn typed_url(u: &str) -> Option<String> {
     let u = u.trim();
-    if u.is_empty() || u.chars().any(char::is_whitespace) {
+    if u.is_empty() || u.chars().any(|c| c.is_whitespace() || c == char::REPLACEMENT_CHARACTER) {
         return None;
     }
     match u.split_once("://") {
@@ -359,6 +360,14 @@ mod tests {
         assert!(large.body.len() > small.body.len(), "{} vs {}", large.body.len(), small.body.len());
         let wml = page(route_for("/status.wml?s=1", &cfg, 1, 500));
         assert_eq!(wml.kind, ContentKind::Wml);
+    }
+
+    #[test]
+    fn typed_url_that_was_not_utf8_is_refused() {
+        // WSP hands a Latin-1 URI over percent-encoded; its "ñ" does not decode as UTF-8.
+        let p = page(route_for("/go?u=Espa%F1a", &cfg(true, &[1]), 1, 900));
+        assert_eq!(p.status, status::BAD_REQUEST);
+        assert!(String::from_utf8(p.body).unwrap().contains("Dirección no válida"));
     }
 
     #[test]

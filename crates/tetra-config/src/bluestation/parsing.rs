@@ -562,6 +562,8 @@ group_size = 3
 retry_base_ms = 4000
 air_rate_bytes_per_sec = 450
 max_retries = 4
+retransmit_rid = true
+hold_on_ms = 2000
 
 [wap.browse]
 enabled = true

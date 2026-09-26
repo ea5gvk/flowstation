@@ -23,6 +23,8 @@ pub enum WapContentTypeForm {
     Short,
     /// Media type as text ("application/vnd.wap.xhtml+xml") with a UTF-8 charset parameter.
     Text,
+    /// Well-known short integer alone (0xC5, WML 0x88), no charset: what Nexus-BS sent the MXP600.
+    Bare,
 }
 
 /// `[wap.wtp]`: WTP transaction tuning.
@@ -37,6 +39,12 @@ pub struct CfgWapWtp {
     pub air_rate_bytes_per_sec: u32,
     /// Retransmissions of a packet group before the transaction is aborted.
     pub max_retries: u8,
+    /// Set RID on retransmitted Result packets (WAP-224); false sends them with RID clear, as
+    /// Nexus-BS did with the MXP600.
+    pub retransmit_rid: bool,
+    /// The hold-on Ack goes out only when a download has not answered within this time (0 = at
+    /// once).
+    pub hold_on_ms: u64,
 }
 
 impl Default for CfgWapWtp {
@@ -47,6 +55,8 @@ impl Default for CfgWapWtp {
             retry_base_ms: 4000,
             air_rate_bytes_per_sec: 450,
             max_retries: 4,
+            retransmit_rid: true,
+            hold_on_ms: 2000,
         }
     }
 }
@@ -178,6 +188,10 @@ pub struct CfgWapWtpDto {
     pub air_rate_bytes_per_sec: u32,
     #[serde(default = "default_max_retries")]
     pub max_retries: u8,
+    #[serde(default = "default_retransmit_rid")]
+    pub retransmit_rid: bool,
+    #[serde(default = "default_hold_on_ms")]
+    pub hold_on_ms: u64,
 
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
@@ -265,6 +279,12 @@ fn default_air_rate() -> u32 {
 }
 fn default_max_retries() -> u8 {
     CfgWapWtp::default().max_retries
+}
+fn default_retransmit_rid() -> bool {
+    CfgWapWtp::default().retransmit_rid
+}
+fn default_hold_on_ms() -> u64 {
+    CfgWapWtp::default().hold_on_ms
 }
 fn default_search_url() -> String {
     "http://lite.duckduckgo.com/lite/?q=".to_string()
@@ -389,7 +409,8 @@ pub fn apply_wap_patch(dto: CfgWapDto) -> Result<CfgWap, String> {
     let content_type = match dto.content_type.trim() {
         "short" => WapContentTypeForm::Short,
         "text" => WapContentTypeForm::Text,
-        other => return Err(format!("wap: content_type must be \"short\" or \"text\", got {other:?}")),
+        "bare" => WapContentTypeForm::Bare,
+        other => return Err(format!("wap: content_type must be \"short\", \"text\" or \"bare\", got {other:?}")),
     };
 
     let debug_udp_listen = match dto.debug_udp_listen.trim() {
@@ -437,12 +458,17 @@ pub fn apply_wap_patch(dto: CfgWapDto) -> Result<CfgWap, String> {
             if !(1..=10).contains(&w.max_retries) {
                 return Err("wap.wtp: max_retries must be within 1..=10".to_string());
             }
+            if w.hold_on_ms > 30_000 {
+                return Err("wap.wtp: hold_on_ms must be within 0..=30000".to_string());
+            }
             CfgWapWtp {
                 sar,
                 group_size: w.group_size,
                 retry_base_ms: w.retry_base_ms,
                 air_rate_bytes_per_sec: w.air_rate_bytes_per_sec,
                 max_retries: w.max_retries,
+                retransmit_rid: w.retransmit_rid,
+                hold_on_ms: w.hold_on_ms,
             }
         }
     };
@@ -569,6 +595,19 @@ mod tests {
         assert!(apply_wap_patch(dto("[wtp]\nsar = \"maybe\"")).is_err());
         assert!(apply_wap_patch(dto("[wtp]\ngroup_size = 0")).is_err());
         assert!(apply_wap_patch(dto("[wtp]\nair_rate_bytes_per_sec = 0")).is_err());
+        assert!(apply_wap_patch(dto("[wtp]\nhold_on_ms = 30001")).is_err());
+        assert!(apply_wap_patch(dto("content_type = \"plain\"")).is_err());
+    }
+
+    #[test]
+    fn rid_hold_on_and_bare_content_type_parse() {
+        let cfg = apply_wap_patch(dto("content_type = \"bare\"\n[wtp]\nretransmit_rid = false\nhold_on_ms = 0")).unwrap();
+        assert_eq!(cfg.content_type, WapContentTypeForm::Bare);
+        assert!(!cfg.wtp.retransmit_rid);
+        assert_eq!(cfg.wtp.hold_on_ms, 0);
+        let default = CfgWapWtp::default();
+        assert!(default.retransmit_rid);
+        assert_eq!(default.hold_on_ms, 2000);
     }
 
     #[test]

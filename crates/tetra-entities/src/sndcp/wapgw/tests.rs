@@ -239,9 +239,8 @@ fn get_5kb_segments_and_groups() {
     let t0 = Instant::now();
     let (fetcher, _) = PageFetcher::boxed(5000, false);
     let mut gw = gateway_with(cfg(), fetcher);
-    let out = send(&mut gw, get(0x1234, "http://68k.news/"), t0);
-    assert_eq!(out[0], vec![0x18, 0x92, 0x34], "hold-on Ack before the result");
-    let first: Vec<_> = out[1..].to_vec();
+    // The page is ready at once: the Result acknowledges the Invoke, no hold-on Ack.
+    let first = send(&mut gw, get(0x1234, "http://68k.news/"), t0);
     let heads: Vec<_> = first.iter().map(|p| (result(p).0, result(p).1, result(p).2)).collect();
     assert_eq!(heads, vec![(2, 0, 0), (6, 1, 0), (6, 2, GTR)], "first group of 3");
     assert!(first.iter().all(|p| p.len() <= 576 - 28));
@@ -257,8 +256,7 @@ fn nack_retransmits_only_missing_with_rid() {
     let t0 = Instant::now();
     let (fetcher, _) = PageFetcher::boxed(3000, false);
     let mut gw = gateway_with(cfg(), fetcher);
-    let out = send(&mut gw, get(9, "http://68k.news/"), t0);
-    let group: Vec<_> = out[1..].to_vec();
+    let group = send(&mut gw, get(9, "http://68k.news/"), t0);
     assert_eq!(group.len(), 3);
     // Packet 1 was lost: the terminal Nacks it after the group end.
     let again = send(&mut gw, initiator::nack(9, &[1]), t0);
@@ -297,9 +295,10 @@ fn duplicate_invoke_during_fetch_sends_hold_on_only() {
     let t0 = Instant::now();
     let (fetcher, _) = PageFetcher::boxed(100, true);
     let mut gw = gateway_with(cfg(), fetcher);
-    assert_eq!(send(&mut gw, get(3, "/go?u=wiby.me"), t0), vec![vec![0x18, 0x80, 0x03]]);
+    assert!(send(&mut gw, get(3, "/go?u=wiby.me"), t0).is_empty());
     let dup = initiator::invoke(3, 2, TTR, true, false, &get_pdu("/go?u=wiby.me"));
     assert_eq!(send(&mut gw, dup, t0), vec![vec![0x19, 0x80, 0x03]]);
+    assert!(collect(gw.poll(t0 + Duration::from_secs(3))).is_empty(), "hold-on already sent");
     // A fetch that never ends is answered with 504.
     let out = collect(gw.poll(t0 + FETCH_GUARD + Duration::from_secs(1)));
     assert_eq!(out.len(), 1);
@@ -312,13 +311,13 @@ fn abort_notimplementedsar_falls_back() {
     let (fetcher, budgets) = PageFetcher::boxed(5000, false);
     let mut gw = gateway_with(cfg(), fetcher);
     let out = send(&mut gw, get(1, "http://68k.news/"), t0);
-    assert_eq!(out.len(), 4, "hold-on + first group");
+    assert_eq!(out.len(), 3, "first group");
     assert!(send(&mut gw, initiator::abort(1, 0, wtp::ABORT_REASON_NOTIMPLEMENTEDSAR), t0).is_empty());
     let out = send(&mut gw, get(2, "http://68k.news/"), t0);
-    assert_eq!(out.len(), 2, "hold-on + one datagram");
-    let (_, psn, flags, _, _, _) = result(&out[1]);
+    assert_eq!(out.len(), 1, "one datagram");
+    let (_, psn, flags, _, _, _) = result(&out[0]);
     assert_eq!((psn, flags), (0, TTR));
-    assert!(out[1].len() <= 576 - 28);
+    assert!(out[0].len() <= 576 - 28);
     let budgets = budgets.lock().unwrap();
     assert_eq!(budgets[1], 576 - 28 - 3 - wsp::REPLY_OVERHEAD_MAX, "one Result packet");
     assert!(budgets[0] > budgets[1]);
@@ -354,8 +353,252 @@ fn tidnew_resets_cache() {
     send(&mut gw, initiator::ack(5, None), t0);
     let dup = initiator::invoke(5, 2, TTR, true, false, &get_pdu("/status.wml"));
     assert!(send(&mut gw, dup, t0).is_empty(), "cached TID: duplicate");
-    let renewed = initiator::invoke(5, 2, TTR, true, true, &get_pdu("/status.wml"));
+    let renewed = initiator::invoke(5, 2, TTR, false, true, &get_pdu("/status.wml"));
     assert_eq!(send(&mut gw, renewed, t0).len(), 1, "TIDnew: a new transaction");
+}
+
+/// A retransmission is the same PDU with RID set, TIDnew included: it must not restart the
+/// transaction it repeats.
+#[test]
+fn retransmitted_invoke_with_tidnew_is_a_duplicate() {
+    let t0 = Instant::now();
+    let mut gw = gateway();
+    let connect_new = |tid, rid| {
+        let mut pdu = connect(tid);
+        pdu[0] = (pdu[0] & !1) | u8::from(rid);
+        pdu[3] |= 0x20; // TIDnew: first transaction after power-up
+        pdu
+    };
+    let first = send(&mut gw, connect_new(0x100, false), t0);
+    assert_eq!(&first[0][..5], &[0x12, 0x81, 0x00, 0x02, 0x01], "ConnectReply of session 1");
+    // No Ack yet: the copy gets the same ConnectReply again, not a second session.
+    let again = send(&mut gw, connect_new(0x100, true), t0);
+    assert_eq!(again, vec![[&[0x13][..], &first[0][1..]].concat()]);
+    assert_eq!((gw.sessions.len(), gw.next_session_id), (1, 2));
+    // Acknowledged, then a late copy: nothing.
+    assert!(send(&mut gw, initiator::ack(0x100, None), t0).is_empty());
+    assert!(send(&mut gw, connect_new(0x100, true), t0).is_empty());
+    assert_eq!(gw.next_session_id, 2);
+    // The copy of an Invoke whose original was lost does restart the TIDs.
+    let other = send(&mut gw, connect_new(0x300, true), t0);
+    assert_eq!(&other[0][3..5], &[0x02, 0x02], "session 2");
+    assert!(!gw.txs.contains_key(&TxKey {
+        ip: MS_IP,
+        port: MS_PORT,
+        tid: 0x100
+    }));
+}
+
+#[test]
+fn repeated_invoke_while_sending_resends_at_once() {
+    let t0 = Instant::now();
+    let mut gw = gateway();
+    let out = send(&mut gw, get(0x40, "/status.wml"), t0);
+    assert_eq!(out.len(), 1);
+    let dup = initiator::invoke(0x40, 2, TTR, true, false, &get_pdu("/status.wml"));
+    // The Result was lost: every copy of the Invoke gets it again, until the retries run out.
+    for _ in 0..cfg().wtp.max_retries {
+        let again = send(&mut gw, dup.clone(), t0 + Duration::from_millis(500));
+        assert_eq!(again, vec![[&[out[0][0] | 1][..], &out[0][1..]].concat()], "Result with RID");
+    }
+    assert!(send(&mut gw, dup, t0 + Duration::from_secs(1)).is_empty());
+    // The retries were used up: the timer gives up.
+    assert_eq!(collect(gw.poll(t0 + Duration::from_secs(20))), vec![vec![0x20, 0x80, 0x40, 0x08]]);
+}
+
+#[test]
+fn retransmit_rid_off_sends_copies_with_rid_clear() {
+    let t0 = Instant::now();
+    let mut cfg = cfg();
+    cfg.wtp.retransmit_rid = false;
+    let mut gw = gateway_with(cfg, Box::new(UnavailableFetcher::default()));
+    let out = send(&mut gw, get(0x41, "/status.wml"), t0);
+    let dup = initiator::invoke(0x41, 2, TTR, true, false, &get_pdu("/status.wml"));
+    assert_eq!(send(&mut gw, dup, t0), out, "the same Result, RID clear (as Nexus-BS)");
+    assert_eq!(collect(gw.poll(t0 + Duration::from_secs(20))), out, "timer copy, RID clear");
+}
+
+/// GTR and TTR both set in an Invoke: the terminal does not do SAR.
+#[test]
+fn invoke_without_sar_gets_one_datagram() {
+    for sar in [WapSarMode::Auto, WapSarMode::On] {
+        let t0 = Instant::now();
+        let mut cfg = cfg();
+        cfg.wtp.sar = sar;
+        let mut gw = gateway_with(cfg, Box::new(UnavailableFetcher::default()));
+        let no_sar = initiator::invoke(0x50, 2, GTR | TTR, false, false, &get_pdu("/"));
+        let out = send(&mut gw, no_sar, t0);
+        assert_eq!(out.len(), 1, "{sar:?}");
+        assert_eq!(result(&out[0]).2, TTR);
+        assert!(out[0].len() <= 576 - 28);
+        // Auto remembers the radio; On only follows what each Invoke says.
+        let home = send(&mut gw, get(0x51, "/"), t0);
+        assert_eq!(home.len(), if sar == WapSarMode::Auto { 1 } else { 2 }, "{sar:?}");
+    }
+}
+
+#[test]
+fn silent_segmented_result_falls_back_to_single_datagrams() {
+    let t0 = Instant::now();
+    let mut gw = gateway();
+    assert_eq!(send(&mut gw, get(0x60, "/"), t0).len(), 2, "home page in two packets");
+    let mut t = t0;
+    let mut last = Vec::new();
+    for _ in 0..=cfg().wtp.max_retries {
+        t += Duration::from_secs(20);
+        last = collect(gw.poll(t));
+    }
+    assert_eq!(last, vec![vec![0x20, 0x80, 0x60, 0x08]], "Abort NORESPONSE");
+    assert_eq!(send(&mut gw, get(0x61, "/"), t).len(), 1, "no more segmented results");
+    // An acknowledged segmented result keeps SAR on.
+    let mut gw = gateway();
+    let first = send(&mut gw, get(0x62, "/"), t0);
+    receive_all(&mut gw, 0x62, first, t0);
+    assert_eq!(send(&mut gw, get(0x63, "/"), t0).len(), 2);
+    let mut t = t0;
+    for _ in 0..=cfg().wtp.max_retries {
+        t += Duration::from_secs(20);
+        gw.poll(t);
+    }
+    assert!(gw.no_sar.is_empty(), "this radio answered segmented results before");
+}
+
+#[test]
+fn measured_round_trip_stretches_the_timer() {
+    let t0 = Instant::now();
+    let mut gw = gateway();
+    let out = send(&mut gw, get(0x70, "/status.wml"), t0);
+    let air = Duration::from_millis(out[0].len() as u64 * 1000 / 450);
+    // The Ack comes back just before the fixed 4 s timer: the next Result waits longer.
+    assert!(send(&mut gw, initiator::ack(0x70, None), t0 + Duration::from_millis(3900)).is_empty());
+    let t1 = t0 + Duration::from_secs(10);
+    let out = send(&mut gw, get(0x71, "/status.wml"), t1);
+    assert_eq!(out.len(), 1);
+    assert!(
+        collect(gw.poll(t1 + Duration::from_secs(6) + air)).is_empty(),
+        "the static timer fired here"
+    );
+    let again = collect(gw.poll(t1 + MAX_ADAPTIVE_TIMER + air * 2));
+    assert_eq!(again.len(), 1);
+    assert!(result(&again[0]).3, "retransmission");
+}
+
+#[test]
+fn paused_timers_wait_for_the_bearer() {
+    let t0 = Instant::now();
+    let mut gw = gateway();
+    let out = send(&mut gw, get(0x72, "/status.wml"), t0);
+    assert_eq!(out.len(), 1);
+    gw.pause_timers(ISSI);
+    // A long group call: no retransmission and no Abort while the bearer holds the data.
+    assert!(collect(gw.poll(t0 + Duration::from_secs(60))).is_empty());
+    let t1 = t0 + Duration::from_secs(61);
+    gw.resume_timers(ISSI, t1);
+    assert!(collect(gw.poll(t1 + Duration::from_secs(3))).is_empty(), "a fresh timer");
+    assert!(send(&mut gw, initiator::ack(0x72, None), t1 + Duration::from_secs(3)).is_empty());
+    assert!(matches!(gw.txs.values().next().map(|t| &t.state), Some(TxState::Done { .. })));
+}
+
+#[test]
+fn connect_without_client_sdu_uses_wsp_default() {
+    let t0 = Instant::now();
+    let (fetcher, budgets) = PageFetcher::boxed(5000, false);
+    let mut gw = gateway_with(cfg(), fetcher);
+    let reply = send(
+        &mut gw,
+        initiator::invoke(0x80, 2, TTR, false, false, &[0x01, 0x10, 0x00, 0x00]),
+        t0,
+    );
+    assert_eq!(
+        reply,
+        vec![vec![0x12, 0x80, 0x80, 0x02, 0x01, 0x00, 0x00]],
+        "no capabilities echoed"
+    );
+    assert_eq!(gw.sessions.get(&(MS_IP, MS_PORT)).map(|s| s.client_sdu), Some(wsp::DEFAULT_SDU));
+    let first = send(&mut gw, get(0x81, "http://68k.news/"), t0);
+    let message = receive_all(&mut gw, 0x81, first, t0);
+    assert!(message.len() <= wsp::DEFAULT_SDU, "{} octets", message.len());
+    assert_eq!(budgets.lock().unwrap()[0], wsp::DEFAULT_SDU - wsp::REPLY_OVERHEAD_MAX);
+    // A Resume of a session this gateway does not know gets the same default.
+    let mut gw = gateway();
+    send(&mut gw, initiator::invoke(0x82, 2, TTR, false, false, &[0x09, 0x01, 0x00]), t0);
+    assert_eq!(gw.sessions.get(&(MS_IP, MS_PORT)).map(|s| s.client_sdu), Some(wsp::DEFAULT_SDU));
+}
+
+#[test]
+fn small_mtu_is_flagged() {
+    assert!(fragments_requests(296));
+    assert!(!fragments_requests(576));
+}
+
+#[test]
+fn hold_on_only_when_the_download_is_slow() {
+    let t0 = Instant::now();
+    let (fetcher, _) = PageFetcher::boxed(100, true);
+    let mut gw = gateway_with(cfg(), fetcher);
+    assert!(send(&mut gw, get(0x90, "/go?u=wiby.me"), t0).is_empty());
+    assert!(collect(gw.poll(t0 + Duration::from_millis(1900))).is_empty());
+    assert_eq!(
+        collect(gw.poll(t0 + Duration::from_millis(2000))),
+        vec![vec![0x18, 0x80, 0x90]],
+        "hold-on after hold_on_ms"
+    );
+    assert!(collect(gw.poll(t0 + Duration::from_secs(5))).is_empty(), "only once");
+}
+
+#[test]
+fn latin1_uri_gets_a_page_not_an_abort() {
+    let mut gw = gateway();
+    let wsp = [&[0x40, 0x0c][..], b"/go?u=Espa", &[0xf1], b"a"].concat();
+    let out = send(&mut gw, initiator::invoke(0x91, 2, TTR, false, false, &wsp), Instant::now());
+    assert_eq!(out.len(), 1);
+    assert_eq!(&result(&out[0]).5[..2], &[0x04, status::BAD_REQUEST]);
+}
+
+#[test]
+fn other_wtp_version_is_aborted() {
+    let mut gw = gateway();
+    let mut pdu = get(0x92, "/");
+    pdu[3] |= 0x40; // version 1
+    assert_eq!(
+        send(&mut gw, pdu, Instant::now()),
+        vec![vec![0x20, 0x80, 0x92, 0x06]],
+        "WTPVERSIONONE"
+    );
+    assert!(gw.txs.is_empty());
+}
+
+#[test]
+fn segmented_invoke_flood_is_bounded() {
+    let t0 = Instant::now();
+    let mut gw = gateway();
+    // Segments that never close a group, each with a new TID: a few per radio at most.
+    for tid in 0..MAX_REASSEMBLING_PER_PEER as u16 {
+        assert!(send(&mut gw, initiator::segmented_invoke(tid, 1, 0, false, b"x"), t0).is_empty());
+    }
+    let refused = send(&mut gw, initiator::segmented_invoke(0x99, 1, 0, false, b"x"), t0);
+    assert_eq!(refused, vec![vec![0x20, 0x80, 0x99, 0x07]], "CAPTEMPEXCEEDED");
+    assert_eq!(gw.txs.len(), MAX_REASSEMBLING_PER_PEER);
+    // Many radios: the gateway-wide bound holds.
+    for issi in 0..(MAX_TRANSACTIONS as u32) {
+        let peer = WapPeer {
+            issi: 1000 + issi,
+            ip: Ipv4Addr::from(0x0a01_0000 + issi),
+            via: WapVia::Air,
+        };
+        for tid in 0..2 {
+            gw.on_udp(
+                UdpIn {
+                    peer,
+                    src_port: MS_PORT,
+                    dst_port: WAP_PORT_CONNECTION,
+                    payload: initiator::segmented_invoke(tid, 1, 0, false, b"x"),
+                },
+                t0,
+            );
+        }
+    }
+    assert_eq!(gw.txs.len(), MAX_TRANSACTIONS);
 }
 
 #[test]
@@ -375,8 +618,7 @@ fn unavailable_fetcher_answers_503() {
     let t0 = Instant::now();
     let mut gw = gateway();
     let out = send(&mut gw, get(8, "/s?q=tetra"), t0);
-    assert_eq!(out[0], vec![0x18, 0x80, 0x08]);
-    let message = receive_all(&mut gw, 8, out[1..].to_vec(), t0);
+    let message = receive_all(&mut gw, 8, out, t0);
     assert_eq!(&message[..2], &[0x04, status::SERVICE_UNAVAILABLE]);
     assert!(String::from_utf8_lossy(&message).contains("navegación no está disponible"));
 }
@@ -614,6 +856,9 @@ mtu = 1500
 debug_udp_listen = "127.0.0.1:0"
 debug_issi = 9990
 
+[wap.wtp]
+hold_on_ms = 30000
+
 [wap.browse]
 enabled = true
 allowed_issis = [9990]
@@ -644,13 +889,12 @@ allowed_ports = [{port}]
     };
     assert_eq!(&exchange(&connect(1), 1)[0][..4], &[0x12, 0x80, 0x01, 0x02]);
 
-    // Hold-on Ack, then the page in one Result (MTU 1500 carries a 1200-octet page); returns the
-    // XHTML body after acknowledging the Result.
+    // The page in one Result (MTU 1500 carries a 1200-octet page; the hold-on Ack is held back
+    // for 30 s); returns the XHTML body after acknowledging the Result.
     let mut fetch = |tid: u16, uri: &str| -> String {
-        let got = exchange(&get(tid, uri), 2);
-        assert_eq!(got.len(), 2, "hold-on Ack and Result for {uri}");
-        assert_eq!(got[0], wtp::ack(tid, None, false), "hold-on Ack first");
-        let (ty, _, flags, _, _, wsp) = result(&got[1]);
+        let got = exchange(&get(tid, uri), 1);
+        assert_eq!(got.len(), 1, "Result for {uri}");
+        let (ty, _, flags, _, _, wsp) = result(&got[0]);
         assert_eq!((ty, flags), (2, TTR));
         assert_eq!(&wsp[..2], &[0x04, 0x20], "WSP Reply 200");
         let body = String::from_utf8(wsp[3 + wsp[2] as usize..].to_vec()).unwrap();
