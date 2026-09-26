@@ -5,9 +5,10 @@ use std::net::Ipv4Addr;
 
 use crate::sndcp::wap_status::{WapStatusSnapshot, compact_uptime, escape_xhtml_text};
 
-const PROLOG: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>";
-const DOCTYPE: &str = "<!DOCTYPE html PUBLIC \"-//WAPFORUM//DTD XHTML Mobile 1.0//EN\" \"http://www.wapforum.org/DTD/xhtml-mobile10.dtd\">";
-const HTML_OPEN: &str = "<html xmlns=\"http://www.w3.org/1999/xhtml\">";
+pub(crate) const PROLOG: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>";
+pub(crate) const DOCTYPE: &str =
+    "<!DOCTYPE html PUBLIC \"-//WAPFORUM//DTD XHTML Mobile 1.0//EN\" \"http://www.wapforum.org/DTD/xhtml-mobile10.dtd\">";
+pub(crate) const HTML_OPEN: &str = "<html xmlns=\"http://www.w3.org/1999/xhtml\">";
 
 /// The home page is shown on every browser start: keep it within two SAR packets.
 pub const HOME_MAX_BYTES: usize = 900;

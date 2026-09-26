@@ -13,9 +13,12 @@
 //! into a downlink N-PDU ([`UdpOut::to_ipv4`]), and reports a radio that deregisters or drops its
 //! PDP context (`on_peer_lost`).
 
+pub mod convert;
 pub mod debug_udp;
+pub mod doc_cache;
 pub mod fetcher;
 pub mod home;
+pub mod paginate;
 pub mod router;
 pub mod snapshot;
 pub mod wsp;
