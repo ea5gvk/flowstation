@@ -23,6 +23,7 @@ use super::sec_snom_notify::{CfgSnomNotifyDto, apply_snom_notify_patch};
 use super::sec_telegram::{CfgTelegramDto, apply_telegram_patch};
 use super::sec_telemetry::{CfgTelemetryDto, apply_telemetry_patch};
 use super::sec_tpg2200_action::{CfgTpg2200ActionDto, apply_tpg2200_action_patch};
+use super::sec_wap::{CfgWapDto, apply_wap_patch};
 use super::sec_wx::{CfgWxServiceDto, apply_wx_service_patch};
 use super::{PhyIoDto, phy_dto_to_cfg};
 
@@ -192,6 +193,23 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
         return Err(format!("Unrecognized fields in emergency config: {:?}", sorted_keys(&emergency.extra)).into());
     }
 
+    // Optional wap section and its [wap.wtp] / [wap.browse] subsections.
+    if let Some(ref wap) = root.wap {
+        if !wap.extra.is_empty() {
+            return Err(format!("Unrecognized fields in wap config: {:?}", sorted_keys(&wap.extra)).into());
+        }
+        if let Some(ref wtp) = wap.wtp
+            && !wtp.extra.is_empty()
+        {
+            return Err(format!("Unrecognized fields in wap.wtp config: {:?}", sorted_keys(&wtp.extra)).into());
+        }
+        if let Some(ref browse) = wap.browse
+            && !browse.extra.is_empty()
+        {
+            return Err(format!("Unrecognized fields in wap.browse config: {:?}", sorted_keys(&browse.extra)).into());
+        }
+    }
+
     // Build cell config, then inject the separately-parsed neighbor cells and sds_command_control
     let mut cell_cfg = cell_dto_to_cfg(root.cell_info);
     cell_cfg.neighbor_cells_ca = neighbor_cells_ca;
@@ -243,6 +261,10 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
         telegram: None,
         health: apply_health_patch(root.health.unwrap_or_default()),
         emergency: apply_emergency_patch(root.emergency.unwrap_or_default()),
+        wap: match root.wap {
+            Some(wap) => apply_wap_patch(wap)?,
+            None => Default::default(),
+        },
     };
 
     if let Some(brew) = root.brew {
@@ -321,6 +343,7 @@ struct TomlConfigRoot {
     telegram_alerts: Option<CfgTelegramDto>,
     health: Option<CfgHealthDto>,
     emergency: Option<CfgEmergencyDto>,
+    wap: Option<CfgWapDto>,
 
     #[serde(flatten)]
     extra: HashMap<String, Value>,
@@ -521,6 +544,30 @@ dl_queue_degraded = 64
 dl_queue_critical = 192
 sds_queue_degraded = 32
 sds_queue_critical = 128
+
+[wap]
+enabled = true
+gateway_ipv4 = "10.0.0.1"
+mtu = 576
+max_message_bytes = 8192
+max_request_bytes = 1024
+content_type = "short"
+debug_udp_listen = "127.0.0.1:9200"
+debug_udp_allowed_sources = ["127.0.0.1/32"]
+debug_issi = 0
+
+[wap.wtp]
+sar = "auto"
+group_size = 3
+retry_base_ms = 4000
+air_rate_bytes_per_sec = 450
+max_retries = 4
+
+[wap.browse]
+enabled = true
+allowed_issis = [2260618]
+search_url = "http://lite.duckduckgo.com/lite/?q="
+bookmarks = ["http://68k.news/", "http://wiby.me/", "http://text.npr.org/"]
 "#;
         let cfg = from_toml_str(toml).unwrap_or_else(|e| panic!("documented optional blocks must parse when uncommented: {e}"));
         assert!(cfg.recovery.enabled);
@@ -550,6 +597,7 @@ sds_queue_critical = 128
         assert!(cfg.dapnet.telegram_allowed_rics.contains(&200));
         assert!(cfg.dapnet.telegram_allowed_rics.contains(&0x1C40));
         assert!(cfg.geoalarm.enabled);
+        assert!(cfg.wap.browse_allowed(2260618));
     }
 
     fn minimal_toml(extra_cell: &str) -> String {
@@ -762,5 +810,76 @@ pbx_gateway_issi = [16777184, 16777186]
         let cfg = from_toml_str(&toml).expect("brew config with pbx_gateway_issi alias must parse");
         let brew = cfg.brew.expect("brew config should be present");
         assert_eq!(brew.pbx_gateway_issis, Some(vec![16_777_184, 16_777_186]));
+    }
+
+    #[test]
+    fn wap_default_is_disabled() {
+        let cfg = from_toml_str(&minimal_toml("")).expect("parse");
+        assert!(!cfg.wap.enabled);
+        assert!(!cfg.wap.browse.enabled);
+        assert!(cfg.wap.debug_udp_listen.is_none());
+        assert_eq!(cfg.wap, crate::bluestation::CfgWap::default());
+    }
+
+    #[test]
+    fn wap_section_parses_with_subsections() {
+        let toml = minimal_toml("")
+            + r#"
+[wap]
+enabled = true
+gateway_ipv4 = "10.0.0.1"
+mtu = 1500
+debug_udp_listen = "0.0.0.0:9200"
+debug_udp_allowed_sources = ["10.33.1.0/24"]
+debug_issi = 9990
+
+[wap.wtp]
+sar = "off"
+group_size = 4
+
+[wap.browse]
+enabled = true
+allowed_issis = [2260618]
+"#;
+        let cfg = from_toml_str(&toml).expect("wap section must parse");
+        assert!(cfg.wap.enabled);
+        assert_eq!(cfg.wap.mtu, 1500);
+        assert_eq!(cfg.wap.debug_udp_listen, Some("0.0.0.0:9200".parse().unwrap()));
+        assert_eq!(cfg.wap.wtp.sar, crate::bluestation::WapSarMode::Off);
+        assert_eq!(cfg.wap.wtp.group_size, 4);
+        assert!(cfg.wap.browse_allowed(2260618));
+        assert!(!cfg.wap.browse_allowed(9990));
+    }
+
+    #[test]
+    fn wap_browse_without_wap_rejected() {
+        let toml = minimal_toml("") + "\n[wap]\n[wap.browse]\nenabled = true\n";
+        assert!(from_toml_str(&toml).is_err(), "browse needs [wap] enabled");
+    }
+
+    #[test]
+    fn wap_bad_mtu_rejected() {
+        let toml = minimal_toml("") + "\n[wap]\nmtu = 1000\n";
+        assert!(from_toml_str(&toml).is_err(), "mtu must be one of the SNDCP values");
+    }
+
+    #[test]
+    fn wap_unknown_keys_rejected() {
+        for block in [
+            "\n[wap]\nbogus = 1\n",
+            "\n[wap]\n[wap.wtp]\nbogus = 1\n",
+            "\n[wap]\n[wap.browse]\nbogus = 1\n",
+        ] {
+            let toml = minimal_toml("") + block;
+            assert!(from_toml_str(&toml).is_err(), "unknown key must be rejected: {block}");
+        }
+    }
+
+    #[test]
+    fn wap_lan_debug_udp_without_sources_rejected() {
+        let lan = minimal_toml("") + "\n[wap]\ndebug_udp_listen = \"0.0.0.0:9200\"\ndebug_udp_allowed_sources = []\n";
+        assert!(from_toml_str(&lan).is_err(), "LAN debug bearer needs a source list");
+        let lo = minimal_toml("") + "\n[wap]\ndebug_udp_listen = \"127.0.0.1:9200\"\ndebug_udp_allowed_sources = []\n";
+        assert!(from_toml_str(&lo).is_ok(), "loopback debug bearer may accept any local source");
     }
 }

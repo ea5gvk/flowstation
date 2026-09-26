@@ -61,5 +61,8 @@ pub use sec_emergency::*;
 pub mod sec_health;
 pub use sec_health::*;
 
+pub mod sec_wap;
+pub use sec_wap::*;
+
 pub mod state;
 pub use state::*;

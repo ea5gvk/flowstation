@@ -4,7 +4,7 @@ use tetra_core::freqs::FreqInfo;
 
 use crate::bluestation::{
     CfgAsterisk, CfgCellInfo, CfgControl, CfgDapnet, CfgEmergency, CfgGeoalarm, CfgHealth, CfgNetInfo, CfgPhyIo, CfgRecovery, CfgSecurity,
-    CfgSnomNotify, CfgTpg2200Action, CfgWxService, PhyBackend, StackState,
+    CfgSnomNotify, CfgTpg2200Action, CfgWap, CfgWxService, PhyBackend, StackState,
 };
 
 use super::sec_brew::CfgBrew;
@@ -118,6 +118,9 @@ pub struct StackConfig {
     /// Emergency-state handling. Always present (defaults: LOCAL-only — no Brew forward,
     /// telegram_alert ON, clear_timeout_secs 30). See [`CfgEmergency`].
     pub emergency: CfgEmergency,
+
+    /// WAP gateway for packet-data terminals. Always present (default: disabled).
+    pub wap: CfgWap,
 }
 
 impl StackConfig {
@@ -356,6 +359,18 @@ impl SharedConfig {
     /// Write guard for mutable state.
     pub fn state_write(&self) -> std::sync::RwLockWriteGuard<'_, StackState> {
         self.state.write().expect("StackState RwLock blocked")
+    }
+
+    /// Effective `[wap]` settings: the dashboard runtime override of the browse switch and of the
+    /// list of radios allowed to browse if present, otherwise the config file values. Returns an
+    /// owned CfgWap so callers don't hold the state lock.
+    pub fn effective_wap(&self) -> CfgWap {
+        let mut wap = self.cfg.wap.clone();
+        if let Some(o) = self.state_read().wap_override.as_ref() {
+            wap.browse.enabled = o.browse_enabled;
+            wap.browse.allowed_issis = o.browse_allowed_issis.clone();
+        }
+        wap
     }
 
     /// Effective WX/METAR service settings: the dashboard runtime override if present,

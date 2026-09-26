@@ -472,6 +472,46 @@ voice_service = true
 
 ###############################################################################
 
+# OPTIONAL: WAP gateway for packet-data terminals (FlowStation)
+#
+# A WAP 1.x gateway (WTP/WSP over UDP, ports 9200 and 9201) inside the station. Radios with a
+# WAP browser (e.g. Motorola MXP600 / MTP3550) get a local home page with the station status;
+# the radios listed in [wap.browse] allowed_issis also get a search box and bookmarks for
+# text-only sites. Everything is off by default.
+#
+# Not in this build yet: the SNDCP packet-data bearer (so radios cannot reach the gateway over
+# the air) and the Internet fetcher (a radio allowed to browse gets a "not available" page).
+# Until then the gateway is reachable only through the debug UDP bearer, for example with
+# contrib/wap-debug/wtp_client.py. That bearer answers anyone who can reach it, so it listens
+# on loopback; to test from the LAN use debug_udp_listen = "0.0.0.0:9200" and restrict
+# debug_udp_allowed_sources to your LAN (a LAN listener without a source list is refused).
+#
+# [wap]
+# enabled = false                                # master on/off for the gateway
+# gateway_ipv4 = "10.0.0.1"                      # address the radios send WAP requests to
+# mtu = 576                                      # largest IPv4 datagram sent: 296, 576, 1006, 1500 or 2002
+# max_message_bytes = 8192                       # largest response (caps the Client-SDU)
+# max_request_bytes = 1024                       # largest request (caps the Server-SDU)
+# content_type = "short"                         # XHTML Content-Type: "short" (0xC5) or "text"
+# debug_udp_listen = ""                          # debug UDP bearer, e.g. "127.0.0.1:9200"; empty = off
+# debug_udp_allowed_sources = ["127.0.0.1/32"]   # sources (CIDR) the debug bearer accepts
+# debug_issi = 0                                 # ISSI the debug bearer's requests are handled as
+#
+# [wap.wtp]
+# sar = "auto"                                   # segment large replies: "auto", "off" or "on"
+# group_size = 3                                 # packets sent before waiting for an Ack (1..=32)
+# retry_base_ms = 4000                           # retransmission timer; the group's air time is added
+# air_rate_bytes_per_sec = 450                   # expected useful air rate, stretches the timer
+# max_retries = 4                                # retransmissions before the transaction is aborted
+#
+# [wap.browse]
+# enabled = false                                # Internet browsing (needs [wap] enabled = true)
+# allowed_issis = []                             # radios that may browse; empty = nobody
+# search_url = "http://lite.duckduckgo.com/lite/?q="  # the query is appended URL-encoded
+# bookmarks = ["http://68k.news/", "http://wiby.me/", "http://text.npr.org/"]
+
+###############################################################################
+
 # OPTIONAL: Built-in WX/METAR SDS service (FlowStation)
 #
 # A weather responder that runs inside FlowStation — no external bot needed.

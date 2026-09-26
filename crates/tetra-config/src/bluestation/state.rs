@@ -235,6 +235,14 @@ impl SubscriberRegistry {
     }
 }
 
+/// Runtime override for WAP browsing, edited from the dashboard: the `[wap.browse]` switch and
+/// the list of radios allowed to browse. `None` means "use the config value".
+#[derive(Debug, Clone, Default)]
+pub struct WapRuntimeOverride {
+    pub browse_enabled: bool,
+    pub browse_allowed_issis: Vec<u32>,
+}
+
 /// Runtime override for the built-in WX/METAR service, edited from the dashboard.
 ///
 /// Mirrors the editable subset of `[wx_service]` config. When `Some`, it takes precedence
@@ -524,6 +532,8 @@ pub struct StackState {
     pub geoalarm_override: Option<GeoalarmRuntimeOverride>,
     /// Runtime override for Snom XML NOTIFY settings. See SnomNotifyRuntimeOverride.
     pub snom_notify_override: Option<SnomNotifyRuntimeOverride>,
+    /// Runtime override for WAP browsing (dashboard). See WapRuntimeOverride.
+    pub wap_override: Option<WapRuntimeOverride>,
     /// Next TPG2200 ActionURL incident number. Initialised lazily from `[tpg2200_action]`.
     pub tpg2200_action_next_incident: Option<u16>,
     /// Runtime Asterisk SIP/RTP bridge status for `/api/asterisk/status` and the dashboard tab.
@@ -710,6 +720,7 @@ impl Default for StackState {
             dapnet_override: None,
             geoalarm_override: None,
             snom_notify_override: None,
+            wap_override: None,
             tpg2200_action_next_incident: None,
             asterisk_status: AsteriskRuntimeStatus::default(),
             dapnet_status: DapnetRuntimeStatus::default(),
