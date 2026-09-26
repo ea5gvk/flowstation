@@ -483,8 +483,8 @@ voice_service = true
 # loopback, link-local and CGNAT are refused, also after DNS and after every redirect), turns it
 # into small XHTML-MP pages with "Siguiente" links, and logs only the domain.
 #
-# Not in this build yet: the SNDCP packet-data bearer (so radios cannot reach the gateway over
-# the air). Until then the gateway is reachable only through the debug UDP bearer, for example with
+# Radios reach the gateway over the air through the SNDCP packet-data bearer ([packet_data]
+# below). Without it the gateway is reachable only through the debug UDP bearer, for example with
 # contrib/wap-debug/wtp_client.py. That bearer answers anyone who can reach it, so it listens
 # on loopback; to test from the LAN use debug_udp_listen = "0.0.0.0:9200" and restrict
 # debug_udp_allowed_sources to your LAN (a LAN listener without a source list is refused).
@@ -527,6 +527,21 @@ voice_service = true
 # requests_per_issi = 20                         # Internet requests per radio ...
 # requests_window_secs = 600                     # ... in this window
 # max_concurrent_fetches = 2                     # downloads at the same time (1..=4)
+
+# OPTIONAL: SNDCP packet-data bearer to the WAP gateway (FlowStation)
+#
+# PDP context activation (with the CHAP Success DIMETRA radios wait for), an IPv4 address from the
+# pool, READY/STANDBY, and SN-UNITDATA on the common control channel between the radios and the
+# [wap] gateway (its gateway_ipv4 and mtu are the ones announced to the radios). Also set
+# cell_info sndcp_service = true and [wap] enabled = true. Voice always goes first: data waits
+# while a radio is in a call and only one data PDU at a time waits on the control channel.
+# Not in this build yet: the advanced link (SN-DATA) and a packet-data channel.
+#
+# [packet_data]
+# enabled = false                                # master on/off for the bearer
+# pool_first = "10.0.0.2"                        # first IPv4 of the dynamic pool (must not hold [wap] gateway_ipv4)
+# pool_last = "10.0.0.254"                       # last IPv4 of the pool (at most 1024 addresses)
+# ready_timer_code = 10                          # READY timer announced: 8 = 10 s, 9 = 20 s, 10 = 30 s, 11 = 60 s
 
 ###############################################################################
 

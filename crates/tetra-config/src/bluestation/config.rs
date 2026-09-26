@@ -9,6 +9,7 @@ use crate::bluestation::{
 
 use super::sec_brew::CfgBrew;
 use super::sec_dashboard::CfgDashboard;
+use super::sec_packet_data::CfgPacketData;
 use super::sec_telegram::CfgTelegram;
 use super::sec_telemetry::CfgTelemetry;
 
@@ -121,6 +122,9 @@ pub struct StackConfig {
 
     /// WAP gateway for packet-data terminals. Always present (default: disabled).
     pub wap: CfgWap,
+
+    /// SNDCP packet-data bearer to the WAP gateway. Always present (default: disabled).
+    pub packet_data: CfgPacketData,
 }
 
 impl StackConfig {

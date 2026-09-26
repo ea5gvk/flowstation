@@ -17,6 +17,7 @@ use super::sec_dashboard::{CfgDashboardDto, apply_dashboard_patch};
 use super::sec_emergency::{CfgEmergencyDto, apply_emergency_patch};
 use super::sec_geoalarm::{CfgGeoalarmDto, apply_geoalarm_patch};
 use super::sec_health::{CfgHealthDto, apply_health_patch};
+use super::sec_packet_data::{CfgPacketDataDto, apply_packet_data_patch};
 use super::sec_recovery::{CfgRecoveryDto, apply_recovery_patch};
 use super::sec_security::{CfgSecurityDto, apply_security_patch};
 use super::sec_snom_notify::{CfgSnomNotifyDto, apply_snom_notify_patch};
@@ -210,6 +211,13 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
         }
     }
 
+    // Optional packet_data section.
+    if let Some(ref packet_data) = root.packet_data
+        && !packet_data.extra.is_empty()
+    {
+        return Err(format!("Unrecognized fields in packet_data config: {:?}", sorted_keys(&packet_data.extra)).into());
+    }
+
     // Build cell config, then inject the separately-parsed neighbor cells and sds_command_control
     let mut cell_cfg = cell_dto_to_cfg(root.cell_info);
     cell_cfg.neighbor_cells_ca = neighbor_cells_ca;
@@ -265,7 +273,21 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
             Some(wap) => apply_wap_patch(wap)?,
             None => Default::default(),
         },
+        packet_data: match root.packet_data {
+            Some(packet_data) => apply_packet_data_patch(packet_data)?,
+            None => Default::default(),
+        },
     };
+
+    // The radios reach the gateway at [wap] gateway_ipv4: it cannot be handed out as a radio's
+    // address.
+    if cfg.packet_data.enabled && cfg.packet_data.in_pool(cfg.wap.gateway_ipv4) {
+        return Err(format!(
+            "packet_data: the pool {}..{} contains [wap] gateway_ipv4 {}",
+            cfg.packet_data.pool_first, cfg.packet_data.pool_last, cfg.wap.gateway_ipv4
+        )
+        .into());
+    }
 
     if let Some(brew) = root.brew {
         cfg.brew = Some(apply_brew_patch(brew));
@@ -344,6 +366,7 @@ struct TomlConfigRoot {
     health: Option<CfgHealthDto>,
     emergency: Option<CfgEmergencyDto>,
     wap: Option<CfgWapDto>,
+    packet_data: Option<CfgPacketDataDto>,
 
     #[serde(flatten)]
     extra: HashMap<String, Value>,
@@ -570,6 +593,12 @@ enabled = true
 allowed_issis = [2260618]
 search_url = "http://lite.duckduckgo.com/lite/?q="
 bookmarks = ["http://68k.news/", "http://wiby.me/", "http://text.npr.org/"]
+
+[packet_data]
+enabled = true
+pool_first = "10.0.0.2"
+pool_last = "10.0.0.254"
+ready_timer_code = 10
 "#;
         let cfg = from_toml_str(toml).unwrap_or_else(|e| panic!("documented optional blocks must parse when uncommented: {e}"));
         assert!(cfg.recovery.enabled);
@@ -600,6 +629,8 @@ bookmarks = ["http://68k.news/", "http://wiby.me/", "http://text.npr.org/"]
         assert!(cfg.dapnet.telegram_allowed_rics.contains(&0x1C40));
         assert!(cfg.geoalarm.enabled);
         assert!(cfg.wap.browse_allowed(2260618));
+        assert!(cfg.packet_data.enabled);
+        assert_eq!(cfg.packet_data.ready_timer_code, 10);
     }
 
     fn minimal_toml(extra_cell: &str) -> String {
@@ -821,6 +852,49 @@ pbx_gateway_issi = [16777184, 16777186]
         assert!(!cfg.wap.browse.enabled);
         assert!(cfg.wap.debug_udp_listen.is_none());
         assert_eq!(cfg.wap, crate::bluestation::CfgWap::default());
+    }
+
+    #[test]
+    fn packet_data_default_is_disabled() {
+        let cfg = from_toml_str(&minimal_toml("")).expect("parse");
+        assert_eq!(cfg.packet_data, crate::bluestation::CfgPacketData::default());
+        assert!(!cfg.packet_data.enabled);
+    }
+
+    #[test]
+    fn packet_data_section_parses_and_validates() {
+        let ok = minimal_toml("")
+            + r#"
+[packet_data]
+enabled = true
+pool_first = "10.0.0.10"
+pool_last = "10.0.0.20"
+ready_timer_code = 9
+"#;
+        let cfg = from_toml_str(&ok).expect("packet_data section must parse");
+        assert!(cfg.packet_data.enabled);
+        assert_eq!(cfg.packet_data.pool_first, std::net::Ipv4Addr::new(10, 0, 0, 10));
+        assert_eq!(cfg.packet_data.ready_timer_code, 9);
+        for bad in [
+            "bogus = 1",
+            "pool_first = \"10.0.0.9\"\npool_last = \"10.0.0.8\"",
+            "pool_first = \"10.0.0.0\"\npool_last = \"10.0.8.0\"",
+            "ready_timer_code = 0",
+            "ready_timer_code = 15",
+        ] {
+            let toml = minimal_toml("") + "\n[packet_data]\n" + bad + "\n";
+            assert!(from_toml_str(&toml).is_err(), "{bad} must be rejected");
+        }
+    }
+
+    #[test]
+    fn packet_data_pool_must_not_hold_the_gateway() {
+        let clash = minimal_toml("") + "\n[packet_data]\nenabled = true\npool_first = \"10.0.0.1\"\n";
+        assert!(from_toml_str(&clash).is_err(), "gateway 10.0.0.1 inside the pool");
+        let moved = minimal_toml("") + "\n[wap]\ngateway_ipv4 = \"10.0.1.1\"\n[packet_data]\nenabled = true\npool_first = \"10.0.0.1\"\n";
+        assert!(from_toml_str(&moved).is_ok());
+        let off = minimal_toml("") + "\n[packet_data]\npool_first = \"10.0.0.1\"\n";
+        assert!(from_toml_str(&off).is_ok(), "only checked with the bearer on");
     }
 
     #[test]

@@ -1,0 +1,150 @@
+use std::collections::HashMap;
+use std::net::Ipv4Addr;
+
+use serde::Deserialize;
+use toml::Value;
+
+/// Largest dynamic address pool (one PDP context per address).
+pub const PACKET_DATA_MAX_POOL: u32 = 1024;
+
+/// `[packet_data]`: the SNDCP packet-data bearer (PDP contexts, SN-UNITDATA) that carries the
+/// radios' IPv4 datagrams to the `[wap]` gateway. The gateway address and the MTU announced in
+/// the SN-ACTIVATE PDP CONTEXT ACCEPT come from `[wap]` (`gateway_ipv4`, `mtu`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CfgPacketData {
+    pub enabled: bool,
+    /// First address of the dynamic IPv4 pool.
+    pub pool_first: Ipv4Addr,
+    /// Last address of the dynamic IPv4 pool.
+    pub pool_last: Ipv4Addr,
+    /// READY timer announced in the ACCEPT (EN 300 392-2 table 28.112): 8 = 10 s, 9 = 20 s,
+    /// 10 = 30 s, 11 = 60 s. The station's own READY timer runs 2 s shorter.
+    pub ready_timer_code: u8,
+}
+
+impl Default for CfgPacketData {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            pool_first: Ipv4Addr::new(10, 0, 0, 2),
+            pool_last: Ipv4Addr::new(10, 0, 0, 254),
+            ready_timer_code: 10,
+        }
+    }
+}
+
+impl CfgPacketData {
+    /// Whether `ip` is in the dynamic pool.
+    pub fn in_pool(&self, ip: Ipv4Addr) -> bool {
+        (u32::from(self.pool_first)..=u32::from(self.pool_last)).contains(&u32::from(ip))
+    }
+}
+
+/// Duration of a READY timer code (table 28.112), in milliseconds. None for the reserved codes.
+pub fn ready_timer_ms(code: u8) -> Option<u64> {
+    Some(match code {
+        1 => 200,
+        2 => 500,
+        3 => 700,
+        4 => 1_000,
+        5 => 2_000,
+        6 => 3_000,
+        7 => 5_000,
+        8 => 10_000,
+        9 => 20_000,
+        10 => 30_000,
+        11 => 60_000,
+        12 => 120_000,
+        13 => 180_000,
+        14 => 300_000,
+        _ => return None,
+    })
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CfgPacketDataDto {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_pool_first")]
+    pub pool_first: String,
+    #[serde(default = "default_pool_last")]
+    pub pool_last: String,
+    #[serde(default = "default_ready_timer_code")]
+    pub ready_timer_code: u8,
+
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
+}
+
+fn default_pool_first() -> String {
+    CfgPacketData::default().pool_first.to_string()
+}
+fn default_pool_last() -> String {
+    CfgPacketData::default().pool_last.to_string()
+}
+fn default_ready_timer_code() -> u8 {
+    CfgPacketData::default().ready_timer_code
+}
+
+fn parse_ipv4(key: &str, s: &str) -> Result<Ipv4Addr, String> {
+    s.trim()
+        .parse()
+        .map_err(|_| format!("packet_data: {key} {s:?} is not an IPv4 address"))
+}
+
+pub fn apply_packet_data_patch(dto: CfgPacketDataDto) -> Result<CfgPacketData, String> {
+    let pool_first = parse_ipv4("pool_first", &dto.pool_first)?;
+    let pool_last = parse_ipv4("pool_last", &dto.pool_last)?;
+    let (first, last) = (u32::from(pool_first), u32::from(pool_last));
+    if first > last {
+        return Err("packet_data: pool_first must not be above pool_last".to_string());
+    }
+    if last - first >= PACKET_DATA_MAX_POOL {
+        return Err(format!("packet_data: the pool may hold at most {PACKET_DATA_MAX_POOL} addresses"));
+    }
+    if ready_timer_ms(dto.ready_timer_code).is_none() {
+        return Err("packet_data: ready_timer_code must be within 1..=14".to_string());
+    }
+    Ok(CfgPacketData {
+        enabled: dto.enabled,
+        pool_first,
+        pool_last,
+        ready_timer_code: dto.ready_timer_code,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dto(toml_src: &str) -> CfgPacketDataDto {
+        toml::from_str(toml_src).expect("packet_data dto parses")
+    }
+
+    #[test]
+    fn empty_section_matches_default() {
+        let cfg = apply_packet_data_patch(dto("")).unwrap();
+        assert_eq!(cfg, CfgPacketData::default());
+        assert!(!cfg.enabled);
+        assert!(cfg.in_pool(Ipv4Addr::new(10, 0, 0, 2)) && cfg.in_pool(Ipv4Addr::new(10, 0, 0, 254)));
+        assert!(!cfg.in_pool(Ipv4Addr::new(10, 0, 0, 1)));
+    }
+
+    #[test]
+    fn bad_pools_rejected() {
+        assert!(apply_packet_data_patch(dto("pool_first = \"10.0.0.9\"\npool_last = \"10.0.0.8\"")).is_err());
+        assert!(apply_packet_data_patch(dto("pool_first = \"10.0.0.0\"\npool_last = \"10.0.4.0\"")).is_err());
+        assert!(apply_packet_data_patch(dto("pool_first = \"10.0.0\"")).is_err());
+        let one = apply_packet_data_patch(dto("pool_first = \"10.0.0.7\"\npool_last = \"10.0.0.7\"")).unwrap();
+        assert!(one.in_pool(Ipv4Addr::new(10, 0, 0, 7)));
+        assert!(apply_packet_data_patch(dto("pool_first = \"10.0.0.0\"\npool_last = \"10.0.3.255\"")).is_ok());
+    }
+
+    #[test]
+    fn ready_timer_code_range() {
+        assert!(apply_packet_data_patch(dto("ready_timer_code = 0")).is_err());
+        assert!(apply_packet_data_patch(dto("ready_timer_code = 15")).is_err());
+        assert_eq!(apply_packet_data_patch(dto("ready_timer_code = 8")).unwrap().ready_timer_code, 8);
+        assert_eq!(ready_timer_ms(10), Some(30_000));
+    }
+}
