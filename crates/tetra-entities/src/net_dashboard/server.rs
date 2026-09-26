@@ -2131,7 +2131,7 @@ fn handle_connection(
                 break;
             }
         }
-        serve_callsigns(buf.into_inner(), &radioid, &req_line);
+        serve_callsigns(buf.into_inner(), &radioid, &req_line, &shared_config);
     } else if req_line.contains("GET /api/update/check") {
         let mut buf = BufReader::new(stream);
         loop {
@@ -3088,7 +3088,12 @@ fn serve_update_status(mut stream: TcpStream, update_state: &SharedUpdateState) 
 /// derived from the call-sign prefix, or empty if unknown) and `{ "<id>": "" }` for IDs confirmed
 /// absent from RadioID. IDs still being fetched in the background are OMITTED, so the client retries
 /// them on a later poll. Lookups are non-blocking — unknown IDs are queued for background resolution.
-fn serve_callsigns(stream: TcpStream, radioid: &crate::net_dashboard::radioid::RadioIdCache, req_line: &str) {
+fn serve_callsigns(
+    stream: TcpStream,
+    radioid: &crate::net_dashboard::radioid::RadioIdCache,
+    req_line: &str,
+    shared_config: &Option<tetra_config::bluestation::SharedConfig>,
+) {
     use crate::net_dashboard::radioid::Lookup;
     // Parse the `ids=` query parameter from "GET /api/callsigns?ids=1,2,3 HTTP/1.1".
     let ids: Vec<u32> = req_line
@@ -3106,8 +3111,19 @@ fn serve_callsigns(stream: TcpStream, radioid: &crate::net_dashboard::radioid::R
         })
         .unwrap_or_default();
 
+    // The parrot service's ISSI is labelled "Parrot" instead of being looked up on RadioID.
+    let parrot_issi = shared_config
+        .as_ref()
+        .map(|cfg| cfg.config())
+        .filter(|cfg| cfg.cell.parrot_enabled)
+        .map(|cfg| cfg.cell.parrot_issi);
+
     let mut map = serde_json::Map::new();
     for id in ids {
+        if Some(id) == parrot_issi {
+            map.insert(id.to_string(), serde_json::json!({"cs": "Parrot", "fl": ""}));
+            continue;
+        }
         match radioid.get(id) {
             Lookup::Found(cs) => {
                 let flag = crate::net_dashboard::callsign::callsign_flag(&cs).unwrap_or_default();
@@ -5926,6 +5942,30 @@ duplex_spacing = 4
 reverse_operation = false
 location_area = 1
 "#;
+
+    /// The parrot ISSI shows up as "Parrot" without a RadioID lookup.
+    #[test]
+    fn callsigns_label_the_enabled_parrot_issi() {
+        use std::io::Read;
+
+        let cfg =
+            tetra_config::bluestation::parsing::from_toml_str(&format!("{MINIMAL_CONFIG}parrot_enabled = true\nparrot_issi = 12345\n"))
+                .unwrap();
+        let shared = Some(tetra_config::bluestation::SharedConfig::from_parts(cfg, None));
+        let path = std::env::temp_dir().join(format!("parrot_radioid_{}.json", std::process::id()));
+        let radioid = crate::net_dashboard::radioid::RadioIdCache::new(path);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        super::serve_callsigns(server, &radioid, "GET /api/callsigns?ids=12345 HTTP/1.1", &shared);
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+
+        let body = response.split("\r\n\r\n").nth(1).expect("HTTP body");
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(json["12345"], serde_json::json!({"cs": "Parrot", "fl": ""}));
+    }
 
     /// A bad config body posted to /api/config must be rejected (400) and must NOT touch the file on
     /// disk — otherwise the next restart fails to parse it and the base station crash-loops.
