@@ -3,7 +3,7 @@ use crate::{MessageQueue, TetraEntityTrait};
 use std::time::Instant;
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, Sap, TdmaTime};
+use tetra_core::{BitBuffer, Sap, TdmaTime, TetraAddress};
 use tetra_saps::ltpd::LtpdMleUnitdataInd;
 use tetra_saps::tla::TlaTlDataReqBl;
 use tetra_saps::{SapMsg, SapMsgInner};
@@ -13,21 +13,24 @@ use tetra_saps::{SapMsg, SapMsgInner};
 
 /// MLE protocol discriminator value for SNDCP (3 bits, 0b100). The MS's MLE routes the downlink SDU
 /// to its SNDCP entity, mirroring the uplink (mle_bs.rs).
-const MLE_DISCRIMINATOR_SNDCP: u64 = 0b100;
+pub(crate) const MLE_DISCRIMINATOR_SNDCP: u64 = 0b100;
 /// SN-PDU type for SN-ACTIVATE PDP CONTEXT (4 bits, 0x0). DEMAND on uplink, ACCEPT on downlink.
 const SN_PDU_ACTIVATE_PDP_CONTEXT: u64 = 0x0;
+const SN_PDU_DEACTIVATE_PDP_CONTEXT_ACCEPT: u64 = 0x1;
+const SN_PDU_DEACTIVATE_PDP_CONTEXT_DEMAND: u8 = 0x2;
+const SN_PDU_ACTIVATE_PDP_CONTEXT_REJECT: u64 = 0x3;
 
 // SN-ACTIVATE PDP CONTEXT ACCEPT mandatory field values (clause 28.4.5.*).
 const PDU_PRIORITY_MAX: u64 = 4; // 0..7, mid (28.103)
-const READY_TIMER: u64 = 8; // 8 = 10 s (28.112)
+const READY_TIMER: u8 = 8; // 8 = 10 s (28.112)
 const STANDBY_TIMER: u64 = 5; // 5 = 10 min (28.122)
 const RESPONSE_WAIT_TIMER: u64 = 8; // 8 = 10 s (28.116)
-const TIA_IPV4_STATIC: u64 = 1; // Type identifier in accept: 1 = IPv4 Static Address (28.126)
-const TIA_IPV4_DYNAMIC: u64 = 2; // 2 = IPv4 Dynamic Address
-const MTU_1500: u64 = 4; // 4 = 1500 octets (28.79)
+pub(crate) const TIA_IPV4_STATIC: u8 = 1; // Type identifier in accept: 1 = IPv4 Static Address (28.126)
+pub(crate) const TIA_IPV4_DYNAMIC: u8 = 2; // 2 = IPv4 Dynamic Address
+const MTU_1500: u8 = 4; // 4 = 1500 octets (28.79)
 /// Address handed to a MS that requested a dynamic IPv4 (ATID != 0). Static requests get the address
 /// the MS asked for, echoed back.
-const POOL_IPV4: u64 = 0xC0A8_01B4; // 192.168.1.180
+const POOL_IPV4: u32 = 0xC0A8_01B4; // 192.168.1.180
 
 // CHAP authentication carried in the Protocol configuration options (PCO) type-3 element.
 // Motorola/Dimetra radios run PPP CHAP (RFC 1994) inside PDP context activation: the DEMAND's PCO
@@ -48,6 +51,145 @@ pub struct Sndcp {
     wap: Option<WapService>,
 }
 
+/// The mandatory header of an SN-ACTIVATE PDP CONTEXT DEMAND (table 28.24) and the CHAP identifier
+/// its PCO carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Demand {
+    pub nsapi: u8,
+    /// Address type identifier in demand: 0 = static IPv4, 1 = dynamic IPv4, 2..5 other.
+    pub atid: u8,
+    /// The address asked for with ATID 0.
+    pub static_ipv4: Option<u32>,
+    pub chap_id: Option<u8>,
+}
+
+/// Decode a DEMAND: type(4) version(4) NSAPI(4) ATID(3) [IPv4(32) when ATID == 0]. `demand` is the
+/// SNDCP PDU bit-string (after the 3-bit MLE discriminator). Missing fields fall back as the stub
+/// always did: NSAPI 1, ATID 0.
+pub(crate) fn parse_demand(demand: &str) -> Demand {
+    let bits = |off: usize, n: usize| -> Option<u64> { demand.get(off..off + n).and_then(|s| u64::from_str_radix(s, 2).ok()) };
+    let nsapi = bits(8, 4).unwrap_or(1) as u8;
+    let atid = bits(12, 3).unwrap_or(0) as u8;
+    Demand {
+        nsapi,
+        atid,
+        static_ipv4: if atid == 0 { bits(15, 32).map(|ip| ip as u32) } else { None },
+        chap_id: find_chap_response_id(demand),
+    }
+}
+
+/// SN-ACTIVATE PDP CONTEXT ACCEPT (table 28.23) prefixed with the MLE discriminator: `ipv4` with
+/// type identifier `tia`, the READY timer and MTU codes given, and, if the DEMAND carried PPP CHAP,
+/// the PCO with the CHAP Success the MS waits for.
+pub(crate) fn encode_pdp_accept(nsapi: u8, tia: u8, ipv4: u32, mtu_code: u8, ready_code: u8, chap_id: Option<u8>) -> BitBuffer {
+    let mut sdu = BitBuffer::new_autoexpand(16);
+    sdu.write_bits(MLE_DISCRIMINATOR_SNDCP, 3);
+    sdu.write_bits(SN_PDU_ACTIVATE_PDP_CONTEXT, 4); // SN PDU type = ACCEPT
+    sdu.write_bits(u64::from(nsapi), 4); // NSAPI (echo)
+    sdu.write_bits(PDU_PRIORITY_MAX, 3);
+    sdu.write_bits(u64::from(ready_code), 4);
+    sdu.write_bits(STANDBY_TIMER, 4);
+    sdu.write_bits(RESPONSE_WAIT_TIMER, 4);
+    sdu.write_bits(u64::from(tia), 3); // Type identifier in accept (IPv4 present)
+    sdu.write_bits(u64::from(ipv4), 32); // IP Address IPv4 (conditional on TIA = 1/2)
+    sdu.write_bits(0, 8); // PCOMP negotiation = 0 (no header compression → no conditional fields)
+    sdu.write_bits(u64::from(mtu_code), 3); // Maximum transmission unit
+
+    // Optional elements (annex E.1). If the DEMAND carried PPP CHAP authentication the MS is
+    // waiting for a CHAP Success — without it the data session never opens ("data server not
+    // responding"). Append a PCO type-3 element carrying the Success; otherwise close the PDU
+    // with an o-bit of 0.
+    if let Some(id) = chap_id {
+        for bit in chap_success_optional_section(id).bytes() {
+            sdu.write_bits(u64::from(bit - b'0'), 1);
+        }
+    } else {
+        sdu.write_bits(0, 1); // o-bit = 0: no optional elements → PDU ends
+    }
+    sdu.seek(0);
+    sdu
+}
+
+/// SN-ACTIVATE PDP CONTEXT REJECT (table 28.25) prefixed with the MLE discriminator; `cause` from
+/// table 28.46.
+pub(crate) fn encode_pdp_reject(nsapi: u8, cause: u8) -> BitBuffer {
+    let mut sdu = BitBuffer::new(3 + 4 + 4 + 8 + 1);
+    sdu.write_bits(MLE_DISCRIMINATOR_SNDCP, 3);
+    sdu.write_bits(SN_PDU_ACTIVATE_PDP_CONTEXT_REJECT, 4);
+    sdu.write_bits(u64::from(nsapi), 4);
+    sdu.write_bits(u64::from(cause), 8);
+    sdu.write_bits(0, 1); // o-bit: no PCO
+    sdu.seek(0);
+    sdu
+}
+
+/// Which contexts an SN-DEACTIVATE PDP CONTEXT DEMAND / ACCEPT names (table 28.68).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Deactivation {
+    All,
+    Nsapi(u8),
+}
+
+/// Decode an SN-DEACTIVATE PDP CONTEXT DEMAND (table 28.32): type(4) deactivation type(8)
+/// [NSAPI(4) unless the type is 0]; optional elements are ignored. `pdu` is the SNDCP PDU
+/// bit-string. None if it is not a DEMAND or is too short.
+pub(crate) fn decode_deactivate_demand(pdu: &str) -> Option<Deactivation> {
+    let bits = |off: usize, n: usize| -> Option<u8> { pdu.get(off..off + n).and_then(|s| u8::from_str_radix(s, 2).ok()) };
+    if bits(0, 4)? != SN_PDU_DEACTIVATE_PDP_CONTEXT_DEMAND {
+        return None;
+    }
+    match bits(4, 8)? {
+        0 => Some(Deactivation::All),
+        // 1 names the NSAPI; with the reserved values the NSAPI is present too (note 1).
+        _ => Some(Deactivation::Nsapi(bits(12, 4)?)),
+    }
+}
+
+/// SN-DEACTIVATE PDP CONTEXT ACCEPT (table 28.33) prefixed with the MLE discriminator, echoing the
+/// DEMAND's deactivation.
+pub(crate) fn encode_deactivate_accept(deactivation: Deactivation) -> BitBuffer {
+    let mut sdu = BitBuffer::new_autoexpand(24);
+    sdu.write_bits(MLE_DISCRIMINATOR_SNDCP, 3);
+    sdu.write_bits(SN_PDU_DEACTIVATE_PDP_CONTEXT_ACCEPT, 4);
+    match deactivation {
+        Deactivation::All => sdu.write_bits(0, 8),
+        Deactivation::Nsapi(nsapi) => {
+            sdu.write_bits(1, 8);
+            sdu.write_bits(u64::from(nsapi), 4);
+        }
+    }
+    sdu.write_bits(0, 1); // o-bit: no optional elements
+    sdu.seek(0);
+    sdu
+}
+
+/// TL-DATA request on the acknowledged basic link carrying `sdu` to `addr`, as the stub has always
+/// sent its ACCEPT.
+pub(crate) fn tl_data_req(addr: TetraAddress, link_id: u32, endpoint_id: u32, sdu: BitBuffer) -> SapMsg {
+    SapMsg {
+        sap: Sap::TlaSap,
+        src: TetraEntity::Sndcp,
+        dest: TetraEntity::Llc,
+        msg: SapMsgInner::TlaTlDataReqBl(TlaTlDataReqBl {
+            main_address: addr,
+            link_id,
+            endpoint_id,
+            tl_sdu: sdu,
+            stealing_permission: false,
+            subscriber_class: 0,
+            fcs_flag: false,
+            air_interface_encryption: None,
+            stealing_repeats_flag: None,
+            data_class_info: None,
+            req_handle: 0,
+            graceful_degradation: None,
+            chan_alloc: None,
+            follow_uplink_channel: false,
+            tx_reporter: None,
+        }),
+    }
+}
+
 impl Sndcp {
     pub fn new(config: SharedConfig) -> Self {
         let wap = WapService::start(&config);
@@ -59,84 +201,31 @@ impl Sndcp {
     /// from the pool for a dynamic request), with mandatory timers/MTU and no optional elements.
     /// `demand` is the SNDCP PDU bit-string (after the 3-bit MLE discriminator).
     fn send_pdp_accept(&self, queue: &mut MessageQueue, ind: &LtpdMleUnitdataInd, demand: &str) {
-        // Decode the DEMAND mandatory header (table 28.24): type(4) version(4) NSAPI(4) ATID(3)
-        // [IPv4(32) when ATID==0].
-        let bits = |off: usize, n: usize| -> Option<u64> { demand.get(off..off + n).and_then(|s| u64::from_str_radix(s, 2).ok()) };
-        let nsapi = bits(8, 4).unwrap_or(1);
-        let atid = bits(12, 3).unwrap_or(0);
-        let (tia, ipv4) = if atid == 0 {
-            // Static: the MS asked for a specific IPv4 (bits 15..47) — grant it.
-            (TIA_IPV4_STATIC, bits(15, 32).unwrap_or(POOL_IPV4))
+        let d = parse_demand(demand);
+        let (tia, ipv4) = if d.atid == 0 {
+            // Static: the MS asked for a specific IPv4 — grant it.
+            (TIA_IPV4_STATIC, d.static_ipv4.unwrap_or(POOL_IPV4))
         } else {
             // Dynamic (or other): assign one from the pool.
             (TIA_IPV4_DYNAMIC, POOL_IPV4)
         };
-
-        // Build the ACCEPT (table 28.23), prefixed with the 3-bit MLE SNDCP discriminator.
-        let mut sdu = BitBuffer::new_autoexpand(16);
-        sdu.write_bits(MLE_DISCRIMINATOR_SNDCP, 3);
-        sdu.write_bits(SN_PDU_ACTIVATE_PDP_CONTEXT, 4); // SN PDU type = ACCEPT
-        sdu.write_bits(nsapi, 4); // NSAPI (echo)
-        sdu.write_bits(PDU_PRIORITY_MAX, 3);
-        sdu.write_bits(READY_TIMER, 4);
-        sdu.write_bits(STANDBY_TIMER, 4);
-        sdu.write_bits(RESPONSE_WAIT_TIMER, 4);
-        sdu.write_bits(tia, 3); // Type identifier in accept (IPv4 present)
-        sdu.write_bits(ipv4, 32); // IP Address IPv4 (conditional on TIA = 1/2)
-        sdu.write_bits(0, 8); // PCOMP negotiation = 0 (no header compression → no conditional fields)
-        sdu.write_bits(MTU_1500, 3); // Maximum transmission unit
-
-        // Optional elements (annex E.1). If the DEMAND carried PPP CHAP authentication the MS is
-        // waiting for a CHAP Success — without it the data session never opens ("data server not
-        // responding"). Append a PCO type-3 element carrying the Success; otherwise close the PDU
-        // with an o-bit of 0.
-        let chap_id = find_chap_response_id(demand);
-        if let Some(id) = chap_id {
-            for bit in chap_success_optional_section(id).bytes() {
-                sdu.write_bits(u64::from(bit - b'0'), 1);
-            }
-        } else {
-            sdu.write_bits(0, 1); // o-bit = 0: no optional elements → PDU ends
-        }
-        let len = sdu.get_pos();
-        sdu.seek(0);
+        let sdu = encode_pdp_accept(d.nsapi, tia, ipv4, MTU_1500, READY_TIMER, d.chap_id);
 
         tracing::info!(
             "SNDCP: -> SN-ACTIVATE PDP CONTEXT ACCEPT to {:?}: NSAPI={} TIA={} IPv4={}.{}.{}.{} CHAP-Success={} ({} bits)",
             ind.received_tetra_address,
-            nsapi,
+            d.nsapi,
             tia,
             (ipv4 >> 24) & 0xff,
             (ipv4 >> 16) & 0xff,
             (ipv4 >> 8) & 0xff,
             ipv4 & 0xff,
-            chap_id.map(|id| format!("id={id}")).unwrap_or_else(|| "none".into()),
-            len
+            d.chap_id.map(|id| format!("id={id}")).unwrap_or_else(|| "none".into()),
+            sdu.get_len()
         );
 
         // Acknowledged basic link (the DEMAND arrived acknowledged), addressed to the requesting MS.
-        queue.push_back(SapMsg {
-            sap: Sap::TlaSap,
-            src: TetraEntity::Sndcp,
-            dest: TetraEntity::Llc,
-            msg: SapMsgInner::TlaTlDataReqBl(TlaTlDataReqBl {
-                main_address: ind.received_tetra_address,
-                link_id: ind.link_id,
-                endpoint_id: ind.endpoint_id,
-                tl_sdu: sdu,
-                stealing_permission: false,
-                subscriber_class: 0,
-                fcs_flag: false,
-                air_interface_encryption: None,
-                stealing_repeats_flag: None,
-                data_class_info: None,
-                req_handle: 0,
-                graceful_degradation: None,
-                chan_alloc: None,
-                follow_uplink_channel: false,
-                tx_reporter: None,
-            }),
-        });
+        queue.push_back(tl_data_req(ind.received_tetra_address, ind.link_id, ind.endpoint_id, sdu));
     }
 }
 
@@ -145,7 +234,7 @@ impl Sndcp {
 /// SwMI IPv6 information, SwMI Mobile IPv4 information — table 28.23), the PCO type-3 element, and
 /// the closing m-bit. Returned MSB-first as a bit string for direct append to the PDU. Kept as the
 /// single source of truth so the wire encoding and its unit test cannot drift apart.
-fn chap_success_optional_section(chap_id: u8) -> String {
+pub(crate) fn chap_success_optional_section(chap_id: u8) -> String {
     let mut s = String::with_capacity(81);
     s.push('1'); // o-bit = 1: optional elements follow
     s.push_str("000"); // type-2 presence bits, in table order, all absent
@@ -175,7 +264,7 @@ fn chap_success_optional_section(chap_id: u8) -> String {
 /// the PCO is bit-packed, not byte-aligned — then reads the CHAP packet's code/identifier from the
 /// fixed offsets that follow (8-bit length-of-contents, then code, then identifier). The CHAP code
 /// is validated to reject a coincidental C223H bit pattern inside a hash value.
-fn find_chap_response_id(demand: &str) -> Option<u8> {
+pub(crate) fn find_chap_response_id(demand: &str) -> Option<u8> {
     const CHAP_PROTO_ID: &str = "1100001000100011"; // C223H, MSB first
     let read = |off: usize| -> Option<u8> { demand.get(off..off + 8).and_then(|s| u8::from_str_radix(s, 2).ok()) };
     let mut fallback = None;
@@ -288,6 +377,111 @@ mod tests {
         let cfg = tetra_config::bluestation::from_file(path).expect("example config parses");
         let sndcp = Sndcp::new(SharedConfig::from_parts(cfg, None));
         assert!(sndcp.wap.is_none());
+    }
+
+    /// Captured PCO content of a Motorola DEMAND: CHAP Challenge id 5 ("DIMETRA…") and CHAP
+    /// Response id 5 (username "admin").
+    const REAL_PCO_HEX: &str = "0c22318010500180aac20e0caf974bc75e02f44494d455452415f50\
+                                c2231a0205001a10db3b2df8c57cce0db8712b16aa9cb5a361646d696";
+
+    /// SN-ACTIVATE PDP CONTEXT DEMAND (table 28.24), dynamic IPv4, NSAPI 1, with the real PCO as
+    /// its only optional element.
+    fn demand_with_real_pco() -> String {
+        let pco = hex_to_bits(REAL_PCO_HEX);
+        let mut s = String::from("0000000100010010000"); // type 0, version 1, NSAPI 1, ATID 1, MS type 0
+        s.push_str("00000000"); // PCOMP negotiation
+        s.push_str("10"); // o-bit = 1, Access point name index absent
+        s.push_str("10001"); // M-bit = 1, type-3 element PCO
+        s.push_str(&format!("{:011b}", pco.len()));
+        s.push_str(&pco);
+        s.push('0'); // M-bit = 0
+        s
+    }
+
+    /// Static IPv4 10.20.30.40 on NSAPI 2 with no optional elements.
+    fn static_demand_without_options() -> String {
+        let mut s = String::from("000000010010000"); // type 0, version 1, NSAPI 2, ATID 0
+        s.push_str(&format!("{:032b}", 0x0A14_1E28u32));
+        s.push_str("0000000000000"); // MS type 0, PCOMP 0, o-bit 0
+        s
+    }
+
+    /// What the SNDCP entity sends back for `demand` (MLE discriminator included).
+    fn accept_for(demand: &str) -> BitBuffer {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../example_config/config.toml");
+        let cfg = tetra_config::bluestation::from_file(path).expect("example config parses");
+        let mut sndcp = Sndcp::new(SharedConfig::from_parts(cfg, None));
+        let mut queue = MessageQueue::new();
+        let ind = LtpdMleUnitdataInd {
+            sdu: BitBuffer::from_bitstr(&format!("100{demand}")),
+            endpoint_id: 0,
+            link_id: 1,
+            received_tetra_address: tetra_core::TetraAddress::new(2_260_618, tetra_core::SsiType::Issi),
+            chan_change_resp_req: false,
+            chan_change_handle: None,
+        };
+        sndcp.rx_prim(
+            &mut queue,
+            SapMsg {
+                sap: Sap::TlpdSap,
+                src: TetraEntity::Mle,
+                dest: TetraEntity::Sndcp,
+                msg: SapMsgInner::LtpdMleUnitdataInd(ind),
+            },
+        );
+        let msg = queue.pop_front().expect("an ACCEPT");
+        assert!(queue.pop_front().is_none());
+        let SapMsgInner::TlaTlDataReqBl(req) = msg.msg else {
+            panic!("ACCEPT goes out as TL-DATA: {:?}", msg.msg);
+        };
+        assert_eq!((req.link_id, req.chan_alloc.is_none(), req.tx_reporter.is_none()), (1, true, true));
+        req.tl_sdu
+    }
+
+    /// Golden vectors captured from the stub before the packet-data runtime existed: with
+    /// `[packet_data]` off the ACCEPT must stay bit for bit the same (Motorola/DIMETRA CHAP).
+    #[test]
+    fn stub_accept_is_bit_exact() {
+        let with_chap = accept_for(&demand_with_real_pco());
+        assert_eq!(
+            (with_chap.dump_hex(), with_chap.get_len()),
+            ("8032161605400DA0048883C0C22304030500040".to_string(), 153)
+        );
+        let plain = accept_for(&static_demand_without_options());
+        assert_eq!((plain.dump_hex(), plain.get_len()), ("8052160850A0F140040".to_string(), 73));
+    }
+
+    #[test]
+    fn demand_parses_like_the_stub() {
+        let d = parse_demand(&demand_with_real_pco());
+        assert_eq!((d.nsapi, d.atid, d.static_ipv4, d.chap_id), (1, 1, None, Some(5)));
+        let s = parse_demand(&static_demand_without_options());
+        assert_eq!((s.nsapi, s.atid, s.static_ipv4, s.chap_id), (2, 0, Some(0x0A14_1E28), None));
+        // A truncated DEMAND falls back to NSAPI 1, static, no address, as the stub did.
+        let t = parse_demand("0000");
+        assert_eq!((t.nsapi, t.atid, t.static_ipv4), (1, 0, None));
+    }
+
+    #[test]
+    fn reject_layout() {
+        let r = encode_pdp_reject(3, 7);
+        // Discriminator, type 3, NSAPI 3, cause 7 (dynamic address pool empty), o-bit 0.
+        assert_eq!(r.to_bitstr(), "10000110011000001110");
+    }
+
+    #[test]
+    fn deactivate_demand_and_accept_round_trip() {
+        assert_eq!(decode_deactivate_demand("0010000000000"), Some(Deactivation::All));
+        assert_eq!(decode_deactivate_demand("00100000000101010"), Some(Deactivation::Nsapi(5)));
+        // An SNDCP network endpoint identifier after the o-bit is ignored.
+        assert_eq!(
+            decode_deactivate_demand(&format!("00100000000101011{:016b}0", 0xBEEF)),
+            Some(Deactivation::Nsapi(5))
+        );
+        assert_eq!(decode_deactivate_demand("001000000001"), None, "NSAPI missing");
+        assert_eq!(decode_deactivate_demand("0000000000000"), None, "not a DEMAND");
+        assert_eq!(encode_deactivate_accept(Deactivation::All).to_bitstr(), "1000001000000000");
+        assert_eq!(encode_deactivate_accept(Deactivation::Nsapi(5)).to_bitstr(), "10000010000000101010");
     }
 
     #[test]
