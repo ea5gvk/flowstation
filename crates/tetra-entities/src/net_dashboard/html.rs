@@ -4311,7 +4311,7 @@ const LANGS={
     confirm_shutdown:'Shutdown FlowStation?\nThe service will stop and must be restarted manually.',
     confirm_logout:'Log out?',
     saved:'✓ Saved — restart to apply.',save_fail:'✗ Save failed',conn_error:'Connection error.',
-    update:'Update',update_available:'Update available',update_title:'OTA Update — github.com/razvanzeces/flowstation',
+    update:'Update',update_available:'Update available',update_title:'OTA Update',
     update_confirm:'Pull latest from main and rebuild?\nThe service will restart automatically.',
     update_running:'Updating… do not close this window.',
     update_done_ok:'✓ Update complete. Restarting…',
@@ -4417,7 +4417,7 @@ const LANGS={
     confirm_shutdown:'Oprire FlowStation?\nServiciul se va opri și trebuie repornit manual.',
     confirm_logout:'Deconectare?',
     saved:'✓ Salvat — repornire pentru aplicare.',save_fail:'✗ Salvare eșuată',conn_error:'Eroare de conexiune.',
-    update:'Update',update_available:'Actualizare disponibilă',update_title:'Update OTA — github.com/razvanzeces/flowstation',
+    update:'Update',update_available:'Actualizare disponibilă',update_title:'Update OTA',
     update_confirm:'Descarcă ultima versiune din main și recompilează?\nServiciul va reporni automat.',
     update_running:'Se actualizează… nu închide fereastra.',
     update_done_ok:'✓ Update finalizat. Se repornește…',
@@ -4521,7 +4521,7 @@ const LANGS={
     confirm_shutdown:'FlowStation herunterfahren?\nDer Dienst wird gestoppt und muss manuell neu gestartet werden.',
     confirm_logout:'Abmelden?',
     saved:'✓ Gespeichert — Neustart zum Anwenden.',save_fail:'✗ Fehler beim Speichern',conn_error:'Verbindungsfehler.',
-    update:'Update',update_available:'Update verfügbar',update_title:'OTA-Update — github.com/razvanzeces/flowstation',
+    update:'Update',update_available:'Update verfügbar',update_title:'OTA-Update',
     update_confirm:'Neueste Version von main holen und neu bauen?\nDer Dienst startet automatisch neu.',
     update_running:'Aktualisierung läuft… Fenster nicht schließen.',
     update_done_ok:'✓ Update abgeschlossen. Neustart…',
@@ -4593,7 +4593,7 @@ const LANGS={
     confirm_shutdown:'¿Apagar FlowStation?\nEl servicio se detendrá y deberá reiniciarse manualmente.',
     confirm_logout:'¿Cerrar sesión?',
     saved:'✓ Guardado — reinicia para aplicar.',save_fail:'✗ Error al guardar',conn_error:'Error de conexión.',
-    update:'Update',update_available:'Actualización disponible',update_title:'Actualización OTA — github.com/razvanzeces/flowstation',
+    update:'Update',update_available:'Actualización disponible',update_title:'Actualización OTA',
     update_confirm:'¿Obtener la última versión de main y recompilar?\nEl servicio se reiniciará automáticamente.',
     update_running:'Actualizando… no cierres esta ventana.',
     update_done_ok:'✓ Actualización completa. Reiniciando…',
@@ -4660,7 +4660,7 @@ const LANGS={
     confirm_shutdown:'Leállítja a FlowStation-t?\nA szolgáltatást kézzel kell újraindítani.',
     confirm_logout:'Kijelentkezik?',
     saved:'✓ Mentve — újraindítás szükséges az alkalmazáshoz.',save_fail:'✗ Mentési hiba',conn_error:'Kapcsolódási hiba.',
-    update:'Frissítés',update_available:'Elérhető frissítés',update_title:'OTA frissítés — github.com/razvanzeces/flowstation',
+    update:'Frissítés',update_available:'Elérhető frissítés',update_title:'OTA frissítés',
     update_confirm:'Letölti a legújabb verziót a main ágból és újraépíti?\nA szolgáltatás automatikusan újraindul.',
     update_running:'Frissítés folyamatban… ne zárja be az ablakot.',
     update_done_ok:'✓ Frissítés kész. Újraindul…',
@@ -4729,7 +4729,7 @@ const LANGS={
     confirm_shutdown:'确定关闭 FlowStation？\n服务将停止，需要手动重启。',
     confirm_logout:'确定注销吗？',
     saved:'✓ 已保存 — 重启后生效',save_fail:'✗ 保存失败',conn_error:'连接错误',
-    update:'更新',update_available:'有可用更新',update_title:'OTA 在线更新 — github.com/razvanzeces/flowstation',
+    update:'更新',update_available:'有可用更新',update_title:'OTA 在线更新',
     update_confirm:'是否从 main 分支拉取最新代码并重新构建？\n服务将自动重启。',
     update_running:'正在更新… 请不要关闭此窗口',
     update_done_ok:'✓ 更新完成，正在重启…',
@@ -8886,10 +8886,10 @@ window.addEventListener('resize', () => {
   drawRfWaterfall();
 });
 
-// ── GitHub update-check ─────────────────────────────────────────────────────
-// Best-effort: query GitHub for the latest release once at boot (and when the
-// config page is opened). If a newer version exists, reveal the header badge and
-// highlight the Update button. Failures are silent.
+// ── Git update-check ────────────────────────────────────────────────────────
+// Best-effort: ask the dashboard whether the source tree's remote branch (the one
+// the OTA pulls from) has new commits, once at boot (and when the config page is
+// opened). If so, reveal the header badge and highlight the Update button. Failures are silent.
 async function checkUpdate(){
   try{
     const r=await fetch('/api/update/check');

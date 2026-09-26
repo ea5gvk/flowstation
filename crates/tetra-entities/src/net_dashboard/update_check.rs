@@ -1,54 +1,25 @@
-//! GitHub release update-check for the dashboard.
+//! Git-based update-check for the dashboard.
 //!
-//! Compares the locally built version (`tetra_core::STACK_VERSION`, e.g. "v0.2.5-gabc123")
-//! against the latest GitHub release tag and reports whether a newer version exists. This
-//! is purely informational — the actual update is performed by the existing git-based OTA
-//! path (`run_update`). We only surface an "update available" badge so the operator knows
-//! to click it.
+//! Compares the running build (the commit hash baked into the binary) against the tip of the
+//! remote branch the source tree is checked out on — the same `origin/<branch>` the OTA path
+//! (`run_update`) fast-forwards to. A fork branch (e.g. `miura`) is therefore told about its own
+//! new commits, not about upstream releases the OTA would never bring in. This is purely
+//! informational: we only surface an "update available" badge so the operator knows to click it.
 //!
-//! The check is best-effort: any network/parse failure yields `UpdateCheck::unknown()`
+//! The check is best-effort: any git/network failure yields `UpdateCheck::unknown()`
 //! rather than an error, so a flaky connection never breaks the dashboard.
 
-use std::time::Duration;
-
-const GITHUB_API_LATEST: &str = "https://api.github.com/repos/razvanzeces/flowstation/releases/latest";
-// GitHub requires a User-Agent on all API requests.
-const USER_AGENT: &str = "FlowStation-Dashboard";
-
-/// A parsed semantic version (major.minor.patch). Pre-release/build metadata is ignored
-/// for comparison purposes — we only care about the release triple.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct SemVer {
-    major: u32,
-    minor: u32,
-    patch: u32,
-}
-
-impl SemVer {
-    /// Parse a version from a string like "v0.2.5", "0.2.5", or "v0.2.5-gabc123".
-    /// Leading 'v'/'V' is optional; anything after the patch (a '-' or '+' suffix) is
-    /// ignored. Returns None if the major.minor.patch core can't be parsed.
-    fn parse(s: &str) -> Option<Self> {
-        let s = s.trim();
-        let s = s.strip_prefix('v').or_else(|| s.strip_prefix('V')).unwrap_or(s);
-        // Cut at the first '-' or '+' (pre-release / build / git suffix).
-        let core = s.split(['-', '+']).next().unwrap_or(s);
-        let mut it = core.split('.');
-        let major = it.next()?.trim().parse().ok()?;
-        let minor = it.next().unwrap_or("0").trim().parse().unwrap_or(0);
-        let patch = it.next().unwrap_or("0").trim().parse().unwrap_or(0);
-        Some(SemVer { major, minor, patch })
-    }
-}
+use std::path::Path;
+use std::process::{Command, Stdio};
 
 /// Result of an update check, serialised to JSON for the dashboard.
 #[derive(Debug, Clone)]
 pub struct UpdateCheck {
-    /// Locally built version string (as-is, e.g. "v0.2.5-gabc123").
+    /// Locally built version string (as-is, e.g. "v0.2.5-2aad62c8").
     pub current: String,
-    /// Latest release tag from GitHub, if the check succeeded (e.g. "v0.2.6").
+    /// Remote branch tip, if the check succeeded (e.g. "miura b349882a (+3)").
     pub latest: Option<String>,
-    /// True when `latest` parses to a strictly higher SemVer than `current`.
+    /// True when the remote branch has commits the running binary was not built from.
     pub update_available: bool,
     /// URL of the latest release page, if available (for a "view release" link).
     pub release_url: Option<String>,
@@ -94,51 +65,61 @@ fn json_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// Query GitHub for the latest release and compare against `current_version`
-/// (typically `tetra_core::STACK_VERSION`). Blocking; call from a worker thread.
-pub fn check_for_update(current_version: &str) -> UpdateCheck {
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .user_agent(USER_AGENT)
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return UpdateCheck::unknown(current_version),
+/// Fetch the remote branch `src_dir` is checked out on and count the commits on it that the
+/// running binary (`binary_git_hash`, e.g. `tetra_core::GIT_HASH`) was not built from.
+/// `src_dir` is None when no trusted source tree was found. Blocking (runs `git fetch`);
+/// call from a worker thread.
+pub fn check_for_update(current_version: &str, binary_git_hash: &str, src_dir: Option<&Path>) -> UpdateCheck {
+    let Some(dir) = src_dir else {
+        return UpdateCheck::unknown(current_version);
+    };
+    // Never prompt for credentials, and abort a stalled fetch instead of hanging the handler.
+    let git = |args: &[&str]| -> Option<String> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=10"])
+            .args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::null())
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
     };
 
-    let resp = match client
-        .get(GITHUB_API_LATEST)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .and_then(|r| r.error_for_status())
-    {
-        Ok(r) => r,
-        Err(_) => return UpdateCheck::unknown(current_version),
-    };
-
-    let json: serde_json::Value = match resp.json() {
-        Ok(j) => j,
-        Err(_) => return UpdateCheck::unknown(current_version),
-    };
-
-    let tag = json.get("tag_name").and_then(|v| v.as_str());
-    let html_url = json.get("html_url").and_then(|v| v.as_str()).map(|s| s.to_string());
-
-    let Some(tag) = tag else {
+    // Same branch selection as run_update: the checked-out branch, `main` on a detached HEAD.
+    let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"])
+        .filter(|b| !b.is_empty() && b != "HEAD")
+        .unwrap_or_else(|| "main".to_string());
+    let remote_ref = format!("origin/{}", branch);
+    if git(&["fetch", "--quiet", "origin", branch.as_str()]).is_none() {
+        return UpdateCheck::unknown(current_version);
+    }
+    let Some(remote_short) = git(&["rev-parse", "--short=8", remote_ref.as_str()]) else {
         return UpdateCheck::unknown(current_version);
     };
 
-    let update_available = match (SemVer::parse(current_version), SemVer::parse(tag)) {
-        (Some(cur), Some(latest)) => latest > cur,
-        // If we can't parse one side, don't claim an update is available.
-        _ => false,
+    // Count from the commit the binary was built from; fall back to the tree's HEAD when the
+    // build embedded no hash or that commit is not in this clone.
+    let bin = binary_git_hash.strip_suffix("-modified").unwrap_or(binary_git_hash);
+    let bin_commit = format!("{}^{{commit}}", bin);
+    let base = if bin.is_empty() || bin == "unknown" || git(&["cat-file", "-e", bin_commit.as_str()]).is_none() {
+        "HEAD"
+    } else {
+        bin
+    };
+    let range = format!("{}..{}", base, remote_ref);
+    let Some(behind) = git(&["rev-list", "--count", range.as_str()]).and_then(|n| n.parse::<u32>().ok()) else {
+        return UpdateCheck::unknown(current_version);
     };
 
     UpdateCheck {
         current: current_version.to_string(),
-        latest: Some(tag.to_string()),
-        update_available,
-        release_url: html_url,
+        latest: Some(format!("{} {} (+{})", branch, remote_short, behind)),
+        update_available: behind > 0,
+        release_url: None,
         check_failed: false,
     }
 }
@@ -148,91 +129,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_plain() {
-        assert_eq!(
-            SemVer::parse("0.2.5"),
-            Some(SemVer {
-                major: 0,
-                minor: 2,
-                patch: 5
-            })
-        );
-    }
-
-    #[test]
-    fn parse_v_prefix() {
-        assert_eq!(
-            SemVer::parse("v1.4.0"),
-            Some(SemVer {
-                major: 1,
-                minor: 4,
-                patch: 0
-            })
-        );
-    }
-
-    #[test]
-    fn parse_git_suffix() {
-        assert_eq!(
-            SemVer::parse("v0.2.5-gabc123"),
-            Some(SemVer {
-                major: 0,
-                minor: 2,
-                patch: 5
-            })
-        );
-    }
-
-    #[test]
-    fn parse_partial() {
-        assert_eq!(
-            SemVer::parse("v2.1"),
-            Some(SemVer {
-                major: 2,
-                minor: 1,
-                patch: 0
-            })
-        );
-        assert_eq!(
-            SemVer::parse("3"),
-            Some(SemVer {
-                major: 3,
-                minor: 0,
-                patch: 0
-            })
-        );
-    }
-
-    #[test]
-    fn compare_versions() {
-        let a = SemVer::parse("v0.2.5").unwrap();
-        let b = SemVer::parse("v0.2.6").unwrap();
-        let c = SemVer::parse("v0.3.0").unwrap();
-        let d = SemVer::parse("v1.0.0").unwrap();
-        assert!(b > a);
-        assert!(c > b);
-        assert!(d > c);
-        assert!(a == SemVer::parse("0.2.5-gdeadbeef").unwrap());
-    }
-
-    #[test]
-    fn newer_release_detected() {
-        // Simulate the comparison check_for_update does.
-        let cur = SemVer::parse("v0.2.5-gabc").unwrap();
-        let latest = SemVer::parse("v0.2.6").unwrap();
-        assert!(latest > cur);
-    }
-
-    #[test]
-    fn same_version_no_update() {
-        let cur = SemVer::parse("v0.2.5-gabc").unwrap();
-        let latest = SemVer::parse("v0.2.5").unwrap();
-        assert!(!(latest > cur));
-    }
-
-    #[test]
-    fn unparseable_tag_no_update() {
-        assert_eq!(SemVer::parse("nightly"), None);
+    fn no_source_tree_is_unknown() {
+        let uc = check_for_update("v0.2.5-2aad62c8", "2aad62c8", None);
+        assert!(uc.check_failed);
+        assert!(!uc.update_available);
     }
 
     #[test]

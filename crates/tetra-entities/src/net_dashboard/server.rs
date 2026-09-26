@@ -721,13 +721,21 @@ fn run_update(update: SharedUpdateState, config_path: String, source_dir_overrid
         log!(update, "✓ safe.directory registered, continuing.");
     }
 
-    // Step 3: fetch remote without merging — just update refs
-    log!(update, "--- Checking remote for updates ---");
-    if run_cmd_output(&update, "git", &["-C", src_str, "fetch", "origin", "main"], &src_dir).is_none() {
+    // Step 3: fetch the branch this tree is checked out on (e.g. `miura` on a fork), not a hardcoded
+    // `main` — otherwise a clone tracking a fork branch never receives that branch's commits.
+    // Detached HEAD falls back to `main`.
+    let branch = run_cmd_output(&update, "git", &["-C", src_str, "rev-parse", "--abbrev-ref", "HEAD"], &src_dir)
+        .map(|s| s.trim().to_string())
+        .filter(|b| !b.is_empty() && b != "HEAD")
+        .unwrap_or_else(|| "main".to_string());
+    let remote_ref = format!("origin/{}", branch);
+    let range = format!("HEAD..{}", remote_ref);
+    log!(update, "--- Checking remote for updates (branch {}) ---", branch);
+    if run_cmd_output(&update, "git", &["-C", src_str, "fetch", "origin", branch.as_str()], &src_dir).is_none() {
         return;
     }
 
-    // Step 4: compare local HEAD with remote origin/main
+    // Step 4: compare local HEAD with the remote branch
     let local_commit = run_cmd_output(&update, "git", &["-C", src_str, "rev-parse", "HEAD"], &src_dir)
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
@@ -735,7 +743,7 @@ fn run_update(update: SharedUpdateState, config_path: String, source_dir_overrid
         return;
     }
 
-    let remote_commit = run_cmd_output(&update, "git", &["-C", src_str, "rev-parse", "origin/main"], &src_dir)
+    let remote_commit = run_cmd_output(&update, "git", &["-C", src_str, "rev-parse", remote_ref.as_str()], &src_dir)
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
     if remote_commit.is_empty() {
@@ -745,11 +753,11 @@ fn run_update(update: SharedUpdateState, config_path: String, source_dir_overrid
     log!(update, "Local  commit: {}", &local_commit[..local_commit.len().min(12)]);
     log!(update, "Remote commit: {}", &remote_commit[..remote_commit.len().min(12)]);
 
-    // Step 5: sync the working tree to origin/main when the commits differ.
+    // Step 5: sync the working tree to the remote branch when the commits differ.
     let mut merged = false;
     if local_commit != remote_commit {
         // Show what changed.
-        let _ = run_cmd_output(&update, "git", &["-C", src_str, "log", "--oneline", "HEAD..origin/main"], &src_dir);
+        let _ = run_cmd_output(&update, "git", &["-C", src_str, "log", "--oneline", range.as_str()], &src_dir);
 
         // Backup config before touching anything.
         let backup_path = format!("{}.bak", config_path);
@@ -760,10 +768,22 @@ fn run_update(update: SharedUpdateState, config_path: String, source_dir_overrid
 
         // Fast-forward merge (only changed files are touched on disk).
         log!(update, "--- git merge (fast-forward only) ---");
-        if run_cmd_output(&update, "git", &["-C", src_str, "merge", "--ff-only", "origin/main"], &src_dir).is_none() {
+        if run_cmd_output(
+            &update,
+            "git",
+            &["-C", src_str, "merge", "--ff-only", remote_ref.as_str()],
+            &src_dir,
+        )
+        .is_none()
+        {
             return;
         }
-        merged = true;
+        // A local tree AHEAD of the remote makes the merge a no-op ("Already up to date"); only a
+        // real fast-forward counts as merged, or every click would rebuild against the wrong hash.
+        let new_head = run_cmd_output(&update, "git", &["-C", src_str, "rev-parse", "HEAD"], &src_dir)
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        merged = new_head == remote_commit;
     }
 
     // Step 6: decide whether a rebuild is actually required. We compare the git hash BAKED INTO the
@@ -2089,7 +2109,7 @@ fn handle_connection(
                 break;
             }
         }
-        serve_update_check(buf.into_inner());
+        serve_update_check(buf.into_inner(), source_dir_override.as_deref());
     } else if req_line.contains("GET /api/update/status") {
         let mut buf = BufReader::new(stream);
         loop {
@@ -3028,8 +3048,8 @@ fn serve_update_status(mut stream: TcpStream, update_state: &SharedUpdateState) 
     let _ = stream.write_all(body.as_bytes());
 }
 
-/// GET /api/update/check — query GitHub for the latest release and report whether a newer
-/// version than the running build exists. Best-effort; on any failure returns
+/// GET /api/update/check — fetch the source tree's remote branch and report whether it has
+/// commits the running build lacks. Best-effort; on any failure returns
 /// check_failed=true so the dashboard simply hides the badge.
 /// GET /api/callsigns?ids=1,2,3 — resolve ISSIs to RadioID callsigns ("indicative"). Returns a JSON
 /// object `{ "<id>": {"cs":"CALLSIGN","fl":"🇷🇴"} }` for resolved IDs (`fl` is the country flag emoji
@@ -3073,8 +3093,13 @@ fn serve_callsigns(stream: TcpStream, radioid: &crate::net_dashboard::radioid::R
     http_json_response(stream, 200, &serde_json::Value::Object(map).to_string());
 }
 
-fn serve_update_check(mut stream: TcpStream) {
-    let result = crate::net_dashboard::update_check::check_for_update(tetra_core::STACK_VERSION);
+fn serve_update_check(mut stream: TcpStream, source_dir_override: Option<&str>) {
+    // Same source tree (and trust check) the OTA build uses, so the badge reports exactly what an
+    // OTA click would bring in.
+    let src_dir = resolve_source_dir(source_dir_override)
+        .ok()
+        .filter(|d| source_tree_is_trusted(d).is_ok());
+    let result = crate::net_dashboard::update_check::check_for_update(tetra_core::STACK_VERSION, tetra_core::GIT_HASH, src_dir.as_deref());
     let body = result.to_json();
     let header = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
