@@ -318,6 +318,15 @@ impl TetraEntityTrait for CmceBs {
                     panic!("Unexpected control message: {:?}", message.msg);
                 }
             },
+            // UMAC only sends CMCE the uplink voice of a parrot circuit.
+            Sap::TmdSap => match message.msg {
+                SapMsgInner::TmdCircuitDataInd(prim) => {
+                    self.cc.handle_parrot_ul_frame(prim.carrier_num, prim.ts, prim.data);
+                }
+                _ => {
+                    tracing::warn!("CMCE: unexpected message on TmdSap: {:?}", message.msg);
+                }
+            },
             _ => {
                 panic!("Unexpected SAP: {:?}", message.sap);
             }

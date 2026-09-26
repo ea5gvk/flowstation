@@ -200,6 +200,33 @@ impl ParrotSession {
     }
 }
 
+impl CcBsSubentity {
+    /// UL voice of a LocalParrot circuit, already packed by UMAC. Recorded while the caller
+    /// talks; afterwards it is consumed and dropped.
+    pub fn handle_parrot_ul_frame(&mut self, carrier_num: u16, ts: u8, data: Vec<u8>) {
+        let Some(session) = self.parrot_session.as_mut() else {
+            tracing::debug!("CMCE: parrot UL frame carrier={} ts={} without a session, dropped", carrier_num, ts);
+            return;
+        };
+        if session.record_ul_frame(carrier_num, ts, data) {
+            tracing::trace!(
+                "CMCE: parrot service recorded frame call_id={} carrier={} ts={} frames={}",
+                session.call_id(),
+                carrier_num,
+                ts,
+                session.recorded_len()
+            );
+        } else {
+            tracing::trace!(
+                "CMCE: parrot service consumed non-recorded UL frame call_id={} carrier={} ts={}",
+                session.call_id(),
+                carrier_num,
+                ts
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1736,6 +1736,24 @@ impl UmacBs {
                     });
                 }
 
+                // Parrot circuit: the uplink goes only to CMCE, which records it and plays it back
+                // later. Never to Brew or Asterisk, and no loopback.
+                if self.scheduler_for(carrier_num).dl_media_source(ts) == Some(CircuitDlMediaSource::LocalParrot) {
+                    if let Some(packed) = pack_ul_acelp_bits(&data) {
+                        queue.push_back(SapMsg {
+                            sap: Sap::TmdSap,
+                            src: TetraEntity::Umac,
+                            dest: TetraEntity::Cmce,
+                            msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd {
+                                carrier_num,
+                                ts,
+                                data: packed,
+                            }),
+                        });
+                    }
+                    return;
+                }
+
                 // Forward UL voice to Brew (User plane) if loaded
                 if self.config.config().brew.is_some() {
                     if self.scheduler_for(carrier_num).circuit_is_active(Direction::Ul, ts) {

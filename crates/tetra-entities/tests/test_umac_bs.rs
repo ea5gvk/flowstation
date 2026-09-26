@@ -1,6 +1,6 @@
 mod common;
 
-use tetra_config::bluestation::StackMode;
+use tetra_config::bluestation::{CfgBrew, StackMode};
 use tetra_core::Direction;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Layer2Service, PhyBlockNum, Sap, SsiType, TdmaTime, TetraAddress, debug};
@@ -18,7 +18,7 @@ use tetra_saps::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
 use tetra_saps::lmm::LmmMleUnitdataReq;
 use tetra_saps::sapmsg::{SapMsg, SapMsgInner};
 use tetra_saps::tma::{TmaUnitdataInd, TmaUnitdataReq};
-use tetra_saps::tmd::TmdCircuitDataReq;
+use tetra_saps::tmd::{TmdCircuitDataInd, TmdCircuitDataReq};
 use tetra_saps::tmv::{TmvUnitdataInd, enums::logical_chans::LogicalChannel};
 
 use crate::common::ComponentTest;
@@ -1396,4 +1396,86 @@ fn test_secondary_ts1_close_is_deferred_so_facch_release_goes_out_on_channel() {
         !umac.circuit_is_active_on(SECONDARY_CARRIER, Direction::Ul, 1),
         "the deferred UL close must still run"
     );
+}
+
+#[test]
+fn test_local_loopback_ul_still_loops_back_and_reaches_brew() {
+    // Only a LocalParrot circuit hands its uplink to CMCE: an ordinary simplex circuit keeps
+    // looping it back to the DL and forwarding it to Brew, and CMCE gets nothing.
+    debug::setup_logging_verbose();
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.brew = Some(CfgBrew {
+        host: "127.0.0.1".into(),
+        port: 0,
+        tls: false,
+        username: None,
+        password: None,
+        reconnect_delay: std::time::Duration::from_secs(1),
+        jitter_initial_latency_frames: 0,
+        feature_sds_enabled: true,
+        whitelisted_ssis: None,
+        feature_rssi_export: false,
+        pbx_gateway_issis: None,
+    });
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime { h: 0, m: 1, f: 1, t: 4 }));
+    test.populate_entities(
+        vec![TetraEntity::Umac],
+        vec![TetraEntity::Cmce, TetraEntity::Lmac, TetraEntity::Brew],
+    );
+
+    let mut open = open_shared_voice_circuit(2);
+    if let SapMsgInner::CmceCallControl(CallControl::Open(circuit)) = &mut open.msg {
+        circuit.dl_media_source = CircuitDlMediaSource::LocalLoopback;
+    }
+    test.submit_message(open);
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Cmce,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+            call_id: 1,
+            source_issi: 1000001,
+            dest_gssi: 91,
+            carrier_num: MAIN_CARRIER,
+            ts: 2,
+        }),
+    });
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    let ul_bits: Vec<u8> = (0..274).map(|idx| ((idx * 7 + idx / 3) % 2) as u8).collect();
+    test.submit_message(SapMsg {
+        sap: Sap::TmdSap,
+        src: TetraEntity::Lmac,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmdCircuitDataInd(TmdCircuitDataInd {
+            carrier_num: MAIN_CARRIER,
+            ts: 2,
+            data: ul_bits.clone(),
+        }),
+    });
+    test.run_stack(Some(12));
+    let msgs = test.dump_sinks();
+
+    let tmd_inds_to = |dest: TetraEntity| {
+        msgs.iter()
+            .filter(|msg| msg.dest == dest && matches!(&msg.msg, SapMsgInner::TmdCircuitDataInd(_)))
+            .count()
+    };
+    assert_eq!(tmd_inds_to(TetraEntity::Brew), 1, "the uplink is still forwarded to Brew");
+    assert_eq!(tmd_inds_to(TetraEntity::Cmce), 0, "only parrot circuits send their uplink to CMCE");
+
+    let looped_back = msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::TmvUnitdataReqSlots(req) => Some(req),
+            _ => None,
+        })
+        .flat_map(|req| req.slots.iter())
+        .filter(|slot| slot.carrier_num == MAIN_CARRIER && slot.ts.t == 2)
+        .flat_map(|slot| [&slot.blk1, &slot.blk2].into_iter().flatten())
+        .filter(|blk| blk.logical_channel == LogicalChannel::TchS)
+        .any(|blk| (0..274).all(|i| blk.mac_block.peek_bits_startoffset(i, 1) == Some(ul_bits[i] as u64)));
+    assert!(looped_back, "the uplink is still looped back to the DL");
 }
