@@ -640,6 +640,10 @@ impl AdvancedLinkEngine {
                 delivered.push(sdu);
             }
             link.acks_owed.push(link.vr);
+            // Only the last N.272 are still below the window a repeat can come from.
+            if link.acks_owed.len() > usize::from(link.window) {
+                link.acks_owed.remove(0);
+            }
             link.vr = (link.vr + 1) & 7;
         }
         let (al_number, n271) = (link.al_number, link.n271);
@@ -672,15 +676,23 @@ impl AdvancedLinkEngine {
         let Some(link) = self.links.get_mut(&ssi) else {
             return AlAck::complete(ns_ar);
         };
-        let mut blocks: Vec<AlAckBlock> = link.acks_owed.drain(..).map(AlAckBlock::complete).collect();
-        let ar_offset = ns_ar.wrapping_sub(link.vr) & 7;
+        let vr = link.vr;
+        let ar_offset = ns_ar.wrapping_sub(vr) & 7;
+        let mut owed: Vec<u8> = link.acks_owed.drain(..).collect();
+        // A request on a TL-SDU delivered already (below the window) is answered "received".
+        if ar_offset >= 8 - link.window && !owed.contains(&ns_ar) {
+            owed.push(ns_ar);
+        }
+        owed.sort_unstable_by_key(|n| n.wrapping_sub(vr) & 7);
+        let mut blocks: Vec<AlAckBlock> = owed.into_iter().map(AlAckBlock::complete).collect();
         for off in 0..link.window {
-            let n = (link.vr + off) & 7;
+            let n = (vr + off) & 7;
             let block = match link.rx.get(&n) {
                 Some(RxSdu::Complete(_)) => AlAckBlock::complete(n),
                 Some(RxSdu::FcsFailed) => AlAckBlock::repeat_entire(n),
                 Some(RxSdu::Partial { segments, final_ss, .. }) => selective_block(n, segments, *final_ss),
-                None if off < ar_offset => AlAckBlock::selective(n, 0, 0, 1),
+                // Older than the requested one and nothing received yet.
+                None if ar_offset < link.window && off < ar_offset => AlAckBlock::selective(n, 0, 0, 1),
                 None => continue,
             };
             blocks.push(block);
@@ -1430,6 +1442,102 @@ mod tests {
             tx_reporter: Some(reporter.clone()),
         });
         reporter
+    }
+
+    /// The radio sends TL-SDU `ns` (one octet `byte` and its FCS) in two segments, `which` of them
+    /// (0, 1), asking for an acknowledgement on the last one sent when `ar`. Returns the octets
+    /// delivered up and the AL-ACK blocks as (N(R), complete, S(R)).
+    fn radio_sends(
+        engine: &mut AdvancedLinkEngine,
+        queue: &mut MessageQueue,
+        ns: u8,
+        byte: u8,
+        which: &[u8],
+        ar: bool,
+    ) -> (Vec<u8>, Vec<(u8, bool, Option<u8>)>) {
+        let mut sdu = BitBuffer::new_autoexpand(40);
+        sdu.write_bits(byte as u64, 8);
+        let value = fcs::compute_fcs(&sdu, 0, 8);
+        sdu.write_bits(value as u64, 32);
+        sdu.seek(0);
+        let halves = [sdu.read_bits(20).unwrap(), sdu.read_bits(20).unwrap()];
+        for (i, ss) in which.iter().enumerate() {
+            let mut pdu = BitBuffer::new_autoexpand(40);
+            AlData {
+                final_segment: *ss == 1,
+                acknowledgement_requested: ar && i + 1 == which.len(),
+                ns,
+                ss: *ss,
+            }
+            .to_bitbuf(&mut pdu);
+            pdu.write_bits(halves[*ss as usize], 20);
+            pdu.seek(0);
+            engine.rx(queue, &ind(pdu.clone()), pdu, LlcPduType::AlDataAlFinal, MAIN);
+        }
+        let (mut up, mut blocks) = (Vec::new(), Vec::new());
+        while let Some(msg) = queue.pop_front() {
+            match msg.msg {
+                SapMsgInner::TlaTlDataIndAl(ind) => up.push(ind.tl_sdu.peek_bits(8).unwrap() as u8),
+                SapMsgInner::TmaUnitdataReq(req) => {
+                    let ack = AlAck::from_bitbuf(&mut req.pdu.clone()).unwrap();
+                    blocks.extend(
+                        ack.acknowledgement_blocks
+                            .iter()
+                            .map(|b| (b.nr, b.acknowledges_complete_tl_sdu(), b.sr)),
+                    );
+                }
+                _ => {}
+            }
+        }
+        (up, blocks)
+    }
+
+    #[test]
+    fn acks_name_only_the_tl_sdus_received() {
+        let mut engine = AdvancedLinkEngine::new();
+        let mut queue = MessageQueue::new();
+        setup_link(&mut engine, &mut queue, 3, 3);
+        assert_eq!(
+            radio_sends(&mut engine, &mut queue, 0, 0xa0, &[0, 1], true),
+            (vec![0xa0], vec![(0, true, None)])
+        );
+        for ns in 1..6 {
+            radio_sends(&mut engine, &mut queue, ns, ns, &[0, 1], false);
+        }
+        let (up, blocks) = radio_sends(&mut engine, &mut queue, 6, 6, &[0, 1], true);
+        assert_eq!(up, vec![6]);
+        assert_eq!(blocks, vec![(6, true, None)], "no block for TL-SDUs not sent yet");
+        // A repeat of a delivered TL-SDU is acknowledged again, not delivered again.
+        assert_eq!(
+            radio_sends(&mut engine, &mut queue, 6, 6, &[1], true),
+            (vec![], vec![(6, true, None)])
+        );
+    }
+
+    #[test]
+    fn a_window_of_three_delivers_in_order() {
+        let mut engine = AdvancedLinkEngine::new();
+        let mut queue = MessageQueue::new();
+        let mut p = proposal();
+        p.window_size_code = 3;
+        let mut pdu = BitBuffer::new_autoexpand(32);
+        p.to_bitbuf(&mut pdu);
+        pdu.seek(0);
+        engine.rx(&mut queue, &ind(pdu.clone()), pdu, LlcPduType::AlSetup, MAIN);
+        while queue.pop_front().is_some() {}
+        // TL-SDU 0 loses its first segment; TL-SDU 1 comes whole.
+        let (up, blocks) = radio_sends(&mut engine, &mut queue, 0, 0xb0, &[1], true);
+        assert!(up.is_empty());
+        assert_eq!(blocks, vec![(0, false, Some(0))]);
+        let (up, blocks) = radio_sends(&mut engine, &mut queue, 1, 0xb1, &[0, 1], true);
+        assert!(up.is_empty(), "held until TL-SDU 0");
+        assert_eq!(blocks, vec![(0, false, Some(0)), (1, true, None)]);
+        let (up, blocks) = radio_sends(&mut engine, &mut queue, 0, 0xb0, &[0], true);
+        assert_eq!(up, vec![0xb0, 0xb1], "delivered in N(S) order");
+        assert_eq!(blocks, vec![(0, true, None), (1, true, None)]);
+        // Outside the window (V(R) is 2, window 3): N(S) 5 is dropped.
+        let (up, blocks) = radio_sends(&mut engine, &mut queue, 5, 0xb5, &[0, 1], true);
+        assert!(up.is_empty() && blocks.is_empty());
     }
 
     #[test]
