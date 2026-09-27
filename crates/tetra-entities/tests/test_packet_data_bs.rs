@@ -2609,6 +2609,53 @@ fn pdus_for_a_radio_on_its_pdch_go_on_that_slot() {
     assert_eq!((d.link_id, d.stealing), (0, false));
 }
 
+/// PDUs for a radio queued while it was on its PDCH (waiting behind another, or retransmitted)
+/// go on the MCCH once the PDCH is gone: the route is taken when they go down, not when queued.
+#[test]
+fn queued_pdus_follow_the_radio_off_its_pdch() {
+    let mut air = Air::new(pdch_config(false));
+    let slot = grant_pdch(&air.test.config, ISSI, 4, true);
+    // Two TL-DATA; the radio never acknowledges: the second waits for the first to be given up.
+    air.test.submit_message(tl_data_to(TetraAddress::issi(ISSI), false));
+    air.test.submit_message(tl_data_to(TetraAddress::issi(ISSI), false));
+    air.step();
+    air.acks.clear();
+    let first: Vec<u32> = air.down.drain(..).filter(|d| d.issi == ISSI).map(|d| d.link_id).collect();
+    assert_eq!(first, vec![4], "the first on the PDCH");
+    {
+        let mut state = air.test.config.state_write();
+        state.pdch_by_issi.remove(&ISSI);
+        state.timeslot_alloc.release_slot(TimeslotOwner::PacketData, slot).unwrap();
+    }
+    for _ in 0..200 {
+        air.step();
+        air.acks.clear();
+    }
+    let links: Vec<u32> = air.down.iter().filter(|d| d.issi == ISSI).map(|d| d.link_id).collect();
+    assert!(
+        links.len() >= 4 && links.iter().all(|l| *l == 0),
+        "retransmissions of the first and the second on the MCCH: {links:?}"
+    );
+}
+
+/// A radio that went from its PDCH into a call: an MM PDU following its uplink goes on the
+/// call's slot, not on the PDCH (which the station gives back within a second).
+#[test]
+fn mm_follows_a_radio_from_its_pdch_into_its_call() {
+    let mut air = Air::new(pdch_config(false));
+    grant_pdch(&air.test.config, ISSI, 4, true);
+    air.test.config.state_write().active_call_ts.insert(ISSI, (MAIN_CARRIER, 3, 4));
+    let mut udata = BitBuffer::new_autoexpand(32);
+    BlUdata { has_fcs: false }.to_bitbuf(&mut udata);
+    append_bits(&mut udata, "0101010101");
+    air.uplink_on(ISSI, udata, 3);
+    air.down.clear();
+    air.test.submit_message(tl_data_to(TetraAddress::issi(ISSI), true));
+    air.run(3);
+    let d = air.down.iter().find(|d| d.issi == ISSI).expect("a PDU went down");
+    assert_eq!((d.link_id, d.stealing), (3, true), "on the call's slot");
+}
+
 // The SNDCP runtime ---------------------------------------------------------------------------
 
 /// PDP context and TRANSMIT REQUEST: the RESPONSE assigns the PDCH (sent on the MCCH), which the
@@ -2715,6 +2762,25 @@ fn end_of_data_sends_the_radio_back_and_frees_the_slot() {
     let alloc = eod.alloc.clone().expect("back to the MCCH");
     assert_eq!((alloc.alloc_type, ts_of(&alloc)), (ChanAllocType::QuitAndGo, vec![]));
     air.run(2);
+    let state = air.test.config.state_read();
+    assert!(state.pdch_by_issi.is_empty());
+    assert_eq!(state.timeslot_alloc.owner(4), None, "slot free");
+}
+
+/// SN-END OF DATA with "immediate service change": the radio has left its PDCH already (clause
+/// 28.2.4.7 NOTE 3). No answer, and the slot is free at once.
+#[test]
+fn end_of_data_with_immediate_service_change_gets_no_answer() {
+    let mut air = Air::new(pdch_config(false));
+    onto_pdch(&mut air, ISSI);
+    let eod = encode_end_of_data(&SndcpEndOfData {
+        immediate_service_change: true,
+    })
+    .unwrap()
+    .to_bitstr();
+    air.send_on(ISSI, &eod, 4);
+    air.run(40);
+    assert!(air.take_sn().is_empty(), "no SN-END OF DATA back");
     let state = air.test.config.state_read();
     assert!(state.pdch_by_issi.is_empty());
     assert_eq!(state.timeslot_alloc.owner(4), None, "slot free");

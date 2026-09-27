@@ -405,7 +405,7 @@ impl PacketDataRuntime {
                 issi
             ),
             Some(SN_DATA_TRANSMIT_REQUEST) => self.on_transmit_request(queue, ind, bits, wap, config, now),
-            Some(SN_END_OF_DATA) => self.on_end_of_data(queue, ind, wap, config, now),
+            Some(SN_END_OF_DATA) => self.on_end_of_data(queue, ind, bits, wap, config, now),
             Some(SN_RECONNECT) => self.on_reconnect(queue, ind, bits, wap, config, now),
             Some(t @ (SN_PAGE | SN_DATA_PRIORITY | SN_MODIFY)) => {
                 tracing::info!("SNDCP: SN-PDU type {} from ISSI {} not supported, SN-NOT SUPPORTED sent", t, issi);
@@ -952,15 +952,20 @@ impl PacketDataRuntime {
         self.sync_pause(issi, wap, now);
     }
 
+    /// SN-END OF DATA from a radio: STANDBY, answered with SN-END OF DATA; with "immediate service
+    /// change" the radio has left already (clause 28.2.4.7 NOTE 3): no answer, and its packet-data
+    /// channel goes now.
     fn on_end_of_data(
         &mut self,
         queue: &mut MessageQueue,
         ind: &LtpdMleUnitdataInd,
+        bits: &str,
         wap: Option<&mut WapService>,
         config: &SharedConfig,
         now: Instant,
     ) {
         let issi = ind.received_tetra_address.ssi;
+        let immediate = field(bits, 4, 1) == Some(1);
         let (standby_slots, clock) = (self.standby_slots, self.clock);
         for (key, ctx) in self.ctxs.iter_mut().filter(|(k, _)| k.0 == issi) {
             if ctx.state == CtxState::Ready {
@@ -968,7 +973,8 @@ impl PacketDataRuntime {
                 ctx.deadline = clock + standby_slots;
                 let c = ctx.counters;
                 tracing::info!(
-                    "SNDCP: SN-END OF DATA from ISSI {} NSAPI {} -> STANDBY (N-PDU up {} / down {}, {} / {} bytes)",
+                    "SNDCP: SN-END OF DATA{} from ISSI {} NSAPI {} -> STANDBY (N-PDU up {} / down {}, {} / {} bytes)",
+                    if immediate { " (immediate service change)" } else { "" },
                     issi,
                     key.1,
                     c.up,
@@ -977,6 +983,11 @@ impl PacketDataRuntime {
                     c.down_bytes
                 );
             }
+        }
+        if immediate {
+            self.release_pdch(config, issi, "immediate service change, the radio left it");
+            self.sync_pause(issi, wap, now);
+            return;
         }
         if let Some(msg) = self.end_of_data_msg(
             config,

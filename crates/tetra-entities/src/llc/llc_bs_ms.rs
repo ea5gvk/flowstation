@@ -149,6 +149,13 @@ impl Llc {
         usable.then_some((grant.slot.carrier_num, grant.slot.ts))
     }
 
+    /// Whether `ssi` has a call up (its own or one of its groups') on `slot` (carrier, timeslot).
+    fn in_call_on(&self, ssi: u32, slot: (u16, u8)) -> bool {
+        let state = self.config.state_read();
+        let on_slot = |id: &u32| state.active_call_ts.get(id).is_some_and(|&(carrier, ts, _)| (carrier, ts) == slot);
+        on_slot(&ssi) || state.subscribers.attached_groups_of(ssi).iter().any(on_slot)
+    }
+
     /// Packet-data channels in use, by ISSI, for the advanced link engine.
     fn pdch_routes(&self) -> HashMap<u32, (u16, u8)> {
         let state = self.config.state_read();
@@ -340,9 +347,38 @@ impl Llc {
     }
 
     /// Schedules a message that was not acked in time for a retransmission
-    fn submit_for_acknowledged_transmission(queue: &mut MessageQueue, ack: &mut ExpectedInAck, dltime: TdmaTime) {
+    fn submit_for_acknowledged_transmission(
+        queue: &mut MessageQueue,
+        ack: &mut ExpectedInAck,
+        dltime: TdmaTime,
+        pdch_routes: Option<&HashMap<u32, (u16, u8)>>,
+        main_carrier: u16,
+    ) {
         // Clone the sapmsg. Make sure we set (or for retransmission: reset) timers properly
-        let sapmsg = ack.retransmission_buf.clone();
+        let mut sapmsg = ack.retransmission_buf.clone();
+        // `bearer = "pdch"`: the radio may have left its packet-data channel, or got one, since
+        // the PDU was queued; it goes where the radio is now. Stolen PDUs and PDUs carrying a
+        // channel allocation keep their route.
+        if let Some(routes) = pdch_routes
+            && let SapMsgInner::TmaUnitdataReq(req) = &mut sapmsg.msg
+            && !req.stealing_permission
+            && req.chan_alloc.is_none()
+        {
+            let (carrier, link_id) = routes
+                .get(&req.main_address.ssi)
+                .map_or((main_carrier, 0), |&(carrier, ts)| (carrier, u32::from(ts)));
+            if (req.carrier_num, req.link_id) != (Some(carrier), link_id) {
+                tracing::debug!(
+                    "SSI {} N(S) {}: sending on link {} (queued for link {}), where the radio is now",
+                    ack.addr.ssi,
+                    ack.ns,
+                    link_id,
+                    req.link_id
+                );
+                req.carrier_num = Some(carrier);
+                req.link_id = link_id;
+            }
+        }
         ack.t_submitted_to_umac = Some(dltime);
         ack.t_umac_done = None;
         ack.tx_reporter.reset();
@@ -450,8 +486,15 @@ impl Llc {
         // follows it to the slot it just transmitted on. The UMAC steals there, or falls back to
         // the MCCH if that circuit is gone or the PDU does not fit in one slot.
         // A radio on its packet-data channel listens there, not to the MCCH: its PDUs go on that
-        // slot, never stolen, with the caller's channel allocation (if any) unchanged.
+        // slot, never stolen, with the caller's channel allocation (if any) unchanged; unless it
+        // has just transmitted on the slot of one of its calls (it went into the call from there).
         let pdch = self.pdch_slot(prim.main_address.ssi, true);
+        let acch = prim
+            .follow_uplink_channel
+            .then(|| self.recent_uplink_traffic_slot(prim.main_address.ssi))
+            .flatten()
+            .filter(|slot| pdch.is_none() || self.in_call_on(prim.main_address.ssi, *slot));
+        let pdch = pdch.filter(|_| acch.is_none());
         if let Some((carrier, ts)) = pdch {
             tracing::debug!(
                 "SSI {}: sending on its packet-data channel, carrier {} ts {}",
@@ -460,13 +503,6 @@ impl Llc {
                 ts
             );
         }
-        let acch = if pdch.is_some() {
-            None
-        } else {
-            prim.follow_uplink_channel
-                .then(|| self.recent_uplink_traffic_slot(prim.main_address.ssi))
-                .flatten()
-        };
         if let Some((carrier, ts)) = acch {
             tracing::debug!(
                 "SSI {}: sending on the ACCH of carrier {} ts {}, where its last uplink came in",
@@ -874,8 +910,9 @@ impl Llc {
         queue.push_back(s);
     }
 
-    fn submit_retransmissions_to_umac(&mut self, queue: &mut MessageQueue) -> bool {
+    fn submit_retransmissions_to_umac(&mut self, queue: &mut MessageQueue, pdch_routes: Option<&HashMap<u32, (u16, u8)>>) -> bool {
         let mut had_activity = false;
+        let main_carrier = self.main_carrier();
         let dltime = self.dltime;
         let mut removals: Option<Vec<(u32, u16)>> = None;
 
@@ -911,7 +948,13 @@ impl Llc {
                         ack.retransmit_count
                     );
 
-                    Self::submit_for_acknowledged_transmission(queue, ack, self.dltime.forward_to_timeslot(ack.t_first.t));
+                    Self::submit_for_acknowledged_transmission(
+                        queue,
+                        ack,
+                        self.dltime.forward_to_timeslot(ack.t_first.t),
+                        pdch_routes,
+                        main_carrier,
+                    );
                     had_activity = true;
                 } else {
                     // Exhausted retransmissions, flag for discard
@@ -967,8 +1010,9 @@ impl Llc {
         had_activity
     }
 
-    fn submit_free_messages_to_umac(&mut self, queue: &mut MessageQueue) -> bool {
+    fn submit_free_messages_to_umac(&mut self, queue: &mut MessageQueue, pdch_routes: Option<&HashMap<u32, (u16, u8)>>) -> bool {
         let mut had_activity = false;
+        let main_carrier = self.main_carrier();
         let mut ssi_blocked: HashSet<u32> = HashSet::new();
         for ack in self.outbound_messages.iter_mut() {
             // Check if already submitted to umac
@@ -1003,7 +1047,13 @@ impl Llc {
                 ack.ns,
                 ack.retransmission_buf.msg
             );
-            Self::submit_for_acknowledged_transmission(queue, ack, self.dltime.forward_to_timeslot(ack.t_first.t));
+            Self::submit_for_acknowledged_transmission(
+                queue,
+                ack,
+                self.dltime.forward_to_timeslot(ack.t_first.t),
+                pdch_routes,
+                main_carrier,
+            );
             ssi_blocked.insert(ack.addr.ssi);
             had_activity = true;
         }
@@ -1146,14 +1196,16 @@ impl TetraEntityTrait for Llc {
 
     fn tick_end(&mut self, queue: &mut MessageQueue, _ts: TdmaTime) -> bool {
         let mut had_activity = false;
+        // `bearer = "pdch"`: where each radio is now, for the PDUs that go down this tick.
+        let pdch_routes = (self.pdch_mode && !self.outbound_messages.is_empty()).then(|| self.pdch_routes());
 
         // Step 1 / 4: Check if we have any transmitted messages that were not acked within the expected window
         // Schedule a retransmission if appropriate.
-        had_activity |= self.submit_retransmissions_to_umac(queue);
+        had_activity |= self.submit_retransmissions_to_umac(queue, pdch_routes.as_ref());
 
         // Step 2 / 4: Check if there are any messages that were not yet sent down, that we can now send down the stack
         // Messages may be kept since the target SSI has not yet acked them . If the link is now free, we can send the message down and register that we expect an ACK for it.
-        had_activity |= self.submit_free_messages_to_umac(queue);
+        had_activity |= self.submit_free_messages_to_umac(queue, pdch_routes.as_ref());
 
         // Step 3 / 4: Check if any unsent ACKs are still here
         // Take oldest element from scheduled_out_acks, and remove it from the list
