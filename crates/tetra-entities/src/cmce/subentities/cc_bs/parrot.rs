@@ -9,7 +9,8 @@
 //! The service records validated UL TCH/S frames from one caller, plays the
 //! exact frame payloads back after the caller releases PTT, then clears the
 //! private call. Playback is paced by TDMA ticks and intentionally separate
-//! from normal local P2P handling.
+//! from normal local P2P handling. UL frames the BS did not decode keep their
+//! place as silence, so the caller hears their own speed with the gaps.
 
 use std::collections::VecDeque;
 
@@ -41,7 +42,10 @@ pub(super) struct ParrotSession {
     parrot_issi: u32,
     max_frames: usize,
     playback_deadline_timeslots: i32,
-    frames: VecDeque<Vec<u8>>,
+    /// One entry per recorded traffic frame; `None` for a frame the BS did not decode.
+    frames: VecDeque<Option<Vec<u8>>>,
+    last_recorded_at: Option<TdmaTime>,
+    lost_frames: usize,
     state: ParrotState,
     last_frame_at: Option<TdmaTime>,
     playback_started_at: Option<TdmaTime>,
@@ -60,6 +64,8 @@ impl ParrotSession {
             max_frames: max_secs as usize * TCH_S_TRAFFIC_FRAMES_PER_SECOND,
             playback_deadline_timeslots: (max_secs as i32 + PARROT_PLAYBACK_GUARD_SECONDS) * TETRA_TIMESLOTS_PER_SECOND,
             frames: VecDeque::new(),
+            last_recorded_at: None,
+            lost_frames: 0,
             state: ParrotState::Recording,
             last_frame_at: None,
             playback_started_at: None,
@@ -88,11 +94,24 @@ impl ParrotSession {
         self.carrier_num == carrier_num && self.ts == ts
     }
 
-    /// Record one UL frame of the session's slot. Returns false when the frame is not recorded:
-    /// another slot, recording over, or the limit reached.
-    pub(super) fn record_ul_frame(&mut self, carrier_num: u16, ts: u8, data: Vec<u8>) -> bool {
+    /// Record one UL frame of the session's slot, received at `now`. Returns false when the frame
+    /// is not recorded: another slot, recording over, or the limit reached.
+    pub(super) fn record_ul_frame(&mut self, carrier_num: u16, ts: u8, data: Vec<u8>, now: TdmaTime) -> bool {
         if !self.owns_slot(carrier_num, ts) || self.state != ParrotState::Recording {
             return false;
+        }
+        if let Some(prev) = self.last_recorded_at {
+            // Traffic frames between the last one heard and this one were sent but not decoded.
+            // Keep their place, or the playback splices the rest together and sounds sped up.
+            for gap in 1..now.diff(prev) / 4 {
+                if self.frames.len() >= self.max_frames {
+                    break;
+                }
+                if prev.add_timeslots(4 * gap).f != 18 {
+                    self.frames.push_back(None);
+                    self.lost_frames += 1;
+                }
+            }
         }
         if self.frames.len() >= self.max_frames {
             tracing::debug!(
@@ -102,12 +121,17 @@ impl ParrotSession {
             );
             return false;
         }
-        self.frames.push_back(data);
+        self.frames.push_back(Some(data));
+        self.last_recorded_at = Some(now);
         true
     }
 
     pub(super) fn recorded_len(&self) -> usize {
         self.frames.len()
+    }
+
+    pub(super) fn lost_frames(&self) -> usize {
+        self.lost_frames
     }
 
     pub(super) fn start_playback(&mut self, now: TdmaTime) -> bool {
@@ -177,12 +201,14 @@ impl ParrotSession {
             return None;
         }
 
-        let Some(data) = self.frames.pop_front() else {
+        let Some(frame) = self.frames.pop_front() else {
             self.state = ParrotState::Releasing;
             self.playback_release_started_at = Some(self.last_frame_at.unwrap_or(now));
             return None;
         };
         self.last_frame_at = Some(now);
+        // A frame that was not heard: nothing is queued and the slot goes out as silence.
+        let data = frame?;
 
         Some(SapMsg {
             sap: Sap::TmdSap,
@@ -517,10 +543,11 @@ impl CcBsSubentity {
                 }
                 session.start_playback(self.dltime);
                 tracing::info!(
-                    "U-TX CEASED (parrot) call_id={} from ISSI {} -> starting paced playback; recorded_frames={}",
+                    "U-TX CEASED (parrot) call_id={} from ISSI {} -> starting paced playback; recorded_frames={} (not decoded {})",
                     call_id,
                     sender.ssi,
-                    recorded
+                    recorded,
+                    session.lost_frames()
                 );
                 if let Some(call) = self.individual_calls.get_mut(&call_id) {
                     call.grant_floor(call.called_addr);
@@ -630,7 +657,7 @@ impl CcBsSubentity {
             tracing::debug!("CMCE: parrot UL frame carrier={} ts={} without a session, dropped", carrier_num, ts);
             return;
         };
-        if session.record_ul_frame(carrier_num, ts, data) {
+        if session.record_ul_frame(carrier_num, ts, data, self.dltime) {
             tracing::trace!(
                 "CMCE: parrot service recorded frame call_id={} carrier={} ts={} frames={}",
                 session.call_id(),
@@ -659,13 +686,21 @@ mod tests {
         ParrotSession::new(MAIN_CARRIER, 2, 42, TetraAddress::issi(1001), 99_999, 20)
     }
 
+    /// Time of the `n`th consecutive TDMA frame on ts 2.
+    fn at(n: usize) -> TdmaTime {
+        TdmaTime { h: 0, m: 1, f: 1, t: 2 }.add_timeslots(4 * n as i32)
+    }
+
     #[test]
     fn parrot_recording_is_limited_to_twenty_seconds() {
         let mut session = session();
         let max_frames = 20 * TCH_S_TRAFFIC_FRAMES_PER_SECOND;
 
         for seq in 0..(max_frames + 5) {
-            assert_eq!(session.record_ul_frame(MAIN_CARRIER, 2, vec![seq as u8; 35]), seq < max_frames);
+            assert_eq!(
+                session.record_ul_frame(MAIN_CARRIER, 2, vec![seq as u8; 35], at(seq)),
+                seq < max_frames
+            );
         }
 
         assert_eq!(session.recorded_len(), max_frames);
@@ -675,7 +710,7 @@ mod tests {
     fn parrot_recording_limit_follows_max_secs() {
         let mut session = ParrotSession::new(MAIN_CARRIER, 2, 42, TetraAddress::issi(1001), 99_999, 3);
         for seq in 0..100u8 {
-            session.record_ul_frame(MAIN_CARRIER, 2, vec![seq; 35]);
+            session.record_ul_frame(MAIN_CARRIER, 2, vec![seq; 35], at(seq as usize));
         }
         assert_eq!(session.recorded_len(), 3 * TCH_S_TRAFFIC_FRAMES_PER_SECOND);
     }
@@ -684,20 +719,59 @@ mod tests {
     fn parrot_records_only_its_own_carrier_and_timeslot() {
         let mut session = session();
 
-        assert!(!session.record_ul_frame(MAIN_CARRIER + 1, 2, vec![0; 35]), "same ts, other carrier");
-        assert!(!session.record_ul_frame(MAIN_CARRIER, 3, vec![0; 35]), "same carrier, other ts");
+        assert!(
+            !session.record_ul_frame(MAIN_CARRIER + 1, 2, vec![0; 35], at(0)),
+            "same ts, other carrier"
+        );
+        assert!(
+            !session.record_ul_frame(MAIN_CARRIER, 3, vec![0; 35], at(0)),
+            "same carrier, other ts"
+        );
         assert_eq!(session.recorded_len(), 0);
         assert!(session.owns_slot(MAIN_CARRIER, 2));
         assert!(!session.owns_slot(MAIN_CARRIER + 1, 2));
 
-        assert!(session.record_ul_frame(MAIN_CARRIER, 2, vec![0; 35]));
+        assert!(session.record_ul_frame(MAIN_CARRIER, 2, vec![0; 35], at(0)));
         assert_eq!(session.recorded_len(), 1);
+    }
+
+    /// UL frames the BS did not decode keep their place: frames 1, 2 and 5 heard, 3 and 4 lost,
+    /// then 17 -> 1 across a multiframe (frame 18 carries no traffic, so nothing is missing).
+    /// Playback sends 1, 2, silence, silence, 5 at one frame each: the caller's own speed.
+    #[test]
+    fn parrot_keeps_undecoded_frames_as_silence() {
+        let mut session = session();
+        for (n, byte) in [(0, 1u8), (1, 2), (4, 5)] {
+            assert!(session.record_ul_frame(MAIN_CARRIER, 2, vec![byte; 35], at(n)));
+        }
+        assert_eq!((session.recorded_len(), session.lost_frames()), (5, 2));
+        let last = TdmaTime { h: 0, m: 1, f: 17, t: 2 };
+        assert!(session.record_ul_frame(MAIN_CARRIER, 2, vec![17; 35], last));
+        assert!(session.record_ul_frame(MAIN_CARRIER, 2, vec![18; 35], last.add_timeslots(8)));
+        assert_eq!(
+            (session.recorded_len(), session.lost_frames()),
+            (18, 2 + 11),
+            "gap 6..16 is lost, 18 is not"
+        );
+
+        let start = TdmaTime { h: 0, m: 3, f: 1, t: 2 };
+        assert!(session.start_playback(start));
+        let played: Vec<Option<u8>> = (0..7)
+            .map(|n| {
+                let now = start.add_timeslots(4 * (n + 4));
+                session.next_playback_msg(now).map(|msg| match msg.msg {
+                    SapMsgInner::TmdCircuitDataReq(req) => req.data[0],
+                    _ => panic!("playback sends circuit data"),
+                })
+            })
+            .collect();
+        assert_eq!(played, vec![Some(1), Some(2), None, None, Some(5), None, None]);
     }
 
     #[test]
     fn parrot_playback_guard_forces_completion() {
         let mut session = session();
-        assert!(session.record_ul_frame(MAIN_CARRIER, 2, vec![0; 35]));
+        assert!(session.record_ul_frame(MAIN_CARRIER, 2, vec![0; 35], at(0)));
 
         let start = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
         assert!(session.start_playback(start));
@@ -711,7 +785,7 @@ mod tests {
     #[test]
     fn parrot_playback_skips_frame_18_and_drains_before_finish() {
         let mut session = session();
-        assert!(session.record_ul_frame(MAIN_CARRIER, 2, vec![1; 35]));
+        assert!(session.record_ul_frame(MAIN_CARRIER, 2, vec![1; 35], at(0)));
 
         let start = TdmaTime { h: 0, m: 1, f: 14, t: 2 };
         assert!(session.start_playback(start));
