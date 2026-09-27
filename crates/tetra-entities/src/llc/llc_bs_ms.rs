@@ -813,6 +813,24 @@ impl Llc {
             self.last_uplink
                 .insert(prim.main_address.ssi, (prim.carrier_num, msg_dltime.t, msg_dltime));
         }
+        // `bearer = "pdch"`: a radio that sends a PDU on the MCCH is there, not on its packet-data
+        // channel: its PDUs go on the MCCH until it is assigned the channel again. (A BL-ACK alone
+        // does not count: where a radio acknowledges its assignment is not known.)
+        if self.pdch_mode
+            && !matches!(pdu_type, LlcPduType::BlAck | LlcPduType::BlAckFcs)
+            && prim.main_address.ssi_type != SsiType::Gssi
+            && prim.carrier_num == self.main_carrier()
+            && prim.link_id == 1
+            && self.pdch_slot(prim.main_address.ssi, true).is_some()
+            && let Some(grant) = self.config.state_write().pdch_by_issi.get_mut(&prim.main_address.ssi)
+        {
+            grant.on_air = false;
+            tracing::info!(
+                "LLC: ISSI {} sent a PDU on the MCCH: its PDUs go there, not on its PDCH ts {}",
+                prim.main_address.ssi,
+                grant.slot.ts
+            );
+        }
         if let Some(ns) = ns {
             // Send ACK
             self.schedule_outgoing_ack(msg_dltime, prim.main_address, prim.carrier_num, msg_dltime.t, ns);

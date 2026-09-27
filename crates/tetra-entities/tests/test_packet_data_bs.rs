@@ -2889,6 +2889,45 @@ fn a_reconnect_without_data_gets_no_answer_and_no_pdch() {
     assert!(response.alloc.is_some(), "a PDCH again");
 }
 
+/// The radio never acknowledges the RESPONSE carrying its assignment (it did not get it): once
+/// the LLC gives up, the PDCH goes.
+#[test]
+fn an_assignment_never_acknowledged_gives_the_pdch_back() {
+    let mut air = Air::new(pdch_config(false));
+    air.send(ISSI, &demand(1, None, false));
+    air.next_sn(8).expect("ACCEPT");
+    air.run(4);
+    air.send(ISSI, &transmit_request(1, Some((1, false))));
+    air.acks.retain(|a| a.0 != ISSI);
+    let mut responses = 0;
+    for _ in 0..200 {
+        air.step();
+        air.acks.retain(|a| a.0 != ISSI);
+        responses += air.take_sn().iter().filter(|d| d.sn_type() == Some(7)).count();
+    }
+    assert!(responses >= 2, "the RESPONSE went again");
+    assert_eq!(pdch_slot_of(&air, ISSI), None, "PDCH given back");
+    assert_eq!(air.test.config.state_read().timeslot_alloc.owner(4), None);
+}
+
+/// A radio on its PDCH that sends a PDU on the MCCH (a call set-up, say) is there: its PDUs go on
+/// the MCCH, not on the PDCH it left.
+#[test]
+fn a_radio_heard_on_the_mcch_gets_its_pdus_there() {
+    let mut air = Air::new(pdch_config(false));
+    onto_pdch(&mut air, ISSI);
+    let mut udata = BitBuffer::new_autoexpand(32);
+    BlUdata { has_fcs: false }.to_bitbuf(&mut udata);
+    append_bits(&mut udata, "0010101010"); // MM
+    air.uplink(ISSI, udata);
+    assert!(!air.test.config.state_read().pdch_by_issi[&ISSI].on_air);
+    air.down.clear();
+    air.test.submit_message(tl_data_to(TetraAddress::issi(ISSI), false));
+    air.run(3);
+    let d = air.down.iter().find(|d| d.issi == ISSI).expect("a PDU went down");
+    assert_eq!((d.link_id, d.stealing), (0, false), "on the MCCH");
+}
+
 /// Voice takes the PDCH slot: the grant goes within a second and the radio's data goes on on
 /// the MCCH.
 #[test]

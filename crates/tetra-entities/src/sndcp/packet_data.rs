@@ -144,6 +144,8 @@ struct Pdch {
     slot: CarrierSlot,
     /// The SN-DATA TRANSMIT RESPONSE carrying the assignment, until it went out.
     assignment: Option<TxReporter>,
+    /// The same once it went out, until the radio acknowledges it: lost, the radio never got it.
+    assignment_ack: Option<TxReporter>,
     /// The assignment went out: the radio is on the channel (as far as the station knows).
     on_air: bool,
     /// Last data or transfer request of the radio (TDMA clock).
@@ -702,6 +704,7 @@ impl PacketDataRuntime {
             }
             let reporter = TxReporter::new();
             p.assignment = Some(reporter.clone());
+            p.assignment_ack = None;
             return (Some((pdch_assignment(p.slot), reporter)), format!("PDCH ts {} (again)", p.slot.ts));
         }
         let slot = {
@@ -727,6 +730,7 @@ impl PacketDataRuntime {
             Pdch {
                 slot,
                 assignment: Some(reporter.clone()),
+                assignment_ack: None,
                 on_air: false,
                 last_activity: clock,
                 quit: None,
@@ -802,10 +806,29 @@ impl PacketDataRuntime {
     }
 
     /// Each tick while a packet-data channel exists: the assignment going out puts the radio on
-    /// the channel; an SN-END OF DATA that went out, or an assignment that never did, ends it.
+    /// the channel; an SN-END OF DATA that went out, or an assignment that never did or that the
+    /// radio never acknowledged, ends it. A radio the LLC saw transmitting on the MCCH is off it.
     fn pdch_tick(&mut self, config: &SharedConfig) {
         if self.pdch.is_empty() {
             return;
+        }
+        let off: Vec<u32> = {
+            let state = config.state_read();
+            self.pdch
+                .iter()
+                .filter(|(issi, p)| p.on_air && state.pdch_by_issi.get(issi).is_some_and(|g| !g.on_air))
+                .map(|(issi, _)| *issi)
+                .collect()
+        };
+        for issi in off {
+            if let Some(p) = self.pdch.get_mut(&issi) {
+                p.on_air = false;
+                tracing::info!(
+                    "SNDCP: ISSI {} transmitted on the MCCH, off its PDCH ts {} (kept for now)",
+                    issi,
+                    p.slot.ts
+                );
+            }
         }
         let mut on_air = Vec::new();
         let mut ended = Vec::new();
@@ -813,7 +836,8 @@ impl PacketDataRuntime {
             if let Some(r) = &p.assignment {
                 match r.get_state() {
                     TxState::Pending => {}
-                    TxState::Transmitted | TxState::Acknowledged => {
+                    state @ (TxState::Transmitted | TxState::Acknowledged) => {
+                        p.assignment_ack = (state == TxState::Transmitted).then(|| r.clone());
                         p.assignment = None;
                         if !p.on_air {
                             p.on_air = true;
@@ -822,6 +846,11 @@ impl PacketDataRuntime {
                     }
                     TxState::Lost | TxState::Discarded => ended.push((*issi, "assignment not delivered")),
                 }
+            }
+            match p.assignment_ack.as_ref().map(TxReporter::get_state) {
+                Some(TxState::Acknowledged) => p.assignment_ack = None,
+                Some(TxState::Lost) => ended.push((*issi, "the radio never acknowledged its assignment")),
+                _ => {}
             }
             if p.quit.as_ref().is_some_and(|r| r.get_state() != TxState::Pending) {
                 ended.push((*issi, "SN-END OF DATA, back to the MCCH"));
