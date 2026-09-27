@@ -34,6 +34,11 @@ control PDU codecs, tests adapted from Nexus-BS):
 - crates/tetra-entities/src/sndcp/unitdata.rs
 - crates/tetra-entities/tests/test_packet_data_nexus_bs.rs
 
+LLC advanced link (AL-SETUP, AL-DATA / AL-FINAL and AL-ACK / AL-RNR PDU codecs):
+- crates/tetra-pdus/src/llc/pdus/al_setup.rs
+- crates/tetra-pdus/src/llc/pdus/al_data.rs
+- crates/tetra-pdus/src/llc/pdus/al_ack.rs
+
 Nexus-BS credits (from the Nexus-BS NOTICE):
 - BlueStation Project for historical TETRA BS foundation and
   protocol-structure contributions:
