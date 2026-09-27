@@ -1,3 +1,4 @@
+use super::packet_data::PacketDataRuntime;
 use super::wapgw::WapService;
 use crate::{MessageQueue, TetraEntityTrait};
 use std::time::Instant;
@@ -45,10 +46,11 @@ const CHAP_CODE_SUCCESS: u64 = 3; // RFC 1994 CHAP code: 3 = Success
 const PCO_CHAP_SUCCESS_BITS: u64 = 60;
 
 pub struct Sndcp {
-    #[allow(dead_code)] // wired up when the full packet-data state machine is implemented
     config: SharedConfig,
     /// WAP gateway, only with `[wap] enabled`.
     wap: Option<WapService>,
+    /// Packet-data bearer, only with `[packet_data] enabled`; without it the stub answers.
+    runtime: Option<PacketDataRuntime>,
 }
 
 /// The mandatory header of an SN-ACTIVATE PDP CONTEXT DEMAND (table 28.24) and the CHAP identifier
@@ -193,7 +195,8 @@ pub(crate) fn tl_data_req(addr: TetraAddress, link_id: u32, endpoint_id: u32, sd
 impl Sndcp {
     pub fn new(config: SharedConfig) -> Self {
         let wap = WapService::start(&config);
-        Self { config, wap }
+        let runtime = PacketDataRuntime::new(&config);
+        Self { config, wap, runtime }
     }
 
     /// Reply to an SN-ACTIVATE PDP CONTEXT DEMAND with a spec-conformant SN-ACTIVATE PDP CONTEXT
@@ -287,8 +290,10 @@ impl TetraEntityTrait for Sndcp {
         TetraEntity::Sndcp
     }
 
-    fn tick_start(&mut self, _queue: &mut MessageQueue, _ts: TdmaTime) {
-        if let Some(wap) = self.wap.as_mut() {
+    fn tick_start(&mut self, queue: &mut MessageQueue, _ts: TdmaTime) {
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.tick(queue, &self.config, self.wap.as_mut(), Instant::now());
+        } else if let Some(wap) = self.wap.as_mut() {
             for out in wap.tick(&self.config, Instant::now()) {
                 tracing::debug!("WAP: no bearer to ISSI {} yet, reply dropped", out.peer.issi);
             }
@@ -302,6 +307,10 @@ impl TetraEntityTrait for Sndcp {
             tracing::debug!("SNDCP: unhandled prim (sap={:?}): {:?}", message.sap, message.msg);
             return;
         };
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.rx(queue, ind, self.wap.as_mut(), &self.config, Instant::now());
+            return;
+        }
 
         // The SDU still carries the leading 3-bit MLE protocol discriminator (0b100 = SNDCP); the
         // SNDCP PDU proper — which begins with a 4-bit SN-PDU type — starts after it.
