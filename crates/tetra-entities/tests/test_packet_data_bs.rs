@@ -17,7 +17,7 @@ use tetra_entities::sndcp::transfer::{
     SndcpPhaseModulationResourceRequest, SndcpReconnect, SndcpTransferRejectCause, decode_data_transmit_response, decode_end_of_data,
     decode_not_supported, encode_data_transmit_request, encode_end_of_data, encode_reconnect,
 };
-use tetra_entities::sndcp::unitdata::{decode_sn_user_data_pdu, encode_sn_unitdata};
+use tetra_entities::sndcp::unitdata::{decode_sn_user_data_pdu, encode_sn_data, encode_sn_unitdata};
 use tetra_pdus::llc::enums::llc_pdu_type::LlcPduType;
 use tetra_pdus::llc::pdus::al_ack::AlAck;
 use tetra_pdus::llc::pdus::al_data::AlData;
@@ -114,6 +114,11 @@ fn deactivate(nsapi: Option<u8>) -> String {
 
 fn unitdata(nsapi: u8, npdu: &[u8]) -> String {
     encode_sn_unitdata(nsapi, 0, 0, &BitBuffer::from_bytes(npdu)).unwrap().to_bitstr()
+}
+
+/// SN-DATA (the advanced link's user data PDU).
+fn sn_data(nsapi: u8, npdu: &[u8]) -> String {
+    encode_sn_data(nsapi, 0, 0, &BitBuffer::from_bytes(npdu)).unwrap().to_bitstr()
 }
 
 /// A UDP datagram from the radio at `src` to the gateway's WAP port.
@@ -334,8 +339,12 @@ impl Air {
     /// The radio sets up its advanced link 1 (the AL-SETUP of `radio_al_setup`); returns the
     /// station's answer.
     fn al_setup(&mut self, issi: u32) -> AlSetup {
+        self.al_setup_with(issi, radio_al_setup())
+    }
+
+    fn al_setup_with(&mut self, issi: u32, setup: AlSetup) -> AlSetup {
         let mut pdu = BitBuffer::new_autoexpand(32);
-        radio_al_setup().to_bitbuf(&mut pdu);
+        setup.to_bitbuf(&mut pdu);
         pdu.seek(0);
         self.uplink(issi, pdu);
         for _ in 0..8 {
@@ -1411,6 +1420,213 @@ fn nothing_goes_down_to_a_radio_in_a_call() {
     assert!(air.take_sn().is_empty(), "radio listening to its group");
     air.test.config.state_write().active_call_ts.clear();
     assert!(air.next_sn(200).is_some());
+}
+
+// ---------------------------------------------------------------------------------------------
+// SN-DATA on the advanced link (scenarios of Nexus-BS test_sndcp_bs.rs, written for this harness)
+// ---------------------------------------------------------------------------------------------
+
+/// PDP context, SN-DATA TRANSMIT REQUEST (RESPONSE with no channel) and AL-SETUP, as the MXP600
+/// does before its first WAP request.
+fn attach_al(air: &mut Air, issi: u32) -> Ipv4Addr {
+    let ip = air.attach(issi, 1);
+    assert_eq!(air.al_setup(issi).setup_report, AlSetup::SETUP_REPORT_SUCCESS);
+    air.take_sn();
+    air.al_segments.clear();
+    ip
+}
+
+/// Result of a WTP transaction the radio drives over SN-DATA: every datagram comes down as
+/// SN-DATA on the advanced link, the radio acknowledges the groups and the last packet, and the
+/// reassembled WTP payload is returned with the largest datagram size.
+fn wtp_over_al(air: &mut Air, ip: Ipv4Addr, tid: u16) -> (Vec<u8>, usize, usize) {
+    let mut parts: BTreeMap<u8, Vec<u8>> = BTreeMap::new();
+    let (mut packets, mut largest) = (0, 0);
+    loop {
+        let down = air.next_sn(600).expect("the gateway's answer comes down");
+        assert_eq!((down.issi, down.llc), (ISSI, LlcPduType::AlDataAlFinal), "SN-DATA on the AL");
+        let (wtp, size) = wtp_down(&down, ip);
+        packets += 1;
+        largest = largest.max(size);
+        let ty = (wtp[0] >> 3) & 0x0f;
+        let flags = wtp[0] & 0x06;
+        assert_eq!(u16::from_be_bytes([wtp[1], wtp[2]]), 0x8000 | tid);
+        let (psn, data) = match ty {
+            2 => (0, &wtp[3..]),
+            6 => (wtp[3], &wtp[4..]),
+            _ => panic!("WTP PDU type {ty}: {wtp:02x?}"),
+        };
+        parts.insert(psn, data.to_vec());
+        if flags & 0x02 != 0 {
+            let ack = wtp_ack(tid, (ty == 6).then_some(psn));
+            air.send_al(ISSI, &sn_data(1, &datagram(ip, GATEWAY, 9201, &ack)));
+            break;
+        }
+        if flags & 0x04 != 0 {
+            air.send_al(ISSI, &sn_data(1, &datagram(ip, GATEWAY, 9201, &wtp_ack(tid, Some(psn)))));
+        }
+    }
+    (parts.into_values().flatten().collect(), packets, largest)
+}
+
+/// Nexus-BS `sndcp_wap_al_xhtml_e2e_...` scenario on the MCCH: DEMAND, TRANSMIT REQUEST, AL-SETUP,
+/// a WSP GET of the home page in an AL-FINAL-AR, and the answer back as SN-DATA over the advanced
+/// link in datagrams up to the MTU, each TL-SDU acknowledged by the radio.
+#[test]
+fn wsp_get_over_the_advanced_link_end_to_end() {
+    debug::setup_logging_verbose();
+    let mut air = Air::new(config(true, true));
+    let ip = attach_al(&mut air, ISSI);
+    air.send_al(ISSI, &sn_data(1, &datagram(ip, GATEWAY, 9201, &wtp_get(0x21, "/"))));
+    let (reply, _, largest) = wtp_over_al(&mut air, ip, 0x21);
+    assert_eq!(&reply[..2], &[0x04, 0x20], "WSP Reply, 200 OK");
+    let body = String::from_utf8_lossy(&reply);
+    assert!(body.contains("FlowStation") && body.trim_end().ends_with("</html>"), "{body}");
+    assert!(
+        largest > 320 && largest <= 576,
+        "datagrams up to the MTU on the AL, beyond the basic link's 320: {largest}"
+    );
+    assert!(air.al_segments.iter().all(|s| s.2 <= 194), "each segment fits one SCH/F");
+    // The final Ack ends the transaction: nothing more comes down.
+    air.run(200);
+    assert!(air.take_sn().is_empty());
+}
+
+/// With N.271 = 256 octets the gateway answers in datagrams of at most 249 octets and splits the
+/// page with WTP SAR.
+#[test]
+fn a_small_n271_limits_the_datagrams() {
+    let mut air = Air::new(config(true, true));
+    let ip = air.attach(ISSI, 1);
+    let mut setup = radio_al_setup();
+    setup.max_tl_sdu_len_code = 3;
+    assert_eq!(air.al_setup_with(ISSI, setup).setup_report, AlSetup::SETUP_REPORT_SUCCESS);
+    air.take_sn();
+    air.send_al(ISSI, &sn_data(1, &datagram(ip, GATEWAY, 9201, &wtp_get(0x22, "/"))));
+    let (reply, packets, largest) = wtp_over_al(&mut air, ip, 0x22);
+    assert_eq!(&reply[..2], &[0x04, 0x20]);
+    assert!(largest <= 249, "N.271 256 less FCS, SN-DATA header and discriminator: {largest}");
+    assert!(packets > 1, "the page needs SAR");
+}
+
+/// The answer takes the bearer of the request, alternating on one radio: basic link for
+/// SN-UNITDATA, advanced link for SN-DATA.
+#[test]
+fn answers_follow_the_bearer_of_the_request() {
+    let mut air = Air::new(config(true, true));
+    let ip = attach_al(&mut air, ISSI);
+    for (tid, advanced) in [(0x31, false), (0x32, true), (0x33, false)] {
+        let dg = datagram(ip, GATEWAY, 9201, &wtp_get(tid, "/status.wml"));
+        if advanced {
+            air.send_al(ISSI, &sn_data(1, &dg));
+        } else {
+            air.send_unack(ISSI, &unitdata(1, &dg));
+        }
+        let down = air.next_sn(400).expect("answer");
+        let (wtp, _) = wtp_down(&down, ip);
+        assert_eq!(u16::from_be_bytes([wtp[1], wtp[2]]), 0x8000 | tid);
+        let expected = if advanced { LlcPduType::AlDataAlFinal } else { LlcPduType::BlUdata };
+        assert_eq!(down.llc, expected, "TID {tid:#x}");
+        let ack = datagram(ip, GATEWAY, 9201, &wtp_ack(tid, None));
+        if advanced {
+            air.send_al(ISSI, &sn_data(1, &ack));
+        } else {
+            air.send_unack(ISSI, &unitdata(1, &ack));
+        }
+        air.run(40);
+        air.take_sn();
+    }
+}
+
+/// Nexus-BS `sndcp_wap_al_connect_reply_e2e_...` scenario: a WSP Connect over the AL gets its
+/// ConnectReply over the AL, acknowledged by the radio, and the session opens.
+#[test]
+fn wsp_connect_over_the_advanced_link() {
+    let mut air = Air::new(config(true, true));
+    let ip = attach_al(&mut air, ISSI);
+    air.send_al(ISSI, &sn_data(1, &datagram(ip, GATEWAY, 9201, &wtp_connect(0x60))));
+    let reply = air.next_sn(400).expect("ConnectReply");
+    assert_eq!(reply.llc, LlcPduType::AlDataAlFinal);
+    let (wtp, _) = wtp_down(&reply, ip);
+    assert_eq!(&wtp[..4], &[0x12, 0x80, 0x60, 0x02], "WTP Result with WSP ConnectReply");
+    air.send_al(ISSI, &sn_data(1, &datagram(ip, GATEWAY, 9201, &wtp_ack(0x60, None))));
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    air.run(20);
+    let sessions = air
+        .test
+        .config
+        .state_read()
+        .wap_status
+        .sessions
+        .iter()
+        .filter(|s| s.issi == ISSI)
+        .count();
+    assert_eq!(sessions, 1);
+}
+
+/// Nexus-BS WSP-over-UDP scenario: a request to port 9200 over the AL is answered from 9200 over
+/// the AL.
+#[test]
+fn wsp_to_port_9200_over_the_advanced_link() {
+    let mut air = Air::new(config(true, true));
+    let ip = attach_al(&mut air, ISSI);
+    air.send_al(ISSI, &sn_data(1, &datagram(ip, GATEWAY, 9200, &wtp_get(0x07, "/status.wml"))));
+    let down = air.next_sn(400).expect("WSP Reply");
+    assert_eq!(down.llc, LlcPduType::AlDataAlFinal);
+    let unitdata = decode_sn_user_data_pdu(&down.sn_buf()).unwrap();
+    let mut npdu = unitdata.n_pdu.clone();
+    let mut octets = Vec::new();
+    while let Some(b) = npdu.read_bits(8) {
+        octets.push(b as u8);
+    }
+    let ipv4 = parse_ipv4_packet(&octets).unwrap();
+    let udp = parse_udp_datagram(ipv4.payload).unwrap();
+    assert_eq!((udp.source_port, udp.destination_port), (9200, RADIO_PORT));
+    assert_eq!(u16::from_be_bytes([udp.payload[1], udp.payload[2]]), 0x8007, "WTP answer to TID 7");
+}
+
+/// SN-DATA on the advanced link without a PDP context, or on the basic link, goes nowhere (the
+/// TL-SDU is still acknowledged by the LLC).
+#[test]
+fn sn_data_without_a_context_or_off_the_advanced_link_is_dropped() {
+    let mut air = Air::new(config(true, true));
+    air.al_setup(ISSI);
+    air.send_al(
+        ISSI,
+        &sn_data(1, &datagram(Ipv4Addr::new(10, 0, 0, 2), GATEWAY, 9201, &wtp_get(1, "/"))),
+    );
+    air.run(200);
+    assert!(air.take_sn().is_empty(), "no PDP context");
+    let ip = air.attach(ISSI, 1);
+    air.take_sn();
+    air.send(ISSI, &sn_data(1, &datagram(ip, GATEWAY, 9201, &wtp_get(2, "/"))));
+    air.run(200);
+    assert!(air.take_sn().is_empty(), "SN-DATA only on the advanced link (table 28.16)");
+}
+
+/// The radio does not acknowledge the TL-SDUs: the next datagram waits for the LLC to give up on
+/// the first (at most one data PDU in the MAC for the MCCH), and the link is then closed.
+#[test]
+fn an_unacknowledged_sn_data_holds_the_next_until_the_llc_gives_up() {
+    let mut air = Air::new(config(true, true));
+    let ip = attach_al(&mut air, ISSI);
+    air.al_answer = false;
+    air.send_al(ISSI, &sn_data(1, &datagram(ip, GATEWAY, 9201, &wtp_get(0x41, "/"))));
+    air.run(40);
+    let first_ns: Vec<u8> = air.al_segments.iter().map(|s| s.1.ns).collect();
+    assert!(
+        !first_ns.is_empty() && first_ns.iter().all(|ns| *ns == 0),
+        "only TL-SDU 0: {first_ns:?}"
+    );
+    air.run(2000);
+    assert!(
+        air.al_segments.iter().all(|s| s.1.ns == 0),
+        "no second TL-SDU while the first is unacknowledged"
+    );
+    assert!(
+        air.down.iter().any(|d| d.llc == LlcPduType::AlDisc),
+        "the LLC closed the link after N.273"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

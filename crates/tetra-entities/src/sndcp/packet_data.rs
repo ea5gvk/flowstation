@@ -1,8 +1,9 @@
 //! SNDCP packet-data runtime for `[packet_data]` (EN 300 392-2 clause 28): PDP contexts with an
 //! IPv4 address from the pool (the ACCEPT keeps the stub's CHAP Success for DIMETRA radios),
-//! READY and STANDBY, SN-DATA TRANSMIT REQUEST / RESPONSE, SN-RECONNECT, SN-END OF DATA and
-//! SN-UNITDATA on the basic link of the common control channel (no channel is assigned), carrying
-//! the radios' datagrams to and from the WAP gateway.
+//! READY and STANDBY, SN-DATA TRANSMIT REQUEST / RESPONSE, SN-RECONNECT, SN-END OF DATA, and the
+//! radios' datagrams to and from the WAP gateway on the common control channel (no channel is
+//! assigned): SN-UNITDATA on the unacknowledged basic link, SN-DATA on the acknowledged advanced
+//! link. Each answer goes back on the bearer the radio's last datagram came on.
 //!
 //! Voice first: nothing goes down to a radio while it is in a call (its gateway timers wait), and
 //! at most one data PDU of the whole runtime waits in the MAC for the MCCH, so a call set-up waits
@@ -18,8 +19,8 @@ use std::time::Instant;
 use tetra_config::bluestation::{SharedConfig, StackState, ready_timer_ms};
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Sap, TetraAddress, TxReporter, TxState};
-use tetra_saps::ltpd::LtpdMleUnitdataInd;
-use tetra_saps::tla::TlaTlUnitdataReqBl;
+use tetra_saps::ltpd::{LtpdBearer, LtpdMleUnitdataInd};
+use tetra_saps::tla::{TlDataReqAl, TlaTlUnitdataReqBl};
 use tetra_saps::{SapMsg, SapMsgInner};
 
 use super::ip::{bitbuffer_npdu_octets, parse_ipv4_packet};
@@ -32,7 +33,7 @@ use super::transfer::{
     SndcpTransferRejectCause, decode_data_transmit_request, decode_reconnect, encode_data_transmit_response, encode_end_of_data,
     encode_not_supported,
 };
-use super::unitdata::{SNDCP_NO_COMPRESSION, decode_sn_unitdata_pdu, encode_sn_unitdata};
+use super::unitdata::{SNDCP_NO_COMPRESSION, decode_sn_data_pdu, decode_sn_unitdata_pdu, encode_sn_data, encode_sn_unitdata};
 use super::wapgw::{UdpOut, WapService, WapVia};
 use crate::MessageQueue;
 
@@ -55,6 +56,9 @@ const INFLIGHT_GUARD_SLOTS: u64 = slots(10_000);
 /// Largest datagram sent back in one SN-UNITDATA on the basic link: N.251 (2595 bits without
 /// FCS) less the MLE discriminator and the SN-UNITDATA header, with a margin.
 const BL_MAX_DATAGRAM: usize = 320;
+/// What N.271 holds besides the datagram: the AL FCS (4 octets), the SN-DATA header (2) and the
+/// MLE discriminator (3 bits, one octet).
+const AL_OVERHEAD: usize = 7;
 /// Bound on PDP contexts (dynamic pool plus static addresses).
 const MAX_CONTEXTS: usize = 2048;
 /// Radios remembered for the one-warning-per-radio rule on malformed PDUs.
@@ -111,9 +115,12 @@ struct Ctx {
     in_call: bool,
     /// Traffic since the context last entered READY.
     counters: Counters,
+    /// Bearer of the last datagram from the radio, which its answers take.
+    reply_bearer: LtpdBearer,
 }
 
 struct Inflight {
+    key: (u32, u8),
     reporter: TxReporter,
     since: u64,
 }
@@ -256,9 +263,14 @@ impl PacketDataRuntime {
         })
     }
 
-    /// Largest datagram the gateway may send back to a radio over the basic link.
-    fn max_reply_bytes(&self) -> usize {
-        usize::from(self.mtu).min(BL_MAX_DATAGRAM)
+    /// Largest datagram the gateway may send back on `bearer`: the MTU, and N.251 on the basic
+    /// link or the negotiated N.271 on the advanced link.
+    fn max_reply_bytes(&self, bearer: LtpdBearer) -> usize {
+        let bearer_max = match bearer {
+            LtpdBearer::Advanced { max_sdu_bytes, .. } => usize::from(max_sdu_bytes).saturating_sub(AL_OVERHEAD),
+            LtpdBearer::BasicAck | LtpdBearer::BasicUnack => BL_MAX_DATAGRAM,
+        };
+        usize::from(self.mtu).min(bearer_max)
     }
 
     /// One uplink SN-PDU (the SDU still carries the 3-bit MLE discriminator).
@@ -284,7 +296,8 @@ impl PacketDataRuntime {
         match sn_type {
             Some(SN_ACTIVATE_PDP_CONTEXT) => self.on_demand(queue, ind, bits, wap),
             Some(SN_DEACTIVATE_PDP_CONTEXT_DEMAND) => self.on_deactivate(queue, ind, bits, wap),
-            Some(SN_UNITDATA) => self.on_unitdata(ind, bits, wap, config, now),
+            Some(SN_UNITDATA) => self.on_user_data(ind, bits, wap, config, now),
+            Some(SN_DATA) if matches!(ind.bearer, LtpdBearer::Advanced { .. }) => self.on_user_data(ind, bits, wap, config, now),
             Some(SN_DATA) => tracing::debug!(
                 "SNDCP: SN-DATA from ISSI {} on the basic link (table 28.16 allows it only on the advanced link), dropped",
                 issi
@@ -462,6 +475,7 @@ impl PacketDataRuntime {
                 seen_registered: false,
                 in_call: false,
                 counters: Counters::default(),
+                reply_bearer: LtpdBearer::BasicUnack,
             },
         );
     }
@@ -620,27 +634,47 @@ impl PacketDataRuntime {
         self.sync_pause(issi, wap, now);
     }
 
-    fn on_unitdata(&mut self, ind: &LtpdMleUnitdataInd, bits: &str, mut wap: Option<&mut WapService>, config: &SharedConfig, now: Instant) {
+    /// A datagram from a radio: SN-UNITDATA (basic link) or SN-DATA (advanced link).
+    fn on_user_data(
+        &mut self,
+        ind: &LtpdMleUnitdataInd,
+        bits: &str,
+        mut wap: Option<&mut WapService>,
+        config: &SharedConfig,
+        now: Instant,
+    ) {
         let issi = ind.received_tetra_address.ssi;
-        let unitdata = match decode_sn_unitdata_pdu(&BitBuffer::from_bitstr(bits)) {
+        let (name, decoded) = if field(bits, 0, 4) == Some(SN_DATA) {
+            ("SN-DATA", decode_sn_data_pdu(&BitBuffer::from_bitstr(bits)))
+        } else {
+            ("SN-UNITDATA", decode_sn_unitdata_pdu(&BitBuffer::from_bitstr(bits)))
+        };
+        let unitdata = match decoded {
             Ok(u) => u,
             Err(e) => {
-                tracing::debug!("SNDCP: SN-UNITDATA from ISSI {} not usable ({:?}), dropped", issi, e);
+                tracing::debug!("SNDCP: {} from ISSI {} not usable ({:?}), dropped", name, issi, e);
                 return;
             }
         };
         let key = (issi, unitdata.nsapi);
         let (ready_slots, clock) = (self.ready_slots, self.clock);
+        // An SN-UNITDATA sent on the acknowledged basic link is answered as on the unacknowledged one.
+        let bearer = match ind.bearer {
+            LtpdBearer::BasicAck => LtpdBearer::BasicUnack,
+            other => other,
+        };
+        let max_reply = self.max_reply_bytes(bearer);
         let Some(ctx) = self.ctxs.get_mut(&key) else {
             tracing::debug!(
-                "SNDCP: SN-UNITDATA from ISSI {} NSAPI {} without a PDP context, dropped",
+                "SNDCP: {} from ISSI {} NSAPI {} without a PDP context, dropped",
+                name,
                 issi,
                 unitdata.nsapi
             );
             return;
         };
         let Ok(npdu) = bitbuffer_npdu_octets(&unitdata.n_pdu) else {
-            tracing::debug!("SNDCP: SN-UNITDATA from ISSI {} is not whole octets, dropped", issi);
+            tracing::debug!("SNDCP: {} from ISSI {} is not whole octets, dropped", name, issi);
             return;
         };
         if ctx.state != CtxState::Ready {
@@ -650,6 +684,7 @@ impl PacketDataRuntime {
         ctx.deadline = clock + ready_slots;
         ctx.counters.up += 1;
         ctx.counters.up_bytes += npdu.len();
+        ctx.reply_bearer = bearer;
         // Anti-spoofing: a radio only sends from the address its context holds.
         let ctx_ip = ctx.ip;
         match parse_ipv4_packet(&npdu) {
@@ -673,7 +708,7 @@ impl PacketDataRuntime {
             tracing::debug!("SNDCP: datagram from ISSI {} dropped, [wap] is off", issi);
             return;
         };
-        if let Err(e) = wap.on_air_ipv4(config, issi, &npdu, Some(self.max_reply_bytes()), now) {
+        if let Err(e) = wap.on_air_ipv4(config, issi, &npdu, Some(max_reply), now) {
             tracing::debug!("SNDCP: datagram from ISSI {} not for the gateway ({:?}), dropped", issi, e);
         }
     }
@@ -818,12 +853,19 @@ impl PacketDataRuntime {
 
     fn deliver(&mut self, queue: &mut MessageQueue, config: &SharedConfig, wap: Option<&mut WapService>, now: Instant) {
         if let Some(inflight) = &self.inflight {
-            let pending = inflight.reporter.get_state() == TxState::Pending;
-            if pending && self.clock - inflight.since < INFLIGHT_GUARD_SLOTS {
+            // Final: sent (basic link), or acknowledged, lost or discarded (advanced link).
+            let done = inflight.reporter.is_in_final_state();
+            if !done && self.clock - inflight.since < INFLIGHT_GUARD_SLOTS {
                 return;
             }
-            if pending {
-                tracing::debug!("SNDCP: the MAC never reported the last data PDU, not waiting for it any longer");
+            if !done {
+                tracing::debug!("SNDCP: no final report on the last data PDU, not waiting for it any longer");
+            } else if inflight.reporter.get_state() == TxState::Acknowledged
+                && let Some(ctx) = self.ctxs.get_mut(&inflight.key)
+                && ctx.state == CtxState::Ready
+            {
+                // READY restarts when the peer confirms an SN-DATA (clause 28.2.6.2).
+                ctx.deadline = self.clock + self.ready_slots;
             }
             self.inflight = None;
         }
@@ -839,40 +881,84 @@ impl PacketDataRuntime {
         let (ready_slots, clock) = (self.ready_slots, self.clock);
         let Some(ctx) = self.ctxs.get_mut(&key) else { return };
         let Some(npdu) = ctx.dl.pop_front() else { return };
-        let pdu = match encode_sn_unitdata(key.1, SNDCP_NO_COMPRESSION, SNDCP_NO_COMPRESSION, &BitBuffer::from_bytes(&npdu)) {
+        let bearer = ctx.reply_bearer;
+        let al_number = match bearer {
+            LtpdBearer::Advanced { al_number, .. } => Some(al_number),
+            LtpdBearer::BasicAck | LtpdBearer::BasicUnack => None,
+        };
+        if al_number.is_none() && npdu.len() > BL_MAX_DATAGRAM {
+            tracing::debug!(
+                "SNDCP: datagram of {} bytes for ISSI {} does not fit the basic link, dropped",
+                npdu.len(),
+                key.0
+            );
+            return;
+        }
+        let n_pdu = BitBuffer::from_bytes(&npdu);
+        let encoded = match al_number {
+            Some(_) => encode_sn_data(key.1, SNDCP_NO_COMPRESSION, SNDCP_NO_COMPRESSION, &n_pdu),
+            None => encode_sn_unitdata(key.1, SNDCP_NO_COMPRESSION, SNDCP_NO_COMPRESSION, &n_pdu),
+        };
+        let pdu = match encoded {
             Ok(pdu) => pdu,
             Err(e) => {
-                tracing::debug!("SNDCP: SN-UNITDATA for ISSI {} not built ({:?})", key.0, e);
+                tracing::debug!("SNDCP: datagram PDU for ISSI {} not built ({:?})", key.0, e);
                 return;
             }
         };
         ctx.deadline = clock + ready_slots;
         ctx.counters.down += 1;
         ctx.counters.down_bytes += npdu.len();
-        let reporter = TxReporter::new_unacked();
-        tracing::debug!("SNDCP: -> ISSI {} SN-UNITDATA, {} bytes", key.0, npdu.len());
+        let (msg, reporter) = match al_number {
+            Some(al_number) => {
+                let reporter = TxReporter::new();
+                tracing::debug!(
+                    "SNDCP: -> ISSI {} SN-DATA on advanced link {}, {} bytes",
+                    key.0,
+                    al_number + 1,
+                    npdu.len()
+                );
+                let msg = SapMsgInner::TlaTlDataReqAl(TlDataReqAl {
+                    main_address: ctx.addr,
+                    al_number,
+                    tl_sdu: mle_sdu(&pdu),
+                    tx_reporter: Some(reporter.clone()),
+                });
+                (msg, reporter)
+            }
+            None => {
+                let reporter = TxReporter::new_unacked();
+                tracing::debug!("SNDCP: -> ISSI {} SN-UNITDATA, {} bytes", key.0, npdu.len());
+                let msg = SapMsgInner::TlaTlUnitdataReqBl(TlaTlUnitdataReqBl {
+                    main_address: ctx.addr,
+                    link_id: 0,
+                    endpoint_id: 0,
+                    tl_sdu: mle_sdu(&pdu),
+                    stealing_permission: false,
+                    subscriber_class: 0,
+                    fcs_flag: false,
+                    air_interface_encryption: None,
+                    packet_data_flag: true,
+                    n_tlsdu_repeats: 0,
+                    data_class_info: None,
+                    req_handle: 0,
+                    chan_alloc: None,
+                    tx_reporter: Some(reporter.clone()),
+                });
+                (msg, reporter)
+            }
+        };
         queue.push_back(SapMsg {
             sap: Sap::TlaSap,
             src: TetraEntity::Sndcp,
             dest: TetraEntity::Llc,
-            msg: SapMsgInner::TlaTlUnitdataReqBl(TlaTlUnitdataReqBl {
-                main_address: ctx.addr,
-                link_id: 0,
-                endpoint_id: 0,
-                tl_sdu: mle_sdu(&pdu),
-                stealing_permission: false,
-                subscriber_class: 0,
-                fcs_flag: false,
-                air_interface_encryption: None,
-                packet_data_flag: true,
-                n_tlsdu_repeats: 0,
-                data_class_info: None,
-                req_handle: 0,
-                chan_alloc: None,
-                tx_reporter: Some(reporter.clone()),
-            }),
+            msg,
         });
-        self.inflight = Some(Inflight { reporter, since: clock });
+        self.inflight = Some(Inflight {
+            key,
+            reporter,
+            since: clock,
+        });
         self.last_served = Some(key);
     }
 }
