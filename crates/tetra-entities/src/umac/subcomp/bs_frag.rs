@@ -35,6 +35,11 @@ impl BsFragger {
         }
     }
 
+    /// SSI the PDU is addressed to.
+    pub fn ssi(&self) -> Option<u32> {
+        self.resource.addr.map(|addr| addr.ssi)
+    }
+
     /// Writes MAC-RESOURCE to dest_buf, starting fragmentation if needed.
     /// Then, writes as many SDU bits as possible.
     /// Returns true if the entire SDU was consumed, false if the PDU is fragmented

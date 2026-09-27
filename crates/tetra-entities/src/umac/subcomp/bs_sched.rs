@@ -141,6 +141,10 @@ pub struct BsChannelScheduler {
     /// fragmented MM PDU (e.g. ULocationUpdate when re-entering coverage).
     /// Issuing a real marker fixes that.
     next_usage_marker: [u8; 4],
+
+    /// Packet-data channel per timeslot: the ISSI it is assigned to (`[packet_data] bearer =
+    /// "pdch"`, main carrier ts 2..=4 only). The UMAC sets it from the shared state every tick.
+    pdch: [Option<u32>; 4],
 }
 
 #[derive(Debug)]
@@ -201,6 +205,7 @@ impl BsChannelScheduler {
             mcch_chan_alloc_sent_this_frame: false,
             // Start each timeslot's marker cursor at 4 (first valid value).
             next_usage_marker: [4, 4, 4, 4],
+            pdch: [None; 4],
         }
     }
 
@@ -308,6 +313,72 @@ impl BsChannelScheduler {
             2..=4 => true,
             _ => false,
         }
+    }
+
+    /// Make `ts` (2..=4) the packet-data channel of `owner`, or no packet-data channel. When it
+    /// stops being one radio's PDCH, the signalling still queued there for that radio is dropped:
+    /// the radio goes back to the MCCH on its own when the AACH no longer shows assigned control
+    /// (EN 300 392-2 23.5.6.1.1), and the LLC sends again what it must.
+    pub fn set_pdch(&mut self, ts: u8, owner: Option<u32>) {
+        if !(2..=4).contains(&ts) {
+            return;
+        }
+        let idx = ts as usize - 1;
+        let old = self.pdch[idx];
+        if old == owner {
+            return;
+        }
+        self.pdch[idx] = owner;
+        if let Some(old) = old {
+            let dropped = self.dl_drop_queued_for_ssi(ts, old);
+            tracing::info!(
+                "UMAC: ts {} is no longer the PDCH of ISSI {} ({}; {} queued PDU(s) dropped)",
+                ts,
+                old,
+                if self.circuits.is_active(Direction::Dl, self.carrier_num, ts) {
+                    "taken by a call"
+                } else {
+                    "released"
+                },
+                dropped
+            );
+        }
+        if let Some(issi) = owner {
+            tracing::info!("UMAC: ts {} is the PDCH of ISSI {} (AACH assigned control)", ts, issi);
+        }
+    }
+
+    /// ISSI whose packet-data channel `ts` is.
+    pub fn pdch_owner(&self, ts: u8) -> Option<u32> {
+        (1..=4).contains(&ts).then(|| self.pdch[ts as usize - 1]).flatten()
+    }
+
+    /// Whether `ts` is the packet-data channel of `ssi`.
+    pub fn is_pdch_of(&self, ts: u8, ssi: u32) -> bool {
+        self.pdch_owner(ts) == Some(ssi)
+    }
+
+    /// Drop the resources, fragments, grants and random-access acknowledgements queued on `ts`
+    /// for `ssi` (others stay). Returns how many were dropped.
+    fn dl_drop_queued_for_ssi(&mut self, ts: u8, ssi: u32) -> usize {
+        let queue = &mut self.dltx_queues[ts as usize - 1];
+        let before = queue.len();
+        queue.retain(|elem| {
+            let for_ssi = match elem {
+                DlSchedElem::Resource(pdu, _, _) => pdu.addr.is_some_and(|a| a.ssi == ssi),
+                DlSchedElem::FragBuf(fragger) => fragger.ssi() == Some(ssi),
+                DlSchedElem::Grant(addr, _, _) | DlSchedElem::RandomAccessAck(addr) => addr.ssi == ssi,
+                DlSchedElem::Broadcast(_) | DlSchedElem::Stealing(..) => false,
+            };
+            if for_ssi
+                && let DlSchedElem::Resource(_, _, Some(reporter)) = elem
+                && reporter.get_state() == tetra_core::TxState::Pending
+            {
+                reporter.mark_discarded();
+            }
+            !for_ssi
+        });
+        before - queue.len()
     }
 
     pub fn can_deliver_stealing(&self, ts: u8) -> bool {
@@ -1500,6 +1571,20 @@ impl BsChannelScheduler {
                     bbk: None,
                     ul_phy_chan: ul_phy,
                 }
+            } else if ts.f != 18 && !dl_circuit_active && self.pdch_owner(ts.t).is_some() {
+                // An idle packet-data channel keeps sending SCH/F (a Null PDU) for its radio.
+                TmvUnitdataReqSlot {
+                    carrier_num,
+                    ts,
+                    blk1: Some(TmvUnitdataReq {
+                        logical_channel: LogicalChannel::SchF,
+                        mac_block: self.generate_hangtime_idle_schf(),
+                        scrambling_code: self.scrambling_code,
+                    }),
+                    blk2: None,
+                    bbk: None,
+                    ul_phy_chan: ul_phy,
+                }
             } else if !emit_bcch {
                 TmvUnitdataReqSlot {
                     carrier_num,
@@ -1689,6 +1774,17 @@ impl BsChannelScheduler {
                         aach.f2_af = Some(AccessField {
                             access_code: 0,
                             base_frame_len: 4,
+                        });
+                    } else if dl_traffic_usage.is_none() && ul_traffic_usage.is_none() && self.pdch_owner(ts.t).is_some() {
+                        // Assigned packet-data channel: DL assigned control, UL for the assigned MS
+                        // (Header 2). Never Header 3 with an uplink usage marker >= 4: the MS
+                        // would take the channel as gone (EN 300 392-2 23.5.6.1.1 c).
+                        let ul = &self.ulsched[ts.t as usize - 1][self.ul_ts_to_sched_index(&ts)];
+                        aach.dl_usage = AccessAssignDlUsage::AssignedControl;
+                        aach.ul_usage = AccessAssignUlUsage::AssignedOnly;
+                        aach.f2_af = Some(AccessField {
+                            access_code: 0,
+                            base_frame_len: if ul.ul1.is_some() || ul.ul2.is_some() { 0 } else { 4 },
                         });
                     } else {
                         aach.dl_usage = if let Some(usage) = dl_traffic_usage {
@@ -2432,6 +2528,116 @@ mod tests {
         assert_eq!(sched.dltx_queues[0].len(), 0);
         assert_eq!(sched.dltx_queues[1].len(), 1);
         assert_eq!(sched.dltx_queues[2].len(), 1);
+    }
+
+    /// The next slot `ts` (frames 1..=17) the scheduler finalizes, and its AACH.
+    fn finalize_pdch_test_slot(sched: &mut BsChannelScheduler, ts: u8) -> (TmvUnitdataReqSlot, AccessAssign, u8) {
+        loop {
+            let next = sched.cur_dltime.add_timeslots(1);
+            sched.tick_start(next);
+            let slot = sched.finalize_ts_for_tick();
+            if slot.ts.t != ts || slot.ts.f == 18 {
+                continue;
+            }
+            let mut bbk = slot.bbk.as_ref().expect("bbk").mac_block.clone();
+            let header = bbk.peek_bits(2).expect("AACH header") as u8;
+            let aach = AccessAssign::from_bitbuf(&mut bbk).expect("AACH parses");
+            return (slot, aach, header);
+        }
+    }
+
+    #[test]
+    fn test_pdch_aach_is_assigned_control_and_idle_blocks_are_schf() {
+        let mut sched = get_testing_slotter();
+        sched.set_pdch(4, Some(2260618));
+        assert!(sched.is_pdch_of(4, 2260618) && !sched.is_pdch_of(3, 2260618));
+        let (slot, aach, header) = finalize_pdch_test_slot(&mut sched, 4);
+        assert_eq!(header, 2, "Header 2: downlink usage and an access field");
+        assert_eq!(aach.dl_usage, AccessAssignDlUsage::AssignedControl);
+        assert_eq!(aach.ul_usage, AccessAssignUlUsage::AssignedOnly);
+        assert_eq!(aach.f2_af.map(|af| af.base_frame_len), Some(4));
+        assert_eq!(
+            slot.blk1.as_ref().unwrap().logical_channel,
+            LogicalChannel::SchF,
+            "idle PDCH: SCH/F Null"
+        );
+        assert!(slot.blk2.is_none());
+
+        // Not a PDCH (any more): unallocated, SYNC and SYSINFO as before.
+        sched.set_pdch(4, None);
+        let (slot, aach, _) = finalize_pdch_test_slot(&mut sched, 4);
+        assert_eq!(aach.dl_usage, AccessAssignDlUsage::Unallocated);
+        assert_eq!(slot.blk1.as_ref().unwrap().logical_channel, LogicalChannel::Bsch);
+        // ts1 and the other slots never change.
+        let (_, aach, _) = finalize_pdch_test_slot(&mut sched, 1);
+        assert_eq!(aach.dl_usage, AccessAssignDlUsage::CommonControl);
+        sched.set_pdch(1, Some(2260618));
+        assert_eq!(sched.pdch_owner(1), None, "ts1 is never a PDCH");
+    }
+
+    /// A multi-slot uplink reservation on the PDCH never turns its AACH into Header 3 with a
+    /// traffic usage marker (the MS would leave the channel, EN 300 392-2 23.5.6.1.1 c): the
+    /// reserved slots show "reserved" in the access field instead.
+    #[test]
+    fn test_pdch_uplink_reservation_never_advertises_a_usage_marker() {
+        let mut sched = get_testing_slotter();
+        sched.set_pdch(3, Some(2260618));
+        let addr = TetraAddress::issi(2260618);
+        let (_, marker) = sched
+            .ul_process_cap_req(3, addr, &ReservationRequirement::Req4Slots)
+            .expect("grant");
+        assert!(marker.is_some(), "the grant keeps its usage marker, as on the MCCH");
+        let mut reserved = 0;
+        for _ in 0..8 {
+            let (_, aach, header) = finalize_pdch_test_slot(&mut sched, 3);
+            assert_ne!(header, 3, "never Header 3 on the PDCH");
+            assert_eq!(aach.dl_usage, AccessAssignDlUsage::AssignedControl);
+            if aach.f2_af.map(|af| af.base_frame_len) == Some(0) {
+                reserved += 1;
+            }
+        }
+        // The first reserved slot may already have been built (the MAC works a slot ahead).
+        assert!(
+            (3..=4).contains(&reserved),
+            "the reserved slots are closed to random access: {reserved}"
+        );
+    }
+
+    #[test]
+    fn test_circuit_and_hangtime_win_over_the_pdch() {
+        let mut sched = get_testing_slotter();
+        sched.set_pdch(2, Some(2260618));
+        sched.create_circuit(Direction::Dl, test_circuit(Direction::Dl, 2));
+        sched.create_circuit(Direction::Ul, test_circuit(Direction::Ul, 2));
+        let (slot, aach, _) = finalize_pdch_test_slot(&mut sched, 2);
+        assert_eq!(aach.dl_usage, AccessAssignDlUsage::Traffic(4));
+        assert_eq!(slot.blk1.as_ref().unwrap().logical_channel, LogicalChannel::TchS);
+        sched.set_hangtime(2, true);
+        let (_, aach, header) = finalize_pdch_test_slot(&mut sched, 2);
+        assert_eq!(
+            (header, aach.dl_usage),
+            (2, AccessAssignDlUsage::AssignedControl),
+            "hangtime as without a PDCH"
+        );
+    }
+
+    /// Losing the PDCH drops what was queued on it for its radio, and only that.
+    #[test]
+    fn test_losing_the_pdch_drops_only_its_radios_signalling() {
+        let mut sched = get_testing_slotter();
+        let (mine, other) = (TetraAddress::issi(2260618), TetraAddress::issi(2260619));
+        sched.set_pdch(4, Some(mine.ssi));
+        let reporter = TxReporter::new();
+        let pdu = BsChannelScheduler::dl_make_minimal_resource(&mine, None, false);
+        sched.dl_enqueue_tma_for_link(4, pdu, BitBuffer::from_bitstr("0101"), Some(reporter.clone()));
+        let pdu = BsChannelScheduler::dl_make_minimal_resource(&other, None, false);
+        sched.dl_enqueue_tma_for_link(4, pdu, BitBuffer::from_bitstr("0110"), None);
+        sched.dl_enqueue_random_access_ack(4, mine);
+        assert_eq!(sched.dltx_queues[3].len(), 3);
+        sched.set_pdch(4, None);
+        assert_eq!(reporter.get_state(), tetra_core::TxState::Discarded);
+        assert_eq!(sched.dltx_queues[3].len(), 1);
+        assert!(matches!(&sched.dltx_queues[3][0], DlSchedElem::Resource(pdu, _, _) if pdu.addr == Some(other)));
     }
 
     #[test]

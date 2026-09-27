@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use tetra_config::bluestation::SharedConfig;
+use tetra_config::bluestation::{PacketDataBearer, SharedConfig};
 use tetra_core::freqs::FreqInfo;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Direction, PhyBlockNum, Sap, SsiType, TdmaTime, TetraAddress, Todo, unimplemented_log};
@@ -74,6 +74,8 @@ pub struct UmacBs {
     /// has had a scheduler turn to leave the BS.
     pending_circuit_closes: HashMap<(u16, u8), PendingCircuitClose>,
     telemetry: Option<TelemetrySink>,
+    /// `[packet_data] bearer = "pdch"`: packet-data channels on main-carrier ts 2..=4.
+    pdch_mode: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -96,6 +98,7 @@ impl UmacBs {
         let scrambling_code = scrambler::tetra_scramb_get_init(c.net.mcc, c.net.mnc, c.cell.colour_code);
         let system_wide_services = Self::get_system_wide_services_state(&config);
         let precomps = Self::generate_precomps(&config);
+        let pdch_mode = c.packet_data.enabled && c.packet_data.bearer == PacketDataBearer::Pdch;
         let mut secondary_channel_schedulers = Vec::new();
         if let Some(secondary_carrier) = c.cell.secondary_carrier {
             let mut sched = BsChannelScheduler::new(scrambling_code, precomps.clone());
@@ -119,6 +122,28 @@ impl UmacBs {
             ul_owner_on_air: HashSet::new(),
             pending_circuit_closes: HashMap::new(),
             telemetry,
+            pdch_mode,
+        }
+    }
+
+    /// Packet-data channels from the shared state: a main-carrier slot is one radio's PDCH while
+    /// the SNDCP bearer holds a grant on it and voice has not taken it.
+    fn sync_pdch(&mut self) {
+        let main = self.main_carrier();
+        let mut owners = [None; 4];
+        {
+            let state = self.config.state_read();
+            for (issi, grant) in state.pdch_by_issi.iter() {
+                if grant.slot.carrier_num == main
+                    && (2..=4).contains(&grant.slot.ts)
+                    && state.timeslot_alloc.slot_owner(grant.slot) == Some(tetra_core::TimeslotOwner::PacketData)
+                {
+                    owners[grant.slot.ts as usize - 1] = Some(*issi);
+                }
+            }
+        }
+        for ts in 2..=4u8 {
+            self.channel_scheduler.set_pdch(ts, owners[ts as usize - 1]);
         }
     }
 
@@ -1327,7 +1352,7 @@ impl UmacBs {
     }
 
     /// TMA-SAP MAC-U-BLCK
-    fn rx_ul_mac_u_blck(&self, _queue: &mut MessageQueue, message: &mut SapMsg) {
+    fn rx_ul_mac_u_blck(&mut self, queue: &mut MessageQueue, message: &mut SapMsg) {
         tracing::trace!("rx_ul_mac_u_blck");
 
         // Extract sdu and parse pdu
@@ -1336,7 +1361,7 @@ impl UmacBs {
             return;
         };
 
-        let _pdu = match MacUBlck::from_bitbuf(&mut prim.pdu) {
+        let pdu = match MacUBlck::from_bitbuf(&mut prim.pdu) {
             Ok(pdu) => {
                 tracing::debug!("<- {:?}", pdu);
                 pdu
@@ -1347,6 +1372,14 @@ impl UmacBs {
             }
         };
 
+        if self.pdch_mode {
+            let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago.
+            if prim.carrier_num == self.main_carrier() && self.channel_scheduler.pdch_owner(msg_dltime.t).is_some() {
+                self.rx_ul_mac_u_blck_on_pdch(queue, prim, &pdu, msg_dltime);
+                return;
+            }
+        }
+
         // Handle reservation if present
         // TODO implement slightly different handling since enum is not the same.
         //
@@ -1355,6 +1388,87 @@ impl UmacBs {
         // let a single (even conformant) uplink burst abort the whole single-threaded stack. Log
         // and drop the PDU instead, matching the sibling MAC-FRAG-UL path above.
         unimplemented_log!("rx_ul_mac_u_blck: reservation handling not implemented -- dropping MAC-U-BLCK");
+    }
+
+    /// MAC-U-BLCK on a packet-data channel (EN 300 392-2 21.4.2.5): it comes in a reserved slot or
+    /// by random access of the assigned MS. Its event label would name the MS, but this BS assigns
+    /// none, so the PDU belongs to the slot's reservation, else to the PDCH's radio.
+    fn rx_ul_mac_u_blck_on_pdch(
+        &mut self,
+        queue: &mut MessageQueue,
+        prim: &mut tetra_saps::tmv::TmvUnitdataInd,
+        pdu: &MacUBlck,
+        msg_dltime: TdmaTime,
+    ) {
+        // All-zero and all-one event labels are not for this use (23.4.1.2.3).
+        if pdu.event_label == 0 || pdu.event_label == 0x3ff {
+            tracing::debug!("rx_ul_mac_u_blck: event label {:#x} on the PDCH, ignored", pdu.event_label);
+            return;
+        }
+        let Some(ssi) = self
+            .channel_scheduler
+            .ul_get_slot_owner(msg_dltime, PhyBlockNum::Both)
+            .or_else(|| self.channel_scheduler.pdch_owner(msg_dltime.t))
+        else {
+            return;
+        };
+        let addr = TetraAddress::issi(ssi);
+        // Reservation requirement, with the MAC-U-BLCK meaning of the last two values
+        // (table 21.37): 14 = more than 68 slots, 15 = none.
+        let res_req = match pdu.reservation_req {
+            0..=13 => {
+                tetra_pdus::umac::enums::reservation_requirement::ReservationRequirement::try_from(u64::from(pdu.reservation_req)).ok()
+            }
+            14 => Some(tetra_pdus::umac::enums::reservation_requirement::ReservationRequirement::ReqOver68),
+            _ => None,
+        };
+        if let Some(res_req) = res_req {
+            match self.channel_scheduler.ul_process_cap_req(msg_dltime.t, addr, &res_req) {
+                Some((grant, usage_marker)) => self.channel_scheduler.dl_enqueue_grant(msg_dltime.t, addr, grant, usage_marker),
+                None => tracing::warn!("rx_ul_mac_u_blck: No grant for reservation request {:?}", res_req),
+            }
+        }
+        if pdu.encrypted {
+            unimplemented_log!("rx_ul_mac_u_blck: Encryption mode > 0");
+            return;
+        }
+        let mut pdu_len_bits = prim.pdu.get_len();
+        let num_fill_bits = if pdu.fill_bits {
+            fillbits::removal::get_num_fill_bits(&prim.pdu, pdu_len_bits, false)
+        } else {
+            0
+        };
+        pdu_len_bits -= num_fill_bits;
+        prim.pdu.set_raw_end(prim.pdu.get_raw_start() + pdu_len_bits);
+        if prim.pdu.get_len_remaining() == 0 {
+            return;
+        }
+        let sdu = BitBuffer::from_bitbuffer_pos(&prim.pdu);
+        tracing::debug!(
+            "rx_ul_mac_u_blck: {} bit TM-SDU of ISSI {} on the PDCH ts {}",
+            sdu.get_len(),
+            ssi,
+            msg_dltime.t
+        );
+        queue.push_back(SapMsg {
+            sap: Sap::TmaSap,
+            src: TetraEntity::Umac,
+            dest: TetraEntity::Llc,
+            msg: SapMsgInner::TmaUnitdataInd(TmaUnitdataInd {
+                carrier_num: prim.carrier_num,
+                pdu: Some(sdu),
+                main_address: addr,
+                scrambling_code: prim.scrambling_code,
+                link_id: msg_dltime.t as u32,
+                endpoint_id: 0,
+                new_endpoint_id: None,
+                css_endpoint_id: None,
+                air_interface_encryption: 0,
+                chan_change_response_req: false,
+                chan_change_handle: None,
+                chan_info: None,
+            }),
+        });
     }
 
     fn rx_ul_tma_unitdata_req(&mut self, _queue: &mut MessageQueue, message: SapMsg) {
@@ -1650,7 +1764,11 @@ impl UmacBs {
         // A stealing request that fell back here has no traffic circuit left to follow: the radio
         // is back on the MCCH, so drop the link to the slot it came from.
         let link_id = if chan_alloc_was_stealing_hint { 0 } else { prim.link_id };
-        let is_random_access_response = prim.main_address.ssi_type != SsiType::Gssi && link_id != 0;
+        // On a radio's packet-data channel the scheduler adds the random-access flag itself when
+        // it acknowledges a random access there.
+        let on_its_pdch =
+            self.pdch_mode && u8::try_from(link_id).is_ok_and(|ts| self.channel_scheduler.is_pdch_of(ts, prim.main_address.ssi));
+        let is_random_access_response = prim.main_address.ssi_type != SsiType::Gssi && link_id != 0 && !on_its_pdch;
         let mut pdu = MacResource {
             fill_bits: false,
             pos_of_grant: 0,
@@ -2293,6 +2411,11 @@ impl TetraEntityTrait for UmacBs {
 
         // Feed the health monitor's Congestion domain: current downlink scheduling backlog.
         crate::health::registry().set_dl_queue_depth(self.channel_scheduler.dl_queue_depth());
+
+        // Packet-data channels, before the slot is built (its AACH shows them)
+        if self.pdch_mode {
+            self.sync_pdch();
+        }
 
         // Collect/construct traffic that should be sent down to the LMAC
         // This is basically the _previous_ timeslot
