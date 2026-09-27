@@ -531,11 +531,11 @@ voice_service = true
 # OPTIONAL: SNDCP packet-data bearer to the WAP gateway (FlowStation)
 #
 # PDP context activation (with the CHAP Success DIMETRA radios wait for), an IPv4 address from the
-# pool, READY/STANDBY, and SN-UNITDATA on the common control channel between the radios and the
-# [wap] gateway (its gateway_ipv4 and mtu are the ones announced to the radios). Also set
-# cell_info sndcp_service = true and [wap] enabled = true. Voice always goes first: data waits
-# while a radio is in a call and only one data PDU at a time waits on the control channel.
-# Not in this build yet: the advanced link (SN-DATA) and a packet-data channel.
+# pool, READY/STANDBY, SN-UNITDATA on the basic link and SN-DATA on the advanced link between the
+# radios and the [wap] gateway (its gateway_ipv4 and mtu are the ones announced to the radios).
+# Also set cell_info sndcp_service = true, advanced_link = true and [wap] enabled = true. Voice
+# always goes first: data waits while a radio is in a call and only one data PDU at a time waits
+# on the control channel.
 #
 # [packet_data]
 # enabled = false                                # master on/off for the bearer
