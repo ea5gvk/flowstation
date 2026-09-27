@@ -827,9 +827,10 @@ impl PacketDataRuntime {
         }
     }
 
-    /// Each tick while a packet-data channel exists: the assignment going out puts the radio on
-    /// the channel; an SN-END OF DATA that went out, or an assignment that never did or that the
-    /// radio never acknowledged, ends it. A radio the LLC saw transmitting on the MCCH is off it.
+    /// Each tick with `bearer = "pdch"`: the main-carrier slots in use are noted (see
+    /// `PDCH_QUARANTINE_SLOTS`); the assignment going out puts the radio on its channel; an SN-END
+    /// OF DATA that went out, or an assignment that never did or that the radio never
+    /// acknowledged, ends it. A radio the LLC saw transmitting on the MCCH is off it.
     fn pdch_tick(&mut self, config: &SharedConfig) {
         if self.pdch_cfg.is_none() {
             return;
