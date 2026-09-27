@@ -2804,6 +2804,38 @@ fn voice_takes_the_pdch_and_the_data_goes_on_on_the_mcch() {
     assert_eq!((answer.sn_type(), answer.link_id), (Some(4), 0));
 }
 
+/// Voice first: a radio with a call up in one of its groups gets no PDCH (it would be taken back
+/// within a second); the RESPONSE assigns none. READY ending during the call sends no SN-END OF
+/// DATA (the radio listens to the traffic channel). After the call it gets its PDCH.
+#[test]
+fn a_radio_in_a_call_gets_no_pdch_and_no_end_of_data() {
+    let mut cfg = pdch_config(false);
+    cfg.packet_data.ready_timer_code = 8; // 8 s here
+    let mut air = Air::new(cfg);
+    {
+        let mut state = air.test.config.state_write();
+        state.subscribers.register(ISSI);
+        state.subscribers.affiliate(ISSI, GSSI);
+        state.active_call_ts.insert(GSSI, (MAIN_CARRIER, 2, 4));
+    }
+    air.send(ISSI, &demand(1, None, false));
+    air.next_sn(8).expect("ACCEPT");
+    air.send(ISSI, &transmit_request(1, Some((1, false))));
+    let response = air.next_sn(8).expect("RESPONSE");
+    assert_eq!(
+        decode_data_transmit_response(&response.sn_buf()).unwrap().result,
+        SndcpDataTransmitResponseResult::Accepted
+    );
+    assert!(response.alloc.is_none(), "no PDCH during the call");
+    assert_eq!(pdch_slot_of(&air, ISSI), None);
+    air.run(700);
+    assert!(air.take_sn().is_empty(), "no SN-END OF DATA to a radio in a call");
+    air.test.config.state_write().active_call_ts.clear();
+    air.send(ISSI, &transmit_request(1, None));
+    let response = air.next_sn(8).expect("RESPONSE");
+    assert_eq!(response.alloc.as_ref().map(ts_of), Some(vec![4]), "a PDCH after the call");
+}
+
 // With call control ---------------------------------------------------------------------------
 
 const DATA_RADIO: u32 = 4_000_001;

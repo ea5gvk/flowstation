@@ -631,10 +631,14 @@ impl PacketDataRuntime {
         let issi = ind.received_tetra_address.ssi;
         let (ready_slots, clock) = (self.ready_slots, self.clock);
         let accepted = self.ctxs.contains_key(&(issi, nsapi));
-        let (assignment, channel) = if accepted {
-            self.pdch_for_transfer(config, issi, ind.link_id)
-        } else {
+        // Voice first: a radio in a call (or with a call up in one of its groups) is not sent to a
+        // PDCH, which would be taken back within a second; its data waits on the MCCH.
+        let (assignment, channel) = if !accepted {
             (None, String::new())
+        } else if self.pdch_cfg.is_some() && in_call(&config.state_read(), issi) {
+            (None, "no channel (MCCH, the radio is in a call)".to_string())
+        } else {
+            self.pdch_for_transfer(config, issi, ind.link_id)
         };
         let result = match self.ctxs.get_mut(&(issi, nsapi)) {
             Some(ctx) => {
@@ -1149,22 +1153,31 @@ impl PacketDataRuntime {
                 CtxState::Ready => {
                     ctx.state = CtxState::Standby;
                     ctx.deadline = clock + standby_slots;
-                    ended.push((*key, ctx.addr, ctx.counters));
+                    ended.push((*key, ctx.addr, ctx.counters, call));
                 }
                 CtxState::Standby => released.push((*key, "STANDBY expired")),
             }
         }
         ended.sort_unstable_by_key(|e| e.0);
-        for (key, addr, c) in ended {
+        for (key, addr, c, call) in ended {
+            // A radio in a call is on a traffic channel and would not hear it: STANDBY here only.
             tracing::info!(
-                "SNDCP: READY expired for ISSI {} NSAPI {}: SN-END OF DATA, STANDBY (N-PDU up {} / down {}, {} / {} bytes)",
+                "SNDCP: READY expired for ISSI {} NSAPI {}: {}STANDBY (N-PDU up {} / down {}, {} / {} bytes)",
                 key.0,
                 key.1,
+                if call {
+                    "in a call, no SN-END OF DATA, "
+                } else {
+                    "SN-END OF DATA, "
+                },
                 c.up,
                 c.down,
                 c.up_bytes,
                 c.down_bytes
             );
+            if call {
+                continue;
+            }
             if let Some(msg) = self.end_of_data_msg(config, addr, 0, 0, "READY expired") {
                 queue.push_back(msg);
             }
