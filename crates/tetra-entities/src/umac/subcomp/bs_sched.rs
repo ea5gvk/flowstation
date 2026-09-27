@@ -43,6 +43,13 @@ pub const MACSCHED_NUM_FRAMES: usize = 18;
 /// (EN 300 392-2 cl. 21.5.6); 14 and 15 are reserved codes.
 pub const MAX_GRANTING_DELAY_OPPORTUNITIES: usize = 13;
 
+/// Largest capacity one slot grant hands a radio on its packet-data channel. A larger reservation
+/// requirement is granted in further chunks as the radio uses them: the BS may use more than one
+/// slot grant, and the slots need not be continuous (EN 300 392-2 23.4.2.1.2 NOTE 9). An MXP600
+/// asks for 51 slots at once for a WSP Connect over the advanced link, which no single grant in
+/// the schedule window can hold; Nexus-BS grants such requests 4 slots at a time.
+const PDCH_UL_GRANT_CHUNK_SLOTS: usize = 4;
+
 const NULL_PDU_LEN_BITS: usize = 16;
 
 pub const SCH_HD_CAP: usize = 124;
@@ -148,6 +155,10 @@ pub struct BsChannelScheduler {
     /// Packet-data channel per timeslot: the ISSI it is assigned to (`[packet_data] bearer =
     /// "pdch"`, main carrier ts 2..=4 only). The UMAC sets it from the shared state every tick.
     pdch: [Option<u32>; 4],
+
+    /// Uplink capacity still owed on a packet-data channel after a chunked grant: the radio, the
+    /// slots left and the last slot of the chunk already granted.
+    pdch_ul_debt: [Option<(TetraAddress, usize, TdmaTime)>; 4],
 }
 
 #[derive(Debug)]
@@ -209,6 +220,7 @@ impl BsChannelScheduler {
             // Start each timeslot's marker cursor at 4 (first valid value).
             next_usage_marker: [4, 4, 4, 4],
             pdch: [None; 4],
+            pdch_ul_debt: [None; 4],
         }
     }
 
@@ -332,6 +344,7 @@ impl BsChannelScheduler {
             return;
         }
         self.pdch[idx] = owner;
+        self.pdch_ul_debt[idx] = None;
         if let Some(old) = old {
             let dropped = self.dl_drop_queued_for_ssi(ts, old);
             tracing::info!(
@@ -565,6 +578,12 @@ impl BsChannelScheduler {
     ) -> Option<(BasicSlotgrant, Option<u8>)> {
         let is_halfslot = res_req == &ReservationRequirement::Req1Subslot;
         let requested_cap = if is_halfslot { 1 } else { res_req.to_req_slotcount() };
+        if !is_halfslot && self.is_pdch_of(timeslot, addr.ssi) {
+            // The reservation requirement is the radio's whole estimate (23.5.2.1): it replaces
+            // whatever was still owed from an earlier one.
+            self.pdch_ul_debt[timeslot as usize - 1] = None;
+            return self.ul_grant_pdch_chunk(timeslot, addr, requested_cap);
+        }
 
         // Find a suitable grant opportunity
         let grant_op = self.ul_find_grant_opportunity(timeslot, requested_cap, is_halfslot);
@@ -639,6 +658,77 @@ impl BsChannelScheduler {
                 res_req
             );
             None
+        }
+    }
+
+    /// Grants the radio on its packet-data channel `timeslot` up to `PDCH_UL_GRANT_CHUNK_SLOTS` of
+    /// the `requested` slots, the largest count a basic slot grant can express that fits, and
+    /// notes the rest as owed so `tick_start` grants it once this chunk has gone by.
+    fn ul_grant_pdch_chunk(&mut self, timeslot: u8, addr: TetraAddress, requested: usize) -> Option<(BasicSlotgrant, Option<u8>)> {
+        let wanted = requested.min(PDCH_UL_GRANT_CHUNK_SLOTS);
+        let Some((granted, skips, grant_timestamps)) = (1..=wanted).rev().find_map(|n| {
+            self.ul_find_grant_opportunity(timeslot, n, false)
+                .map(|(skips, slots)| (n, skips, slots))
+        }) else {
+            tracing::warn!(
+                "ul_process_cap_req: no PDCH ts {} slot free for {} ({} wanted)",
+                timeslot,
+                addr,
+                requested
+            );
+            return None;
+        };
+        if skips > MAX_GRANTING_DELAY_OPPORTUNITIES {
+            tracing::warn!(
+                "ul_process_cap_req: PDCH grant for {} would need a granting delay of {} opportunities, deferring",
+                addr,
+                skips
+            );
+            return None;
+        }
+        let usage_marker = (granted >= 2).then(|| self.alloc_usage_marker(timeslot));
+        let last_slot = *grant_timestamps.last().expect("a grant has slots");
+        self.ul_reserve_grant(addr.ssi, grant_timestamps, false, usage_marker);
+        self.pdch_ul_debt[timeslot as usize - 1] = (granted < requested).then_some((addr, requested - granted, last_slot));
+        tracing::debug!(
+            "ul_process_cap_req: PDCH ts {} grants {} {} of {} slot(s), delay {}",
+            timeslot,
+            addr,
+            granted,
+            requested,
+            skips
+        );
+        Some((
+            BasicSlotgrant {
+                capacity_allocation: BasicSlotgrantCapAlloc::from_req_slotcount(granted),
+                granting_delay: if skips == 0 {
+                    BasicSlotgrantGrantingDelay::CapAllocAtNextOpportunity
+                } else {
+                    BasicSlotgrantGrantingDelay::DelayNOpportunities(skips as u8)
+                },
+            },
+            usage_marker,
+        ))
+    }
+
+    /// Grants the next chunk of the capacity still owed on each packet-data channel once the
+    /// radio has had the slots of the previous one.
+    fn ul_grant_pdch_debts(&mut self) {
+        for idx in 0..4 {
+            let Some((addr, remaining, last_slot)) = self.pdch_ul_debt[idx] else {
+                continue;
+            };
+            let ts = idx as u8 + 1;
+            if last_slot.age(self.cur_dltime) < 0 {
+                continue;
+            }
+            self.pdch_ul_debt[idx] = None;
+            if !self.is_pdch_of(ts, addr.ssi) {
+                continue;
+            }
+            if let Some((grant, usage_marker)) = self.ul_grant_pdch_chunk(ts, addr, remaining) {
+                self.dl_enqueue_grant(ts, addr, grant, usage_marker);
+            }
         }
     }
 
@@ -1497,6 +1587,7 @@ impl BsChannelScheduler {
             self.cur_dltime,
             ts
         );
+        self.ul_grant_pdch_debts();
     }
 
     /// Prepares a scheduled FUTURE timeslot for transfer to lmac and transmission
@@ -2662,6 +2753,49 @@ mod tests {
             (3..=4).contains(&reserved),
             "the reserved slots are closed to random access: {reserved}"
         );
+    }
+
+    /// An MXP600 asks for 51 slots at once on its PDCH (a WSP Connect over the advanced link). No
+    /// single grant in the schedule window holds that: grant it 4 slots at a time, the next chunk
+    /// once the radio has had the previous one (EN 300 392-2 23.4.2.1.2 NOTE 9). Off a PDCH the
+    /// request is refused as before.
+    #[test]
+    fn test_pdch_large_reservation_is_granted_in_chunks() {
+        let addr = TetraAddress::issi(2145007);
+        let mut plain = get_testing_slotter();
+        assert!(
+            plain.ul_process_cap_req(4, addr, &ReservationRequirement::Req51Slots).is_none(),
+            "off a PDCH nothing changes"
+        );
+
+        let mut sched = get_testing_slotter();
+        sched.set_pdch(4, Some(addr.ssi));
+        let (grant, marker) = sched
+            .ul_process_cap_req(4, addr, &ReservationRequirement::Req51Slots)
+            .expect("a first chunk");
+        assert_eq!(grant.capacity_allocation, BasicSlotgrantCapAlloc::Grant4Slots);
+        assert!(marker.is_some(), "a multi-slot grant carries its usage marker");
+        assert_eq!(sched.pdch_ul_debt[3].map(|(_, left, _)| left), Some(47));
+
+        // Once the chunk's slots have gone by, the next chunk is granted.
+        for _ in 0..(6 * 4) {
+            let next = sched.cur_dltime.add_timeslots(1);
+            sched.tick_start(next);
+        }
+        assert_eq!(sched.pdch_ul_debt[3].map(|(_, left, _)| left), Some(43));
+
+        // A fresh reservation requirement replaces what was still owed.
+        sched
+            .ul_process_cap_req(4, addr, &ReservationRequirement::Req2Slots)
+            .expect("grant");
+        assert_eq!(sched.pdch_ul_debt[3], None);
+
+        // Leaving the PDCH forgets the debt.
+        sched
+            .ul_process_cap_req(4, addr, &ReservationRequirement::Req51Slots)
+            .expect("grant");
+        sched.set_pdch(4, None);
+        assert_eq!(sched.pdch_ul_debt[3], None);
     }
 
     #[test]
