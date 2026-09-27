@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use tetra_core::TimeslotAllocator;
+use tetra_core::{CarrierSlot, TimeslotAllocator};
 
 /// A one-shot or repeating SDS broadcast message injected at runtime via the dashboard.
 ///
@@ -587,6 +587,19 @@ pub struct StackState {
     /// downlink (incoming-call D-SETUP, SDS) until the MS is awake on its window
     /// (ETSI EN 300 392-2 §16.7). Empty when no MS is in energy economy.
     pub ee_monitoring_windows: std::collections::HashMap<u32, (u8, u8, u8)>,
+
+    /// Packet-data channels of the SNDCP bearer (`[packet_data] bearer = "pdch"`), by ISSI. The
+    /// SNDCP runtime writes it; the UMAC and the LLC use a grant only while the slot's owner is
+    /// still `TimeslotOwner::PacketData` (voice may have taken it). Empty otherwise.
+    pub pdch_by_issi: HashMap<u32, PdchGrant>,
+}
+
+/// One packet-data channel: its slot on the main carrier, and whether the radio was sent there
+/// (the SN-DATA TRANSMIT RESPONSE carrying the assignment went out).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PdchGrant {
+    pub slot: CarrierSlot,
+    pub on_air: bool,
 }
 
 #[cfg(test)]
@@ -756,6 +769,7 @@ impl Default for StackState {
             wap_status: WapRuntimeStatus::default(),
             active_call_ts: std::collections::HashMap::new(),
             ee_monitoring_windows: std::collections::HashMap::new(),
+            pdch_by_issi: HashMap::new(),
         }
     }
 }

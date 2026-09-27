@@ -542,6 +542,9 @@ voice_service = true
 # pool_first = "10.0.0.2"                        # first IPv4 of the dynamic pool (must not hold [wap] gateway_ipv4)
 # pool_last = "10.0.0.254"                       # last IPv4 of the pool (at most 1024 addresses)
 # ready_timer_code = 10                          # READY timer announced: 8 = 10 s, 9 = 20 s, 10 = 30 s, 11 = 60 s
+# bearer = "mcch"                                # "mcch": data on the control channel; "pdch": a 1-slot packet-data channel of the main carrier, which voice takes back
+# pdch_timeslots = [4, 3, 2]                     # main-carrier timeslots a PDCH may take, in order of preference (2..=4)
+# pdch_idle_release_secs = 10                    # a PDCH without data for this long goes back to the pool (1..=300)
 
 ###############################################################################
 

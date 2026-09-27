@@ -7,6 +7,15 @@ use toml::Value;
 /// Largest dynamic address pool (one PDP context per address).
 pub const PACKET_DATA_MAX_POOL: u32 = 1024;
 
+/// Where the radios' packet data goes after an SN-DATA TRANSMIT RESPONSE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PacketDataBearer {
+    /// On the common control channel, no channel assigned (clause 28.3.4.2 NOTE 2).
+    Mcch,
+    /// On a packet-data channel of one timeslot of the main carrier, which voice takes back.
+    Pdch,
+}
+
 /// `[packet_data]`: the SNDCP packet-data bearer (PDP contexts, SN-UNITDATA) that carries the
 /// radios' IPv4 datagrams to the `[wap]` gateway. The gateway address and the MTU announced in
 /// the SN-ACTIVATE PDP CONTEXT ACCEPT come from `[wap]` (`gateway_ipv4`, `mtu`).
@@ -20,6 +29,11 @@ pub struct CfgPacketData {
     /// READY timer announced in the ACCEPT (EN 300 392-2 table 28.112): 8 = 10 s, 9 = 20 s,
     /// 10 = 30 s, 11 = 60 s. The station's own READY timer runs 2 s shorter.
     pub ready_timer_code: u8,
+    pub bearer: PacketDataBearer,
+    /// Main-carrier timeslots a PDCH may take, in order of preference (2..=4).
+    pub pdch_timeslots: Vec<u8>,
+    /// A PDCH without data for this long goes back to the pool (voice takes it earlier if needed).
+    pub pdch_idle_release_secs: u32,
 }
 
 impl Default for CfgPacketData {
@@ -29,6 +43,9 @@ impl Default for CfgPacketData {
             pool_first: Ipv4Addr::new(10, 0, 0, 2),
             pool_last: Ipv4Addr::new(10, 0, 0, 254),
             ready_timer_code: 10,
+            bearer: PacketDataBearer::Mcch,
+            pdch_timeslots: vec![4, 3, 2],
+            pdch_idle_release_secs: 10,
         }
     }
 }
@@ -71,6 +88,12 @@ pub struct CfgPacketDataDto {
     pub pool_last: String,
     #[serde(default = "default_ready_timer_code")]
     pub ready_timer_code: u8,
+    #[serde(default = "default_bearer")]
+    pub bearer: String,
+    #[serde(default = "default_pdch_timeslots")]
+    pub pdch_timeslots: Vec<u8>,
+    #[serde(default = "default_pdch_idle_release_secs")]
+    pub pdch_idle_release_secs: u32,
 
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
@@ -84,6 +107,15 @@ fn default_pool_last() -> String {
 }
 fn default_ready_timer_code() -> u8 {
     CfgPacketData::default().ready_timer_code
+}
+fn default_bearer() -> String {
+    "mcch".to_string()
+}
+fn default_pdch_timeslots() -> Vec<u8> {
+    CfgPacketData::default().pdch_timeslots
+}
+fn default_pdch_idle_release_secs() -> u32 {
+    CfgPacketData::default().pdch_idle_release_secs
 }
 
 fn parse_ipv4(key: &str, s: &str) -> Result<Ipv4Addr, String> {
@@ -105,11 +137,26 @@ pub fn apply_packet_data_patch(dto: CfgPacketDataDto) -> Result<CfgPacketData, S
     if ready_timer_ms(dto.ready_timer_code).is_none() {
         return Err("packet_data: ready_timer_code must be within 1..=14".to_string());
     }
+    let bearer = match dto.bearer.trim().to_ascii_lowercase().as_str() {
+        "mcch" => PacketDataBearer::Mcch,
+        "pdch" => PacketDataBearer::Pdch,
+        other => return Err(format!("packet_data: bearer {other:?} is not \"mcch\" or \"pdch\"")),
+    };
+    let ts = &dto.pdch_timeslots;
+    if ts.is_empty() || ts.iter().any(|t| !(2..=4).contains(t)) || (1..ts.len()).any(|i| ts[..i].contains(&ts[i])) {
+        return Err("packet_data: pdch_timeslots must list main-carrier timeslots 2, 3 or 4, each once".to_string());
+    }
+    if !(1..=300).contains(&dto.pdch_idle_release_secs) {
+        return Err("packet_data: pdch_idle_release_secs must be within 1..=300".to_string());
+    }
     Ok(CfgPacketData {
         enabled: dto.enabled,
         pool_first,
         pool_last,
         ready_timer_code: dto.ready_timer_code,
+        bearer,
+        pdch_timeslots: dto.pdch_timeslots,
+        pdch_idle_release_secs: dto.pdch_idle_release_secs,
     })
 }
 
@@ -146,5 +193,30 @@ mod tests {
         assert!(apply_packet_data_patch(dto("ready_timer_code = 15")).is_err());
         assert_eq!(apply_packet_data_patch(dto("ready_timer_code = 8")).unwrap().ready_timer_code, 8);
         assert_eq!(ready_timer_ms(10), Some(30_000));
+    }
+
+    #[test]
+    fn pdch_keys() {
+        let default = apply_packet_data_patch(dto("")).unwrap();
+        assert_eq!(
+            (default.bearer, default.pdch_timeslots, default.pdch_idle_release_secs),
+            (PacketDataBearer::Mcch, vec![4, 3, 2], 10)
+        );
+        let pdch = apply_packet_data_patch(dto("bearer = \"PDCH\"
+pdch_timeslots = [3]
+pdch_idle_release_secs = 300"))
+        .unwrap();
+        assert_eq!((pdch.bearer, pdch.pdch_timeslots), (PacketDataBearer::Pdch, vec![3]));
+        for bad in [
+            "bearer = \"tch\"",
+            "pdch_timeslots = []",
+            "pdch_timeslots = [1]",
+            "pdch_timeslots = [5]",
+            "pdch_timeslots = [2, 3, 2]",
+            "pdch_idle_release_secs = 0",
+            "pdch_idle_release_secs = 301",
+        ] {
+            assert!(apply_packet_data_patch(dto(bad)).is_err(), "{bad} must be rejected");
+        }
     }
 }

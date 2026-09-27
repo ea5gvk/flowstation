@@ -599,6 +599,9 @@ enabled = true
 pool_first = "10.0.0.2"
 pool_last = "10.0.0.254"
 ready_timer_code = 10
+bearer = "pdch"
+pdch_timeslots = [4, 3, 2]
+pdch_idle_release_secs = 10
 "#;
         let cfg = from_toml_str(toml).unwrap_or_else(|e| panic!("documented optional blocks must parse when uncommented: {e}"));
         assert!(cfg.recovery.enabled);
@@ -631,6 +634,7 @@ ready_timer_code = 10
         assert!(cfg.wap.browse_allowed(2260618));
         assert!(cfg.packet_data.enabled);
         assert_eq!(cfg.packet_data.ready_timer_code, 10);
+        assert_eq!(cfg.packet_data.bearer, crate::bluestation::PacketDataBearer::Pdch);
     }
 
     fn minimal_toml(extra_cell: &str) -> String {
