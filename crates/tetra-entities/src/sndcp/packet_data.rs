@@ -472,9 +472,13 @@ impl PacketDataRuntime {
 
     /// The radio has no context left: the gateway forgets it and its packet-data channel goes.
     fn release_issi(&mut self, issi: u32, wap: Option<&mut WapService>, config: &SharedConfig) {
-        if self.has_ctx(issi) {
-            return;
+        if !self.has_ctx(issi) {
+            self.forget_issi(issi, wap, config);
         }
+    }
+
+    /// `release_issi` for a radio known to have no context left.
+    fn forget_issi(&mut self, issi: u32, wap: Option<&mut WapService>, config: &SharedConfig) {
         self.release_pdch(config, issi, "no PDP context left");
         self.paused.remove(&issi);
         self.awaiting_ack.remove(&issi);
@@ -494,7 +498,11 @@ impl PacketDataRuntime {
             .ctxs
             .iter()
             .any(|(k, c)| k.0 == issi && c.state == CtxState::Ready && !c.in_call);
-        if reachable {
+        self.set_paused(issi, !reachable, wap, now);
+    }
+
+    fn set_paused(&mut self, issi: u32, pause: bool, wap: &mut WapService, now: Instant) {
+        if !pause {
             if self.paused.remove(&issi) {
                 wap.resume_timers(issi, now);
             }
@@ -1248,6 +1256,7 @@ impl PacketDataRuntime {
             }
         }
         released.sort_unstable();
+        let mut gone = Vec::new();
         for (key, why) in released {
             if let Some(ctx) = self.remove_ctx(key) {
                 tracing::info!(
@@ -1258,11 +1267,28 @@ impl PacketDataRuntime {
                     why
                 );
             }
-            self.release_issi(key.0, wap.as_deref_mut(), config);
+            gone.push(key.0);
+        }
+        // One pass over the contexts per step, not one per radio: thousands of contexts must not
+        // cost the stack thread a TDMA slot.
+        if !gone.is_empty() {
+            gone.dedup();
+            let left: HashSet<u32> = self.ctxs.keys().map(|k| k.0).collect();
+            for issi in gone.into_iter().filter(|issi| !left.contains(issi)) {
+                self.forget_issi(issi, wap.as_deref_mut(), config);
+            }
         }
         self.pdch_housekeeping(queue, config, &status, wap.as_deref());
-        for issi in issis {
-            self.sync_pause(issi, wap.as_deref_mut(), now);
+        if let Some(wap) = wap {
+            let mut reachable: HashMap<u32, bool> = HashMap::new();
+            for (k, c) in &self.ctxs {
+                *reachable.entry(k.0).or_default() |= c.state == CtxState::Ready && !c.in_call;
+            }
+            let mut reachable: Vec<(u32, bool)> = reachable.into_iter().collect();
+            reachable.sort_unstable();
+            for (issi, reachable) in reachable {
+                self.set_paused(issi, !reachable, wap, now);
+            }
         }
     }
 
@@ -1657,6 +1683,28 @@ enabled = true
         rt.housekeeping(&mut queue, &config, Some(&mut wap), now);
         assert!(rt.ctxs.is_empty() && rt.by_ip.is_empty() && rt.paused.is_empty());
         assert_eq!(rt.allocate(), Some(Ipv4Addr::new(10, 0, 0, 2)), "address back in the pool");
+    }
+
+    /// Many radios: one housekeeping pauses the gateway for each radio in STANDBY and, once their
+    /// STANDBY ends, forgets them all.
+    #[test]
+    fn housekeeping_of_many_radios() {
+        let config = shared_config();
+        let mut wap = WapService::start(&config).unwrap();
+        let now = Instant::now();
+        let mut rt = PacketDataRuntime::new(&config).expect("[packet_data] enabled");
+        let mut queue = MessageQueue::new();
+        for i in 0..200 {
+            let mut demand = ind("0000000100010010001000000000");
+            demand.received_tetra_address = TetraAddress::issi(ISSI + i);
+            rt.rx(&mut queue, &demand, Some(&mut wap), &config, now);
+        }
+        assert_eq!(rt.ctxs.len(), 200);
+        rt.housekeeping(&mut queue, &config, Some(&mut wap), now);
+        assert_eq!(rt.paused.len(), 200, "all in STANDBY");
+        rt.clock += rt.standby_slots;
+        rt.housekeeping(&mut queue, &config, Some(&mut wap), now);
+        assert!(rt.ctxs.is_empty() && rt.by_ip.is_empty() && rt.paused.is_empty());
     }
 
     /// SN-RECONNECT without data to send (table 28.18): no answer, the context enters STANDBY and
