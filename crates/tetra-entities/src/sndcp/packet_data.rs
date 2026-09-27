@@ -75,6 +75,10 @@ const BL_MAX_DATAGRAM: usize = 320;
 const AL_OVERHEAD: usize = 7;
 /// Bound on PDP contexts (dynamic pool plus static addresses).
 const MAX_CONTEXTS: usize = 2048;
+/// A main-carrier slot freed by a call or by another PDCH shows the AACH unallocated this long
+/// (one multiframe) before it becomes a PDCH: a radio still on it (hangtime, a missed D-RELEASE or
+/// SN-END OF DATA) sees that and leaves (clause 23.5.6.1.1), where assigned control looks alike.
+const PDCH_QUARANTINE_SLOTS: u64 = 72;
 /// Radios remembered for the one-warning-per-radio rule on malformed PDUs.
 const MAX_WARNED: usize = 1024;
 
@@ -189,6 +193,8 @@ pub struct PacketDataRuntime {
     pdch_cfg: Option<PdchConfig>,
     /// Packet-data channels by ISSI.
     pdch: HashMap<u32, Pdch>,
+    /// Last tick each main-carrier timeslot (index) had an owner.
+    slot_busy_at: [Option<u64>; 5],
 }
 
 /// MTU code of the ACCEPT (table 28.79); `[wap] mtu` only takes these values.
@@ -351,6 +357,7 @@ impl PacketDataRuntime {
             ip_identification: 0,
             pdch_cfg,
             pdch: HashMap::new(),
+            slot_busy_at: [None; 5],
         })
     }
 
@@ -693,8 +700,14 @@ impl PacketDataRuntime {
         let Some(pcfg) = &self.pdch_cfg else {
             return (None, "no channel (MCCH)".to_string());
         };
-        let prefs = pcfg.prefs.clone();
         let clock = self.clock;
+        let (prefs, waiting): (Vec<u8>, Vec<u8>) = pcfg.prefs.iter().copied().partition(|ts| {
+            self.slot_busy_at
+                .get(usize::from(*ts))
+                .copied()
+                .flatten()
+                .is_none_or(|t| clock.saturating_sub(t) >= PDCH_QUARANTINE_SLOTS)
+        });
         self.drain_preempted(config);
         if let Some(p) = self.pdch.get_mut(&issi) {
             p.last_activity = clock;
@@ -717,9 +730,10 @@ impl PacketDataRuntime {
         };
         let Some(slot) = slot else {
             tracing::info!(
-                "SNDCP: no main-carrier slot of {:?} free for a PDCH of ISSI {}, data on the MCCH",
+                "SNDCP: no main-carrier slot of {:?} free for a PDCH of ISSI {} ({:?} busy or freed less than a multiframe ago), data on the MCCH",
                 prefs,
-                issi
+                issi,
+                waiting
             );
             return (None, "no channel (MCCH, no PDCH slot free)".to_string());
         };
@@ -809,11 +823,16 @@ impl PacketDataRuntime {
     /// the channel; an SN-END OF DATA that went out, or an assignment that never did or that the
     /// radio never acknowledged, ends it. A radio the LLC saw transmitting on the MCCH is off it.
     fn pdch_tick(&mut self, config: &SharedConfig) {
-        if self.pdch.is_empty() {
+        if self.pdch_cfg.is_none() {
             return;
         }
         let off: Vec<u32> = {
             let state = config.state_read();
+            for ts in 2..=4u8 {
+                if state.timeslot_alloc.owner(ts).is_some() {
+                    self.slot_busy_at[usize::from(ts)] = Some(self.clock);
+                }
+            }
             self.pdch
                 .iter()
                 .filter(|(issi, p)| p.on_air && state.pdch_by_issi.get(issi).is_some_and(|g| !g.on_air))

@@ -2802,6 +2802,38 @@ fn ready_expiry_on_the_pdch_sends_the_radio_back() {
     assert!(air.test.config.state_read().pdch_by_issi.is_empty());
 }
 
+/// A slot a call or another radio's PDCH has just freed waits a multiframe before it becomes a
+/// PDCH, so a radio still on it sees the AACH unallocated and leaves; the next preferred slot is
+/// taken meanwhile.
+#[test]
+fn a_slot_just_freed_waits_before_it_becomes_a_pdch() {
+    let mut air = Air::new(pdch_config(false));
+    air.test
+        .config
+        .state_write()
+        .timeslot_alloc
+        .reserve(TimeslotOwner::Cmce, 4)
+        .unwrap();
+    air.run(4);
+    air.test
+        .config
+        .state_write()
+        .timeslot_alloc
+        .release(TimeslotOwner::Cmce, 4)
+        .unwrap();
+    onto_pdch(&mut air, ISSI);
+    assert_eq!(pdch_slot_of(&air, ISSI), Some(3), "ts4 was a call's until now");
+    air.run(80);
+    onto_pdch(&mut air, ISSI2);
+    assert_eq!(pdch_slot_of(&air, ISSI2), Some(4), "ts4 has waited long enough");
+    air.send_on(ISSI, &end_of_data(), 3);
+    air.next_sn(8).expect("END OF DATA");
+    air.run(2);
+    assert_eq!(pdch_slot_of(&air, ISSI), None);
+    onto_pdch(&mut air, 3_000_001);
+    assert_eq!(pdch_slot_of(&air, 3_000_001), Some(2), "ts3 was a PDCH until now");
+}
+
 /// Without data for `pdch_idle_release_secs` a radio in READY is sent back to the MCCH with
 /// SN-END OF DATA (quit and go) on its PDCH, which goes once that went out (clause 28.2.6.2
 /// NOTE 1); a radio with data going on keeps its PDCH.
