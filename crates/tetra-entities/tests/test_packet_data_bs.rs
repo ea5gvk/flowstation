@@ -7,9 +7,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::Ipv4Addr;
 
 use common::ComponentTest;
-use tetra_config::bluestation::{StackConfig, StackMode};
+use tetra_config::bluestation::{PacketDataBearer, PdchGrant, SharedConfig, StackConfig, StackMode};
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, Sap, SsiType, TdmaTime, TetraAddress, TxReporter, TxState, debug};
+use tetra_core::{BitBuffer, CarrierSlot, Sap, SsiType, TdmaTime, TetraAddress, TimeslotOwner, TxReporter, TxState, debug};
 use tetra_entities::llc::components::fcs;
 use tetra_entities::sndcp::ip::{build_ipv4_udp_npdu, parse_ipv4_packet, parse_udp_datagram};
 use tetra_entities::sndcp::transfer::{
@@ -24,6 +24,9 @@ use tetra_pdus::llc::pdus::al_data::AlData;
 use tetra_pdus::llc::pdus::al_setup::AlSetup;
 use tetra_pdus::llc::pdus::{bl_ack::BlAck, bl_adata::BlAdata, bl_data::BlData, bl_udata::BlUdata};
 use tetra_pdus::mle::enums::mle_protocol_discriminator::MleProtocolDiscriminator;
+use tetra_saps::lcmc::enums::alloc_type::ChanAllocType;
+use tetra_saps::lcmc::enums::ul_dl_assignment::UlDlAssignment;
+use tetra_saps::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
 use tetra_saps::ltpd::LtpdBearer;
 use tetra_saps::sapmsg::{SapMsg, SapMsgInner};
 use tetra_saps::tla::{TlDataIndAl, TlaTlDataIndBl, TlaTlUnitdataIndBl};
@@ -168,6 +171,7 @@ struct Down {
     link_id: u32,
     stealing: bool,
     chan_alloc: bool,
+    alloc: Option<CmceChanAllocReq>,
     /// The SN-PDU (bits after the MLE discriminator) when the TL-SDU is for SNDCP. On the advanced
     /// link, the TL-SDU the radio reassembled (a Down of its own after the segments).
     sn: Option<String>,
@@ -313,6 +317,7 @@ impl Air {
                 link_id: 0,
                 stealing: false,
                 chan_alloc: false,
+                alloc: None,
                 sn,
                 pdu: sdu,
             });
@@ -401,6 +406,34 @@ impl Air {
         }
         self.test.submit_message(tma_ind(issi, llc_pdu, 1));
         self.step();
+    }
+
+    /// Send an uplink LLC PDU from `issi` on timeslot `ts` of the main carrier (downlink slot
+    /// two ahead: tick number = ts + 1 modulo 4).
+    fn uplink_on(&mut self, issi: u32, llc_pdu: BitBuffer, ts: u8) {
+        while self.ticks % 4 != (usize::from(ts) + 1) % 4 {
+            self.step();
+        }
+        self.test.submit_message(tma_ind(issi, llc_pdu, u32::from(ts)));
+        self.step();
+    }
+
+    /// An SN-PDU on the acknowledged basic link on timeslot `ts`.
+    fn send_on(&mut self, issi: u32, sn: &str, ts: u8) {
+        let ns = self.ns.entry(issi).or_insert(0);
+        let mut pdu = BitBuffer::new_autoexpand(64);
+        BlData { has_fcs: false, ns: *ns }.to_bitbuf(&mut pdu);
+        *ns ^= 1;
+        append_bits(&mut pdu, &format!("100{sn}"));
+        self.uplink_on(issi, pdu, ts);
+    }
+
+    /// An SN-PDU on the unacknowledged basic link on timeslot `ts`.
+    fn send_unack_on(&mut self, issi: u32, sn: &str, ts: u8) {
+        let mut pdu = BitBuffer::new_autoexpand(64);
+        BlUdata { has_fcs: false }.to_bitbuf(&mut pdu);
+        append_bits(&mut pdu, &format!("100{sn}"));
+        self.uplink_on(issi, pdu, ts);
     }
 
     /// An SN-PDU on the acknowledged basic link (BL-DATA).
@@ -504,6 +537,7 @@ fn parse_down(req: &TmaUnitdataReq) -> Down {
             link_id: req.link_id,
             stealing: req.stealing_permission,
             chan_alloc: req.chan_alloc.is_some(),
+            alloc: req.chan_alloc.clone(),
             sn: None,
             pdu,
         };
@@ -531,6 +565,7 @@ fn parse_down(req: &TmaUnitdataReq) -> Down {
         link_id: req.link_id,
         stealing: req.stealing_permission,
         chan_alloc: req.chan_alloc.is_some(),
+        alloc: req.chan_alloc.clone(),
         sn,
         pdu: req.pdu.clone(),
     }
@@ -887,9 +922,35 @@ type AirBlock = (usize, u16, u8, Vec<(u32, u8, bool, Option<LlcPduType>)>);
 
 impl MacAir {
     fn new() -> Self {
-        let mut test = ComponentTest::from_config(config(true, false), Some(TdmaTime { h: 0, m: 1, f: 1, t: 1 }));
+        Self::with(config(true, false))
+    }
+
+    fn with(cfg: StackConfig) -> Self {
+        let mut test = ComponentTest::from_config(cfg, Some(TdmaTime { h: 0, m: 1, f: 1, t: 1 }));
         test.populate_entities(vec![TetraEntity::Umac, TetraEntity::Llc], vec![TetraEntity::Lmac, TetraEntity::Mle]);
         Self { test, tick: 0 }
+    }
+
+    /// Main-carrier downlink slots on `ts` (frames 1 to 17) in the next `ticks` ticks.
+    fn run_slots(&mut self, ticks: usize, ts: u8) -> Vec<tetra_saps::tmv::TmvUnitdataReqSlot> {
+        let mut out = Vec::new();
+        for _ in 0..ticks {
+            self.test.run_stack(Some(1));
+            self.tick += 1;
+            for msg in self.test.dump_sinks() {
+                let slots = match msg.msg {
+                    SapMsgInner::TmvUnitdataReq(slot) => vec![slot],
+                    SapMsgInner::TmvUnitdataReqSlots(slots) => slots.slots,
+                    _ => continue,
+                };
+                out.extend(
+                    slots
+                        .into_iter()
+                        .filter(|s| s.carrier_num == MAIN_CARRIER && s.ts.t == ts && s.ts.f != 18),
+                );
+            }
+        }
+        out
     }
 
     fn run(&mut self, ticks: usize) -> Vec<AirBlock> {
@@ -1648,19 +1709,66 @@ struct Voice {
     ticks: usize,
     log: Vec<String>,
     msgs: Vec<SapMsg>,
+    /// The real MAC under the LLC (its downlink blocks go in the log), not a sink.
+    real_umac: bool,
+}
+
+/// The real UMAC, keeping a copy of what it is given.
+struct TapUmac {
+    inner: tetra_entities::umac::umac_bs::UmacBs,
+    seen: Vec<SapMsg>,
+}
+
+impl tetra_entities::TetraEntityTrait for TapUmac {
+    fn entity(&self) -> TetraEntity {
+        TetraEntity::Umac
+    }
+
+    fn rx_prim(&mut self, queue: &mut tetra_entities::MessageQueue, message: SapMsg) {
+        self.seen.push(message.clone());
+        self.inner.rx_prim(queue, message);
+    }
+
+    fn set_config(&mut self, config: SharedConfig) {
+        self.inner.set_config(config);
+    }
+
+    fn tick_start(&mut self, queue: &mut tetra_entities::MessageQueue, ts: TdmaTime) {
+        self.inner.tick_start(queue, ts);
+    }
+
+    fn tick_end(&mut self, queue: &mut tetra_entities::MessageQueue, ts: TdmaTime) -> bool {
+        self.inner.tick_end(queue, ts)
+    }
+}
+
+/// Configuration for the voice scenarios: packet data off, or on with `bearer`.
+fn voice_config(bearer: Option<PacketDataBearer>, secondary: bool) -> StackConfig {
+    let mut cfg = config(bearer.is_some(), bearer.is_some());
+    if let Some(bearer) = bearer {
+        cfg.packet_data.bearer = bearer;
+    }
+    if secondary {
+        cfg.cell.secondary_carrier = Some(SECONDARY_CARRIER);
+    }
+    cfg
 }
 
 impl Voice {
-    fn new(packet_data: bool, secondary: bool) -> Self {
-        let mut cfg = config(packet_data, packet_data);
-        if secondary {
-            cfg.cell.secondary_carrier = Some(SECONDARY_CARRIER);
-        }
+    fn new(cfg: StackConfig, real_umac: bool) -> Self {
         let mut test = ComponentTest::from_config(cfg, Some(TdmaTime::default()));
         test.populate_entities(
             vec![TetraEntity::Llc, TetraEntity::Mle, TetraEntity::Cmce, TetraEntity::Sndcp],
-            vec![TetraEntity::Umac, TetraEntity::Brew],
+            if real_umac {
+                vec![TetraEntity::Lmac, TetraEntity::Brew]
+            } else {
+                vec![TetraEntity::Umac, TetraEntity::Brew]
+            },
         );
+        if real_umac {
+            let inner = tetra_entities::umac::umac_bs::UmacBs::new(test.get_shared_config(), None);
+            test.register_entity(TapUmac { inner, seen: Vec::new() });
+        }
         let (dgna, endpoint) = tetra_entities::net_control::make_control_link();
         let mm = tetra_entities::mm::mm_bs::MmBs::new(test.get_shared_config(), None, Some(endpoint));
         test.register_entity(mm);
@@ -1672,7 +1780,18 @@ impl Voice {
             ticks: 0,
             log: Vec::new(),
             msgs: Vec::new(),
+            real_umac,
         }
+    }
+
+    /// What the UMAC was given since the last call (real MAC only).
+    fn take_tapped(&mut self) -> Vec<SapMsg> {
+        self.test
+            .router
+            .get_entity(TetraEntity::Umac)
+            .and_then(|e| e.as_any_mut().downcast_mut::<TapUmac>())
+            .map(|tap| std::mem::take(&mut tap.seen))
+            .unwrap_or_default()
     }
 
     /// Run `ticks` ticks; the radios behave like the air: every PDU is reported transmitted and
@@ -1689,7 +1808,8 @@ impl Voice {
             }
             self.test.run_stack(Some(1));
             self.ticks += 1;
-            let msgs = self.test.dump_sinks();
+            let mut msgs = self.test.dump_sinks();
+            msgs.extend(self.take_tapped());
             let mut lines: Vec<String> = msgs.iter().map(|m| format!("{m:?}")).collect();
             lines.sort();
             for line in lines {
@@ -1697,7 +1817,9 @@ impl Voice {
             }
             for m in &msgs {
                 let SapMsgInner::TmaUnitdataReq(req) = &m.msg else { continue };
-                if let Some(reporter) = &req.tx_reporter
+                // The real MAC reports its own transmissions.
+                if !self.real_umac
+                    && let Some(reporter) = &req.tx_reporter
                     && reporter.get_state() == TxState::Pending
                 {
                     reporter.mark_transmitted();
@@ -1919,17 +2041,30 @@ fn u_location_update_demand(issi: u32) -> BitBuffer {
     sdu
 }
 
-/// Run `scenario` with the bearer off and on (no data traffic) and require the same output.
+/// Run `scenario` with the bearer off and on, on the MCCH and on a PDCH (no data traffic), and
+/// require the same output; with the PDCH bearer also through the real MAC, down to the blocks
+/// on the air.
 fn same_with_and_without_packet_data(secondary: bool, scenario: impl Fn(&mut Voice)) -> Vec<String> {
-    let mut off = Voice::new(false, secondary);
-    scenario(&mut off);
-    let mut on = Voice::new(true, secondary);
-    scenario(&mut on);
-    assert_eq!(off.log.len(), on.log.len(), "as many messages with [packet_data] on");
-    for (a, b) in off.log.iter().zip(&on.log) {
-        assert_eq!(a, b, "first difference with [packet_data] on");
-    }
-    off.log
+    let run = |bearer: Option<PacketDataBearer>, real_umac: bool| {
+        let mut v = Voice::new(voice_config(bearer, secondary), real_umac);
+        scenario(&mut v);
+        v.log
+    };
+    let same = |off: &[String], on: &[String], what: &str| {
+        assert_eq!(off.len(), on.len(), "as many messages with {what}");
+        for (a, b) in off.iter().zip(on) {
+            assert_eq!(a, b, "first difference with {what}");
+        }
+    };
+    let off = run(None, false);
+    same(&off, &run(Some(PacketDataBearer::Mcch), false), "[packet_data] on the MCCH");
+    same(&off, &run(Some(PacketDataBearer::Pdch), false), "[packet_data] on a PDCH");
+    same(
+        &run(None, true),
+        &run(Some(PacketDataBearer::Pdch), true),
+        "[packet_data] on a PDCH, through the real MAC",
+    );
+    off
 }
 
 fn count(log: &[String], what: &str) -> usize {
@@ -2055,4 +2190,679 @@ fn emergency_call_in_a_full_cell_is_the_same_with_packet_data_on() {
         v.run(20);
     });
     assert!(count(&log, "CallEnded") >= 1, "the emergency call pre-empted one");
+}
+
+// ---------------------------------------------------------------------------------------------
+// bearer = "pdch": a packet-data channel of one main-carrier slot, which voice takes back
+// ---------------------------------------------------------------------------------------------
+
+fn pdch_config(wap: bool) -> StackConfig {
+    let mut cfg = config(true, wap);
+    cfg.packet_data.bearer = PacketDataBearer::Pdch;
+    cfg
+}
+
+/// Give `issi` the packet-data channel on `ts` in the shared state, as the SNDCP runtime does.
+fn grant_pdch(config: &SharedConfig, issi: u32, ts: u8, on_air: bool) -> CarrierSlot {
+    let mut state = config.state_write();
+    let slot = state.timeslot_alloc.reserve_packet_data_slot(&[ts]).expect("slot free");
+    state.pdch_by_issi.insert(issi, PdchGrant { slot, on_air });
+    slot
+}
+
+/// Voice fills main-carrier ts2 and ts3, then takes the packet-data slot (single carrier).
+fn voice_takes_the_pdch(config: &SharedConfig) -> CarrierSlot {
+    let mut state = config.state_write();
+    state.timeslot_alloc.reserve(TimeslotOwner::Cmce, 2).unwrap();
+    state.timeslot_alloc.reserve(TimeslotOwner::Cmce, 3).unwrap();
+    state.timeslot_alloc.allocate_any_slot(TimeslotOwner::Cmce).expect("the PDCH slot")
+}
+
+/// The AACH of a downlink slot: (header, ACCESS-ASSIGN).
+fn aach_of(slot: &tetra_saps::tmv::TmvUnitdataReqSlot) -> (u8, tetra_pdus::umac::pdus::access_assign::AccessAssign) {
+    let mut bbk = slot.bbk.as_ref().expect("AACH").mac_block.clone();
+    bbk.seek(0);
+    let header = bbk.peek_bits(2).unwrap() as u8;
+    (
+        header,
+        tetra_pdus::umac::pdus::access_assign::AccessAssign::from_bitbuf(&mut bbk).unwrap(),
+    )
+}
+
+/// The first MAC-RESOURCE of a slot's first block, if it is one.
+fn first_resource(slot: &tetra_saps::tmv::TmvUnitdataReqSlot) -> Option<tetra_pdus::umac::pdus::mac_resource::MacResource> {
+    let blk = slot.blk1.as_ref()?;
+    let mut b = blk.mac_block.clone();
+    b.seek(0);
+    if b.peek_bits(2) != Some(0) {
+        return None;
+    }
+    tetra_pdus::umac::pdus::mac_resource::MacResource::from_bitbuf(&mut b)
+        .ok()
+        .filter(|r| r.addr.is_some())
+}
+
+fn tl_data_to(addr: TetraAddress, follow_uplink_channel: bool) -> SapMsg {
+    SapMsg {
+        sap: Sap::TlaSap,
+        src: TetraEntity::Mle,
+        dest: TetraEntity::Llc,
+        msg: SapMsgInner::TlaTlDataReqBl(tetra_saps::tla::TlaTlDataReqBl {
+            main_address: addr,
+            link_id: 0,
+            endpoint_id: 0,
+            tl_sdu: BitBuffer::from_bitstr("0101100110011"),
+            stealing_permission: false,
+            subscriber_class: 0,
+            fcs_flag: false,
+            air_interface_encryption: None,
+            stealing_repeats_flag: None,
+            data_class_info: None,
+            req_handle: 0,
+            graceful_degradation: None,
+            chan_alloc: None,
+            follow_uplink_channel,
+            tx_reporter: None,
+        }),
+    }
+}
+
+fn tl_unitdata_to(addr: TetraAddress, octets: usize, reporter: Option<TxReporter>) -> SapMsg {
+    SapMsg {
+        sap: Sap::TlaSap,
+        src: TetraEntity::Sndcp,
+        dest: TetraEntity::Llc,
+        msg: SapMsgInner::TlaTlUnitdataReqBl(tetra_saps::tla::TlaTlUnitdataReqBl {
+            main_address: addr,
+            link_id: 0,
+            endpoint_id: 0,
+            tl_sdu: BitBuffer::from_bytes(&vec![0x5a; octets]),
+            stealing_permission: false,
+            subscriber_class: 0,
+            fcs_flag: false,
+            air_interface_encryption: None,
+            packet_data_flag: true,
+            n_tlsdu_repeats: 0,
+            data_class_info: None,
+            req_handle: 0,
+            chan_alloc: None,
+            tx_reporter: reporter,
+        }),
+    }
+}
+
+fn ts_of(alloc: &CmceChanAllocReq) -> Vec<u8> {
+    (1..=4u8).filter(|ts| alloc.timeslots[*ts as usize - 1]).collect()
+}
+
+// The MAC -------------------------------------------------------------------------------------
+
+/// A PDCH grant turns the slot into an assigned control channel for its radio: AACH assigned
+/// control / assigned only, SCH/F Null while idle, the radio's PDUs there without the random
+/// access flag; without the grant the slot is unallocated again.
+#[test]
+fn a_pdch_grant_makes_the_slot_an_assigned_channel() {
+    debug::setup_logging_verbose();
+    let mut mac = MacAir::with(pdch_config(false));
+    let before = mac.run_slots(8, 4);
+    assert!(
+        before
+            .iter()
+            .all(|s| aach_of(s).1.dl_usage == tetra_pdus::umac::enums::access_assign_dl_usage::AccessAssignDlUsage::Unallocated)
+    );
+    let slot = grant_pdch(&mac.test.config, ISSI, 4, true);
+    let idle = mac.run_slots(8, 4);
+    assert!(!idle.is_empty());
+    for s in &idle[1..] {
+        let (header, aach) = aach_of(s);
+        assert_eq!(header, 2);
+        assert_eq!(
+            (aach.dl_usage, aach.ul_usage),
+            (
+                tetra_pdus::umac::enums::access_assign_dl_usage::AccessAssignDlUsage::AssignedControl,
+                tetra_pdus::umac::enums::access_assign_ul_usage::AccessAssignUlUsage::AssignedOnly
+            )
+        );
+        assert_eq!(
+            s.blk1.as_ref().unwrap().logical_channel,
+            tetra_saps::tmv::enums::logical_chans::LogicalChannel::SchF
+        );
+    }
+    mac.test.submit_message(tl_data_to(TetraAddress::issi(ISSI), false));
+    let with_pdu = mac.run_slots(12, 4);
+    let res = with_pdu.iter().find_map(first_resource).expect("the TL-DATA on the PDCH");
+    assert_eq!(res.addr.unwrap().ssi, ISSI);
+    assert!(!res.random_access_flag, "not a random access answer");
+    // Released: back to an unallocated slot with SYNC.
+    {
+        let mut state = mac.test.config.state_write();
+        state.pdch_by_issi.remove(&ISSI);
+        state.timeslot_alloc.release_slot(TimeslotOwner::PacketData, slot).unwrap();
+    }
+    let after = mac.run_slots(8, 4);
+    let last = after.last().unwrap();
+    assert_eq!(
+        aach_of(last).1.dl_usage,
+        tetra_pdus::umac::enums::access_assign_dl_usage::AccessAssignDlUsage::Unallocated
+    );
+    assert_eq!(
+        last.blk1.as_ref().unwrap().logical_channel,
+        tetra_saps::tmv::enums::logical_chans::LogicalChannel::Bsch
+    );
+}
+
+fn mac_u_blck(event_label: u16, reservation_req: u8) -> SapMsg {
+    let mut pdu = BitBuffer::new(268);
+    tetra_pdus::umac::pdus::mac_u_blck::MacUBlck {
+        fill_bits: true,
+        encrypted: false,
+        event_label,
+        reservation_req,
+    }
+    .to_bitbuf(&mut pdu);
+    pdu.write_bits(0b1010_1100, 8);
+    pdu.write_bits(1, 1); // fill bits: a one, then zeros
+    pdu.seek(0);
+    SapMsg {
+        sap: Sap::TmvSap,
+        src: TetraEntity::Lmac,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmvUnitdataInd(tetra_saps::tmv::TmvUnitdataInd {
+            carrier_num: MAIN_CARRIER,
+            pdu,
+            block_num: tetra_core::PhyBlockNum::Both,
+            logical_channel: tetra_saps::tmv::enums::logical_chans::LogicalChannel::SchF,
+            crc_pass: true,
+            scrambling_code: 0,
+            rssi_dbfs: f32::NEG_INFINITY,
+        }),
+    }
+}
+
+/// MAC-U-BLCK on ts4 received in the tick whose downlink slot is ts2: what reaches the LLC and
+/// the downlink slots of ts4 afterwards.
+fn mac_u_blck_on_ts4(cfg: StackConfig, grant: bool, reservation_req: u8) -> (Vec<SapMsg>, Vec<tetra_saps::tmv::TmvUnitdataReqSlot>) {
+    let mut test = ComponentTest::from_config(cfg, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Llc, TetraEntity::Lmac]);
+    if grant {
+        grant_pdch(&test.config, ISSI, 4, true);
+    }
+    test.run_stack(Some(1));
+    test.dump_sinks();
+    test.submit_message(mac_u_blck(5, reservation_req));
+    let mut up = Vec::new();
+    let mut ts4 = Vec::new();
+    for _ in 0..16 {
+        test.run_stack(Some(1));
+        for msg in test.dump_sinks() {
+            match msg.msg {
+                SapMsgInner::TmaUnitdataInd(_) => up.push(msg),
+                SapMsgInner::TmvUnitdataReqSlots(slots) => ts4.extend(slots.slots.into_iter().filter(|s| s.ts.t == 4)),
+                _ => {}
+            }
+        }
+    }
+    (up, ts4)
+}
+
+/// MAC-U-BLCK on the PDCH belongs to its radio (this BS assigns no event labels): the TM-SDU
+/// reaches the LLC with the timeslot, and a reservation is granted on the PDCH. Anywhere else, or
+/// with the bearer on the MCCH, it is dropped as before.
+#[test]
+fn mac_u_blck_on_the_pdch_reaches_the_llc() {
+    debug::setup_logging_verbose();
+    let (up, _) = mac_u_blck_on_ts4(pdch_config(false), true, 15);
+    assert_eq!(up.len(), 1, "{up:?}");
+    let SapMsgInner::TmaUnitdataInd(ind) = &up[0].msg else {
+        unreachable!()
+    };
+    assert_eq!((ind.main_address.ssi, ind.link_id), (ISSI, 4));
+    assert_eq!(ind.pdu.as_ref().unwrap().to_bitstr(), "10101100");
+
+    let (up, ts4) = mac_u_blck_on_ts4(pdch_config(false), true, 2);
+    assert_eq!(up.len(), 1);
+    let grant = ts4
+        .iter()
+        .filter_map(first_resource)
+        .find(|r| r.addr.is_some_and(|a| a.ssi == ISSI))
+        .expect("an answer on the PDCH");
+    assert!(grant.slot_granting_element.is_some(), "the reservation granted on the PDCH");
+
+    let (up, _) = mac_u_blck_on_ts4(pdch_config(false), false, 15);
+    assert!(up.is_empty(), "not a PDCH: dropped");
+    let (up, _) = mac_u_blck_on_ts4(config(true, false), true, 15);
+    assert!(up.is_empty(), "bearer on the MCCH: dropped as before");
+}
+
+/// Voice takes the PDCH slot: the next block of that slot is the call's (AACH traffic), and what
+/// was still queued there for the data radio is dropped; its next PDU goes on the MCCH.
+#[test]
+fn voice_taking_the_pdch_slot_shows_traffic_and_drops_its_data() {
+    use tetra_core::Direction;
+    use tetra_saps::control::call_control::{CallControl, Circuit, CircuitDlMediaSource};
+    use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
+    debug::setup_logging_verbose();
+    let mut mac = MacAir::with(pdch_config(false));
+    grant_pdch(&mac.test.config, ISSI, 4, true);
+    mac.run_slots(4, 4);
+    let reporter = TxReporter::new_unacked();
+    mac.test
+        .submit_message(tl_unitdata_to(TetraAddress::issi(ISSI), 120, Some(reporter.clone())));
+    let first = mac.run_slots(8, 4);
+    assert!(
+        first
+            .iter()
+            .filter_map(first_resource)
+            .any(|r| r.addr.is_some_and(|a| a.ssi == ISSI))
+    );
+    assert_eq!(reporter.get_state(), TxState::Pending, "more fragments to go");
+
+    let slot = voice_takes_the_pdch(&mac.test.config);
+    assert_eq!(slot.ts, 4);
+    mac.test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Cmce,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::CmceCallControl(CallControl::Open(Circuit {
+            direction: Direction::Both,
+            carrier_num: MAIN_CARRIER,
+            ts: 4,
+            peer_carrier_num: None,
+            peer_ts: None,
+            usage: 6,
+            circuit_mode: CircuitModeType::TchS,
+            speech_service: Some(0),
+            etee_encrypted: false,
+            dl_media_source: CircuitDlMediaSource::SwMI,
+        })),
+    });
+    let after = mac.run_slots(8, 4);
+    assert_eq!(reporter.get_state(), TxState::Discarded);
+    for s in &after[1..] {
+        assert_eq!(
+            aach_of(s).1.dl_usage,
+            tetra_pdus::umac::enums::access_assign_dl_usage::AccessAssignDlUsage::Traffic(6)
+        );
+        assert_eq!(
+            s.blk1.as_ref().unwrap().logical_channel,
+            tetra_saps::tmv::enums::logical_chans::LogicalChannel::TchS
+        );
+    }
+    mac.test.submit_message(tl_data_to(TetraAddress::issi(ISSI), false));
+    let blocks = mac.run(12);
+    let mine: Vec<_> = blocks.iter().filter(|b| b.3.iter().any(|r| r.0 == ISSI)).collect();
+    assert!(
+        !mine.is_empty() && mine.iter().all(|b| (b.1, b.2) == (MAIN_CARRIER, 1)),
+        "back on the MCCH: {mine:?}"
+    );
+}
+
+/// The advanced link of a radio on its PDCH (the MXP600's path): every
+/// segment goes on the PDCH, whole in one block each.
+#[test]
+fn the_advanced_link_of_a_radio_on_its_pdch_runs_there() {
+    debug::setup_logging_verbose();
+    let mut mac = MacAir::with(pdch_config(false));
+    grant_pdch(&mac.test.config, ISSI, 4, true);
+    let reporter = mac.transfer(300);
+    let blocks = mac.run(4 * 20);
+    let segments = al_segments_on_air(&blocks);
+    assert_eq!(segments.len(), 13, "{segments:?}");
+    for (carrier, ts, length_ind) in &segments {
+        assert_eq!((*carrier, *ts), (MAIN_CARRIER, 4), "on the PDCH");
+        assert_ne!(*length_ind, 0b111111, "never fragmented by the MAC");
+    }
+    assert_eq!(reporter.get_state(), TxState::Transmitted);
+}
+
+// The LLC -------------------------------------------------------------------------------------
+
+/// A radio on its PDCH gets its PDUs there (acknowledged and unacknowledged basic link, MM
+/// following the uplink, the BL-ACK of an uplink on the PDCH), never stolen; groups, radios
+/// without a PDCH and a PDCH voice took go the way they always went.
+#[test]
+fn pdus_for_a_radio_on_its_pdch_go_on_that_slot() {
+    debug::setup_logging_verbose();
+    let mut air = Air::new(pdch_config(false));
+    grant_pdch(&air.test.config, ISSI, 4, true);
+    let down_to = |air: &mut Air, issi: u32| -> Down {
+        air.run(3);
+        let i = air.down.iter().position(|d| d.issi == issi).expect("a PDU went down");
+        air.down.remove(i)
+    };
+    for follow in [false, true] {
+        air.test.submit_message(tl_data_to(TetraAddress::issi(ISSI), follow));
+        let d = down_to(&mut air, ISSI);
+        assert_eq!((d.link_id, d.stealing, d.chan_alloc), (4, false, false), "TL-DATA follow={follow}");
+    }
+    // MM follows the uplink to a traffic slot, but a radio on its PDCH is on its PDCH.
+    let mut udata = BitBuffer::new_autoexpand(32);
+    BlUdata { has_fcs: false }.to_bitbuf(&mut udata);
+    append_bits(&mut udata, "0101010101");
+    air.uplink_on(ISSI, udata, 3);
+    air.test.submit_message(tl_data_to(TetraAddress::issi(ISSI), true));
+    assert_eq!(down_to(&mut air, ISSI).link_id, 4);
+
+    air.test.submit_message(tl_unitdata_to(TetraAddress::issi(ISSI), 10, None));
+    let d = down_to(&mut air, ISSI);
+    assert_eq!((d.llc, d.link_id, d.stealing), (LlcPduType::BlUdata, 4, false));
+
+    // A BL-DATA from the radio on its PDCH is acknowledged there.
+    air.down.clear();
+    let mut data = BitBuffer::new_autoexpand(32);
+    BlData { has_fcs: false, ns: 0 }.to_bitbuf(&mut data);
+    append_bits(&mut data, "0101010101");
+    air.uplink_on(ISSI, data, 4);
+    air.run(2);
+    let ack = air
+        .down
+        .iter()
+        .find(|d| d.issi == ISSI && d.llc == LlcPduType::BlAck)
+        .expect("BL-ACK");
+    assert_eq!((ack.link_id, ack.stealing, ack.chan_alloc), (4, false, false));
+
+    // A group and a radio without a PDCH: MCCH.
+    air.test.submit_message(tl_data_to(TetraAddress::new(GSSI, SsiType::Gssi), false));
+    assert_eq!(down_to(&mut air, GSSI).link_id, 0);
+    air.test.submit_message(tl_data_to(TetraAddress::issi(ISSI2), false));
+    assert_eq!(down_to(&mut air, ISSI2).link_id, 0);
+
+    // Voice took the slot: MCCH again.
+    voice_takes_the_pdch(&air.test.config);
+    air.down.clear();
+    air.test.submit_message(tl_data_to(TetraAddress::issi(ISSI), false));
+    let d = down_to(&mut air, ISSI);
+    assert_eq!((d.link_id, d.stealing), (0, false));
+}
+
+// The SNDCP runtime ---------------------------------------------------------------------------
+
+/// PDP context and TRANSMIT REQUEST: the RESPONSE assigns the PDCH (sent on the MCCH), which the
+/// radio is on once it went out. Returns the radio's address.
+fn onto_pdch(air: &mut Air, issi: u32) -> Ipv4Addr {
+    air.send(issi, &demand(1, None, false));
+    let ip = accept_ip(&air.next_sn(8).expect("ACCEPT"));
+    air.send(issi, &transmit_request(1, Some((1, false))));
+    let response = air.next_sn(8).expect("RESPONSE");
+    assert_eq!(
+        decode_data_transmit_response(&response.sn_buf()).unwrap().result,
+        SndcpDataTransmitResponseResult::Accepted
+    );
+    assert!(response.alloc.is_some(), "PDCH assigned");
+    air.run(2);
+    assert!(air.test.config.state_read().pdch_by_issi.get(&issi).is_some_and(|g| g.on_air));
+    air.take_sn();
+    ip
+}
+
+fn pdch_slot_of(air: &Air, issi: u32) -> Option<u8> {
+    air.test.config.state_read().pdch_by_issi.get(&issi).map(|g| g.slot.ts)
+}
+
+/// The MXP600's TRANSMIT REQUEST (one slot, or four) gets one PDCH slot of the main carrier,
+/// both directions, replacing the MCCH; the radio's datagrams and the answers then go on it.
+#[test]
+fn transmit_request_assigns_a_pdch_and_the_data_goes_on_it() {
+    debug::setup_logging_verbose();
+    for slots in [Some((1, false)), Some((4, true)), None] {
+        let mut air = Air::new(pdch_config(true));
+        air.send(ISSI, &demand(1, None, true));
+        let ip = accept_ip(&air.next_sn(8).unwrap());
+        air.send(ISSI, &transmit_request(1, slots));
+        let response = air.next_sn(8).unwrap();
+        assert_eq!(
+            decode_data_transmit_response(&response.sn_buf()).unwrap().result,
+            SndcpDataTransmitResponseResult::Accepted
+        );
+        assert_eq!(response.link_id, 0, "sent on the MCCH, where the radio still is");
+        let alloc = response.alloc.clone().expect("PDCH assignment");
+        assert_eq!(
+            (alloc.alloc_type, alloc.ul_dl_assigned, ts_of(&alloc), alloc.carrier, alloc.usage),
+            (ChanAllocType::Replace, UlDlAssignment::Both, vec![4], Some(MAIN_CARRIER), None),
+            "{slots:?}"
+        );
+        {
+            let state = air.test.config.state_read();
+            let grant = state.pdch_by_issi[&ISSI];
+            assert_eq!(
+                grant.slot,
+                CarrierSlot {
+                    carrier_num: MAIN_CARRIER,
+                    ts: 4
+                }
+            );
+            assert_eq!(state.timeslot_alloc.slot_owner(grant.slot), Some(TimeslotOwner::PacketData));
+        }
+        air.run(2);
+        assert!(air.test.config.state_read().pdch_by_issi[&ISSI].on_air);
+        air.take_sn();
+        air.send_unack_on(ISSI, &unitdata(1, &datagram(ip, GATEWAY, 9201, &wtp_get(0x51, "/status.wml"))), 4);
+        let answer = air.next_sn(300).expect("the answer");
+        assert_eq!((answer.sn_type(), answer.link_id, answer.stealing), (Some(4), 4, false));
+        wtp_down(&answer, ip);
+    }
+}
+
+/// With its preferred slots busy the PDCH takes the next one; with none free the data stays on
+/// the MCCH (RESPONSE accepted, no assignment).
+#[test]
+fn pdch_takes_the_next_preferred_slot_or_the_data_stays_on_the_mcch() {
+    let mut air = Air::new(pdch_config(false));
+    air.test
+        .config
+        .state_write()
+        .timeslot_alloc
+        .reserve(TimeslotOwner::Cmce, 4)
+        .unwrap();
+    for (issi, expected) in [(ISSI, Some(3)), (ISSI2, Some(2)), (3_000_001, None)] {
+        air.send(issi, &demand(1, None, false));
+        air.next_sn(8).unwrap();
+        air.send(issi, &transmit_request(1, Some((1, false))));
+        let response = air.next_sn(8).unwrap();
+        assert_eq!(
+            decode_data_transmit_response(&response.sn_buf()).unwrap().result,
+            SndcpDataTransmitResponseResult::Accepted
+        );
+        assert_eq!(response.alloc.as_ref().map(|a| ts_of(a)[0]), expected, "ISSI {issi}");
+        assert_eq!(pdch_slot_of(&air, issi), expected);
+    }
+}
+
+/// SN-END OF DATA from the radio on its PDCH: answered there with "quit and go" back to the
+/// MCCH, and the slot is free once that went out.
+#[test]
+fn end_of_data_sends_the_radio_back_and_frees_the_slot() {
+    debug::setup_logging_verbose();
+    let mut air = Air::new(pdch_config(false));
+    onto_pdch(&mut air, ISSI);
+    air.send_on(ISSI, &end_of_data(), 4);
+    let eod = air.next_sn(8).expect("END OF DATA");
+    assert_eq!((eod.sn_type(), eod.link_id), (Some(8), 4));
+    let alloc = eod.alloc.clone().expect("back to the MCCH");
+    assert_eq!((alloc.alloc_type, ts_of(&alloc)), (ChanAllocType::QuitAndGo, vec![]));
+    air.run(2);
+    let state = air.test.config.state_read();
+    assert!(state.pdch_by_issi.is_empty());
+    assert_eq!(state.timeslot_alloc.owner(4), None, "slot free");
+}
+
+/// READY expiring on the PDCH ends it the same way.
+#[test]
+fn ready_expiry_on_the_pdch_sends_the_radio_back() {
+    let mut cfg = pdch_config(false);
+    cfg.packet_data.ready_timer_code = 8; // 8 s here, before the 10 s idle release
+    let mut air = Air::new(cfg);
+    onto_pdch(&mut air, ISSI);
+    air.run(540);
+    assert!(air.take_sn().is_empty());
+    let eod = air.next_sn(120).expect("END OF DATA at READY expiry");
+    assert_eq!((eod.sn_type(), eod.link_id), (Some(8), 4));
+    assert_eq!(eod.alloc.map(|a| a.alloc_type), Some(ChanAllocType::QuitAndGo));
+    air.run(2);
+    assert!(air.test.config.state_read().pdch_by_issi.is_empty());
+}
+
+/// Without data for `pdch_idle_release_secs` the PDCH goes back without any signalling (the AACH
+/// tells the radio); a radio with data going on keeps its PDCH.
+#[test]
+fn an_idle_pdch_is_released_without_signalling() {
+    let mut cfg = pdch_config(true);
+    cfg.packet_data.ready_timer_code = 11; // 60 s: READY stays out of the way
+    cfg.packet_data.pdch_idle_release_secs = 2;
+    let mut air = Air::new(cfg);
+    onto_pdch(&mut air, ISSI);
+    let ip2 = onto_pdch(&mut air, ISSI2);
+    assert_eq!((pdch_slot_of(&air, ISSI), pdch_slot_of(&air, ISSI2)), (Some(4), Some(3)));
+    for i in 0..5u16 {
+        air.send_unack_on(
+            ISSI2,
+            &unitdata(1, &datagram(ip2, GATEWAY, 9201, &wtp_get(0x60 + i, "/status.wml"))),
+            3,
+        );
+        air.run(60);
+    }
+    let sent: Vec<Down> = air.take_sn().into_iter().filter(|d| d.issi == ISSI).collect();
+    assert!(sent.is_empty(), "no signalling to the idle radio: {sent:?}");
+    assert_eq!(pdch_slot_of(&air, ISSI), None, "idle PDCH released");
+    assert_eq!(air.test.config.state_read().timeslot_alloc.owner(4), None);
+    assert_eq!(pdch_slot_of(&air, ISSI2), Some(3), "the busy one is kept");
+}
+
+/// Back on the MCCH (anything from it on ts1), the radio gets its PDCH assigned again with the
+/// next TRANSMIT REQUEST; on its PDCH, a TRANSMIT REQUEST is answered there without one.
+#[test]
+fn a_radio_back_on_the_mcch_is_assigned_its_pdch_again() {
+    let mut air = Air::new(pdch_config(false));
+    onto_pdch(&mut air, ISSI);
+    air.send(ISSI, &transmit_request(1, None));
+    let again = air.next_sn(8).unwrap();
+    assert_eq!(again.link_id, 0, "on the MCCH");
+    assert_eq!(again.alloc.as_ref().map(ts_of), Some(vec![4]), "assigned again");
+    air.run(2);
+    assert!(air.test.config.state_read().pdch_by_issi[&ISSI].on_air);
+    air.send_on(ISSI, &transmit_request(1, None), 4);
+    let there = air.next_sn(8).unwrap();
+    assert_eq!((there.link_id, there.chan_alloc), (4, false), "on its PDCH, no new assignment");
+    // SN-RECONNECT from the MCCH (after a call, say) is answered like a TRANSMIT REQUEST.
+    let reconnect = encode_reconnect(&SndcpReconnect {
+        nsapi: Some(1),
+        resource_request: SndcpPacketDataResourceRequest::None,
+    })
+    .unwrap()
+    .to_bitstr();
+    air.send(ISSI, &reconnect);
+    let response = air.next_sn(8).unwrap();
+    assert_eq!(
+        decode_data_transmit_response(&response.sn_buf()).unwrap().result,
+        SndcpDataTransmitResponseResult::Accepted
+    );
+    assert_eq!((response.link_id, response.alloc.as_ref().map(ts_of)), (0, Some(vec![4])));
+}
+
+/// Voice takes the PDCH slot: the grant goes within a second and the radio's data goes on on
+/// the MCCH.
+#[test]
+fn voice_takes_the_pdch_and_the_data_goes_on_on_the_mcch() {
+    debug::setup_logging_verbose();
+    let mut air = Air::new(pdch_config(true));
+    let ip = onto_pdch(&mut air, ISSI);
+    voice_takes_the_pdch(&air.test.config);
+    air.run(80);
+    assert!(air.test.config.state_read().pdch_by_issi.is_empty());
+    air.send_unack(ISSI, &unitdata(1, &datagram(ip, GATEWAY, 9201, &wtp_get(0x70, "/status.wml"))));
+    let answer = air.next_sn(300).expect("answer");
+    assert_eq!((answer.sn_type(), answer.link_id), (Some(4), 0));
+}
+
+// With call control ---------------------------------------------------------------------------
+
+const DATA_RADIO: u32 = 4_000_001;
+
+/// The data radio's PDP context and PDCH through the whole stack.
+fn voice_onto_pdch(v: &mut Voice) {
+    v.uplink(
+        DATA_RADIO,
+        MleProtocolDiscriminator::Sndcp,
+        BitBuffer::from_bitstr(&demand(1, None, false)),
+    );
+    v.run(8);
+    v.uplink(
+        DATA_RADIO,
+        MleProtocolDiscriminator::Sndcp,
+        BitBuffer::from_bitstr(&transmit_request(1, Some((1, false)))),
+    );
+    v.run(8);
+    let grant = v.test.config.state_read().pdch_by_issi.get(&DATA_RADIO).copied();
+    assert!(grant.is_some_and(|g| g.on_air && g.slot.ts == 4), "{grant:?}");
+}
+
+/// Group calls from three radios to three groups; returns the circuits opened (carrier, ts).
+fn three_group_calls(v: &mut Voice, emergency_last: bool) -> Vec<(u16, u8)> {
+    use tetra_saps::control::call_control::CallControl;
+    for (i, g) in [101u32, 102, 103].into_iter().enumerate() {
+        v.register(2_000_001 + i as u32, Some(g));
+    }
+    for (i, g) in [101u32, 102, 103].into_iter().enumerate() {
+        let priority = if emergency_last && i == 2 { 15 } else { 0 };
+        v.cmce(3_000_001 + i as u32, u_setup(g, true, false, priority));
+        v.run(4);
+    }
+    v.run(80);
+    v.msgs
+        .iter()
+        .filter_map(|m| match &m.msg {
+            SapMsgInner::CmceCallControl(CallControl::Open(c)) => Some((c.carrier_num, c.ts)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A group call in a full cell takes the PDCH slot: no call is cut, the radio loses its PDCH
+/// (its data goes on on the MCCH), and the group's D-SETUP goes on the MCCH as always.
+#[test]
+fn a_group_call_in_a_full_cell_takes_the_pdch() {
+    debug::setup_logging_verbose();
+    let mut v = Voice::new(voice_config(Some(PacketDataBearer::Pdch), false), false);
+    voice_onto_pdch(&mut v);
+    let opens = three_group_calls(&mut v, false);
+    assert_eq!(opens, vec![(MAIN_CARRIER, 2), (MAIN_CARRIER, 3), (MAIN_CARRIER, 4)]);
+    assert_eq!(count(&v.log, "CallEnded"), 0, "no call cut");
+    let state = v.test.config.state_read();
+    assert!(state.pdch_by_issi.is_empty(), "the PDCH went to the call");
+    assert_eq!(state.timeslot_alloc.owner(4), Some(TimeslotOwner::Cmce));
+    drop(state);
+    let d_setup_103 = v
+        .msgs
+        .iter()
+        .filter_map(|m| match &m.msg {
+            SapMsgInner::TmaUnitdataReq(req) if req.main_address.ssi == 103 => Some(req.link_id),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !d_setup_103.is_empty() && d_setup_103.iter().all(|l| *l == 0),
+        "group signalling on the MCCH"
+    );
+}
+
+/// With two carriers voice fills the secondary before touching the PDCH.
+#[test]
+fn with_two_carriers_voice_uses_the_secondary_before_the_pdch() {
+    let mut v = Voice::new(voice_config(Some(PacketDataBearer::Pdch), true), false);
+    voice_onto_pdch(&mut v);
+    let opens = three_group_calls(&mut v, false);
+    assert_eq!(opens, vec![(MAIN_CARRIER, 2), (MAIN_CARRIER, 3), (SECONDARY_CARRIER, 1)]);
+    let grant = v.test.config.state_read().pdch_by_issi.get(&DATA_RADIO).copied();
+    assert!(grant.is_some_and(|g| g.on_air && g.slot.ts == 4), "PDCH untouched");
+}
+
+/// An emergency call in a cell whose last slot is the PDCH takes the PDCH, not a call.
+#[test]
+fn an_emergency_call_takes_the_pdch_before_cutting_a_call() {
+    let mut v = Voice::new(voice_config(Some(PacketDataBearer::Pdch), false), false);
+    voice_onto_pdch(&mut v);
+    let opens = three_group_calls(&mut v, true);
+    assert_eq!(opens.last(), Some(&(MAIN_CARRIER, 4)));
+    assert_eq!(count(&v.log, "CallEnded"), 0, "no call pre-empted");
+    assert!(v.test.config.state_read().pdch_by_issi.is_empty());
 }
