@@ -96,6 +96,9 @@ impl MleBs {
             SapMsgInner::TlaTlUnitdataIndBl(_) => {
                 self.rx_tla_unitdata_ind_bl(queue, message);
             }
+            SapMsgInner::TlaTlDataIndAl(_) => {
+                self.rx_tla_data_ind_al(queue, message);
+            }
             _ => {
                 tracing::error!("BUG: unexpected message or state -- routing error");
                 return;
@@ -128,6 +131,43 @@ impl MleBs {
             chan_change_resp_req: false,
             chan_change_handle: None,
             bearer: LtpdBearer::BasicUnack,
+        };
+        queue.push_back(SapMsg {
+            sap: Sap::TlpdSap,
+            src: TetraEntity::Mle,
+            dest: TetraEntity::Sndcp,
+            msg: SapMsgInner::LtpdMleUnitdataInd(m),
+        });
+    }
+
+    /// TL-DATA on an advanced link (the LLC has one only with `[packet_data]` on): SNDCP data for
+    /// the packet-data runtime; any other protocol is ignored.
+    fn rx_tla_data_ind_al(&mut self, queue: &mut MessageQueue, message: SapMsg) {
+        let SapMsgInner::TlaTlDataIndAl(prim) = message.msg else {
+            tracing::error!("BUG: unexpected message or state -- routing error");
+            return;
+        };
+        let mut sdu = prim.tl_sdu;
+        sdu.seek(0);
+        if sdu.read_bits(3) != Some(MleProtocolDiscriminator::Sndcp.into_raw()) {
+            tracing::warn!(
+                "MLE: TL-DATA on advanced link {} of ISSI {} is not for SNDCP, ignoring",
+                prim.al_number + 1,
+                prim.main_address.ssi
+            );
+            return;
+        }
+        let m = LtpdMleUnitdataInd {
+            sdu,
+            endpoint_id: 0,
+            link_id: prim.link_id,
+            received_tetra_address: prim.main_address,
+            chan_change_resp_req: false,
+            chan_change_handle: None,
+            bearer: LtpdBearer::Advanced {
+                al_number: prim.al_number,
+                max_sdu_bytes: prim.max_sdu_bytes,
+            },
         };
         queue.push_back(SapMsg {
             sap: Sap::TlpdSap,

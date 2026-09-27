@@ -64,6 +64,8 @@ pub enum SapMsgInner {
     // TLA-SAP
     TlaTlDataIndBl(TlaTlDataIndBl),
     TlaTlDataReqBl(TlaTlDataReqBl),
+    TlaTlDataIndAl(TlDataIndAl),
+    TlaTlDataReqAl(TlDataReqAl),
     TlaTlReportInd(TlaTlReportInd),
     TlaTlUnitdataIndBl(TlaTlUnitdataIndBl),
     TlaTlUnitdataReqBl(TlaTlUnitdataReqBl),
@@ -193,6 +195,8 @@ impl Display for SapMsgInner {
             SapMsgInner::TlmcConfigureReq(_) => write!(f, "TlmcConfigureReq"),
             SapMsgInner::TlaTlDataIndBl(_) => write!(f, "TlaTlDataIndBl"),
             SapMsgInner::TlaTlDataReqBl(_) => write!(f, "TlaTlDataReqBl"),
+            SapMsgInner::TlaTlDataIndAl(_) => write!(f, "TlaTlDataIndAl"),
+            SapMsgInner::TlaTlDataReqAl(_) => write!(f, "TlaTlDataReqAl"),
             SapMsgInner::TlaTlReportInd(_) => write!(f, "TlaTlReportInd"),
             SapMsgInner::TlaTlUnitdataIndBl(_) => write!(f, "TlaTlUnitdataIndBl"),
             SapMsgInner::TlaTlUnitdataReqBl(_) => write!(f, "TlaTlUnitdataReqBl"),

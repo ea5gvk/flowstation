@@ -223,6 +223,9 @@ pub enum LtpdBearer {
     BasicAck,
     /// Unacknowledged basic link (TL-UNITDATA).
     BasicUnack,
+    /// Acknowledged advanced link `al_number` (0..3 = link 1..4) with a negotiated N.271 of
+    /// `max_sdu_bytes` octets, FCS included.
+    Advanced { al_number: u8, max_sdu_bytes: u16 },
 }
 
 #[derive(Debug, Clone)]

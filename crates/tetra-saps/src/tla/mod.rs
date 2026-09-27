@@ -81,11 +81,34 @@ pub struct TlConnectConf {
     setup_report: Todo,
 }
 
-/// advanced link only
+/// Clause 20.3.5.1.4, advanced link only
+/// TL-DATA request on an acknowledged advanced link (original advanced link, BS stack): the LLC
+/// adds the FCS, segments the TL-SDU and sends it on the MCCH.
 #[derive(Debug, Clone)]
-pub struct TlDataReqAl;
+pub struct TlDataReqAl {
+    pub main_address: TetraAddress,
+    /// Over-air advanced link number: 0..3 means advanced link 1..4.
+    pub al_number: u8,
+    pub tl_sdu: BitBuffer,
+    /// Transmitted once every segment went out, then Acknowledged or Lost as the peer answers;
+    /// Discarded when the LLC cannot take the TL-SDU (no such link, longer than N.271).
+    pub tx_reporter: Option<TxReporter>,
+}
+/// Clause 20.3.5.1.4, advanced link only
+/// TL-DATA indication of a TL-SDU received complete and correct (FCS stripped) on an
+/// acknowledged advanced link.
 #[derive(Debug, Clone)]
-pub struct TlDataIndAl;
+pub struct TlDataIndAl {
+    pub main_address: TetraAddress,
+    /// Over-air advanced link number: 0..3 means advanced link 1..4.
+    pub al_number: u8,
+    /// Negotiated N.271: the longest TL-SDU the link carries, FCS (4 octets) included.
+    pub max_sdu_bytes: u16,
+    /// Timeslot the last segment came in on.
+    pub link_id: LinkId,
+    pub carrier_num: u16,
+    pub tl_sdu: BitBuffer,
+}
 #[derive(Debug, Clone)]
 pub struct TlDataConfAl;
 

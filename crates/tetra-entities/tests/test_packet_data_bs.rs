@@ -22,7 +22,7 @@ use tetra_pdus::llc::pdus::{bl_ack::BlAck, bl_adata::BlAdata, bl_data::BlData, b
 use tetra_pdus::mle::enums::mle_protocol_discriminator::MleProtocolDiscriminator;
 use tetra_saps::ltpd::LtpdBearer;
 use tetra_saps::sapmsg::{SapMsg, SapMsgInner};
-use tetra_saps::tla::{TlaTlDataIndBl, TlaTlUnitdataIndBl};
+use tetra_saps::tla::{TlDataIndAl, TlaTlDataIndBl, TlaTlUnitdataIndBl};
 use tetra_saps::tma::{TmaUnitdataInd, TmaUnitdataReq};
 
 const MAIN_CARRIER: u16 = 1521;
@@ -499,6 +499,54 @@ fn tl_data_for_sndcp_is_basic_ack() {
             panic!("LTPD indication expected");
         };
         assert_eq!((ind.bearer, ind.link_id), (LtpdBearer::BasicAck, 1));
+    }
+}
+
+fn tl_data_al_ind(pd: MleProtocolDiscriminator) -> SapMsg {
+    let mut sdu = BitBuffer::new(11);
+    sdu.write_bits(pd.into_raw(), 3);
+    sdu.write_bits(0b1010_1100, 8);
+    sdu.seek(0);
+    SapMsg {
+        sap: Sap::TlaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Mle,
+        msg: SapMsgInner::TlaTlDataIndAl(TlDataIndAl {
+            main_address: TetraAddress::new(ISSI, SsiType::Issi),
+            al_number: 0,
+            max_sdu_bytes: 2048,
+            link_id: 1,
+            carrier_num: MAIN_CARRIER,
+            tl_sdu: sdu,
+        }),
+    }
+}
+
+#[test]
+fn tl_data_on_an_advanced_link_reaches_sndcp_as_advanced() {
+    let out = through_mle(true, tl_data_al_ind(MleProtocolDiscriminator::Sndcp));
+    assert_eq!(out.len(), 1);
+    assert_eq!((out[0].sap, out[0].dest), (Sap::TlpdSap, TetraEntity::Sndcp));
+    let SapMsgInner::LtpdMleUnitdataInd(ind) = &out[0].msg else {
+        panic!("LTPD indication expected");
+    };
+    assert_eq!(
+        (ind.bearer, ind.link_id),
+        (
+            LtpdBearer::Advanced {
+                al_number: 0,
+                max_sdu_bytes: 2048
+            },
+            1
+        )
+    );
+    assert_eq!(ind.sdu.peek_bits(8), Some(0b1010_1100), "cursor after the MLE discriminator");
+}
+
+#[test]
+fn tl_data_on_an_advanced_link_for_cmce_or_mm_is_dropped() {
+    for pd in [MleProtocolDiscriminator::Cmce, MleProtocolDiscriminator::Mm] {
+        assert!(through_mle(true, tl_data_al_ind(pd)).is_empty(), "{pd:?}");
     }
 }
 
