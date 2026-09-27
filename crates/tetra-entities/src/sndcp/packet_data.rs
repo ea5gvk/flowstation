@@ -7,7 +7,8 @@
 //!
 //! Voice first: nothing goes down to a radio while it is in a call (its gateway timers wait), and
 //! at most one data PDU of the whole runtime waits in the MAC for the MCCH, so a call set-up waits
-//! behind one data PDU at most.
+//! behind one data PDU at most. An SN-DATA out of the MAC and not acknowledged yet holds back only
+//! its own radio's next datagram.
 //!
 //! With `bearer = "pdch"` the SN-DATA TRANSMIT RESPONSE assigns the radio a packet-data channel
 //! (PDCH): one timeslot of the main carrier (`pdch_timeslots`), held in the timeslot allocator as
@@ -174,6 +175,9 @@ pub struct PacketDataRuntime {
     next_housekeeping: u64,
     /// The data PDU waiting in the MAC for the MCCH.
     inflight: Option<Inflight>,
+    /// SN-DATA that left the MAC, waiting for the radio's acknowledgement on its advanced link, by
+    /// ISSI: only that radio's next datagram waits for it.
+    awaiting_ack: HashMap<u32, Inflight>,
     last_served: Option<(u32, u8)>,
     /// ISSIs whose gateway retransmission timers are paused.
     paused: HashSet<u32>,
@@ -338,6 +342,7 @@ impl PacketDataRuntime {
             clock: 0,
             next_housekeeping: HOUSEKEEPING_SLOTS,
             inflight: None,
+            awaiting_ack: HashMap::new(),
             last_served: None,
             paused: HashSet::new(),
             warned: HashSet::new(),
@@ -463,6 +468,7 @@ impl PacketDataRuntime {
         }
         self.release_pdch(config, issi, "no PDP context left");
         self.paused.remove(&issi);
+        self.awaiting_ack.remove(&issi);
         if let Some(wap) = wap {
             wap.peer_lost(issi);
         }
@@ -1269,7 +1275,7 @@ impl PacketDataRuntime {
         let mut keys: Vec<(u32, u8)> = self
             .ctxs
             .iter()
-            .filter(|(_, c)| c.state == CtxState::Ready && !c.in_call && !c.dl.is_empty())
+            .filter(|(k, c)| c.state == CtxState::Ready && !c.in_call && !c.dl.is_empty() && !self.awaiting_ack.contains_key(&k.0))
             .map(|(k, _)| *k)
             .collect();
         keys.sort_unstable();
@@ -1277,23 +1283,55 @@ impl PacketDataRuntime {
         keys.iter().find(|k| after.is_none_or(|last| **k > last)).or(keys.first()).copied()
     }
 
+    /// An SN-DATA the radio acknowledged restarts READY (clause 28.2.6.2).
+    fn on_final(&mut self, inflight: &Inflight) {
+        if inflight.reporter.get_state() == TxState::Acknowledged
+            && let Some(ctx) = self.ctxs.get_mut(&inflight.key)
+            && ctx.state == CtxState::Ready
+        {
+            ctx.deadline = self.clock + self.ready_slots;
+        }
+    }
+
     fn deliver(&mut self, queue: &mut MessageQueue, config: &SharedConfig, wap: Option<&mut WapService>, now: Instant) {
-        if let Some(inflight) = &self.inflight {
-            // Final: sent (basic link), or acknowledged, lost or discarded (advanced link).
-            let done = inflight.reporter.is_in_final_state();
-            if !done && self.clock - inflight.since < INFLIGHT_GUARD_SLOTS {
+        // SN-DATA waiting for the radio's acknowledgement: acknowledged, lost or discarded now, or
+        // not reported on for too long.
+        if !self.awaiting_ack.is_empty() {
+            let clock = self.clock;
+            let mut done: Vec<u32> = self
+                .awaiting_ack
+                .iter()
+                .filter(|(_, a)| a.reporter.is_in_final_state() || clock - a.since >= INFLIGHT_GUARD_SLOTS)
+                .map(|(issi, _)| *issi)
+                .collect();
+            done.sort_unstable();
+            for issi in done {
+                if let Some(a) = self.awaiting_ack.remove(&issi) {
+                    if !a.reporter.is_in_final_state() {
+                        tracing::debug!(
+                            "SNDCP: no acknowledgement report on the SN-DATA to ISSI {}, not waiting any longer",
+                            issi
+                        );
+                    }
+                    self.on_final(&a);
+                }
+            }
+        }
+        if let Some(inflight) = self.inflight.take() {
+            // Out of the MAC: sent (basic link), all segments sent, acknowledged, lost or discarded
+            // (advanced link). The acknowledgement of an SN-DATA is then awaited for its radio only.
+            let state = inflight.reporter.get_state();
+            if state == TxState::Pending && self.clock - inflight.since < INFLIGHT_GUARD_SLOTS {
+                self.inflight = Some(inflight);
                 return;
             }
-            if !done {
-                tracing::debug!("SNDCP: no final report on the last data PDU, not waiting for it any longer");
-            } else if inflight.reporter.get_state() == TxState::Acknowledged
-                && let Some(ctx) = self.ctxs.get_mut(&inflight.key)
-                && ctx.state == CtxState::Ready
-            {
-                // READY restarts when the peer confirms an SN-DATA (clause 28.2.6.2).
-                ctx.deadline = self.clock + self.ready_slots;
+            if state == TxState::Pending {
+                tracing::debug!("SNDCP: no report on the last data PDU, not waiting for it any longer");
+            } else if !inflight.reporter.is_in_final_state() {
+                self.awaiting_ack.insert(inflight.key.0, inflight);
+            } else {
+                self.on_final(&inflight);
             }
-            self.inflight = None;
         }
         let Some(key) = self.next_to_serve() else { return };
         // Voice first, on the live call map: a radio that has just gone into a call gets nothing.

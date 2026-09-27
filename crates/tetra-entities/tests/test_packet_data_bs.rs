@@ -207,6 +207,8 @@ struct Air {
     al_rx: HashMap<(u32, u8), (BTreeMap<u8, BitBuffer>, Option<u8>)>,
     al_up: Vec<(u32, BitBuffer, usize)>,
     al_answer: bool,
+    /// Radios that do not answer acknowledgement requests (the others do, when `al_answer`).
+    al_silent: Vec<u32>,
     al_segments: Vec<(u32, AlData, usize)>,
 }
 
@@ -229,6 +231,7 @@ impl Air {
             al_rx: HashMap::new(),
             al_up: Vec::new(),
             al_answer: true,
+            al_silent: Vec::new(),
             al_segments: Vec::new(),
         }
     }
@@ -292,7 +295,7 @@ impl Air {
         if h.final_segment {
             entry.1 = Some(h.ss);
         }
-        if !h.acknowledgement_requested || !self.al_answer {
+        if !h.acknowledgement_requested || !self.al_answer || self.al_silent.contains(&issi) {
             return;
         }
         let complete = entry.1.is_some_and(|f| (0..=f).all(|ss| entry.0.contains_key(&ss)));
@@ -1688,6 +1691,37 @@ fn an_unacknowledged_sn_data_holds_the_next_until_the_llc_gives_up() {
         air.down.iter().any(|d| d.llc == LlcPduType::AlDisc),
         "the LLC closed the link after N.273"
     );
+}
+
+/// A radio that does not acknowledge its SN-DATA holds back only its own datagrams: the answer to
+/// another radio goes down while the station still waits for the first one's acknowledgement.
+#[test]
+fn an_unacknowledged_sn_data_does_not_hold_other_radios() {
+    let mut air = Air::new(config(true, true));
+    let ip = attach_al(&mut air, ISSI);
+    let ip2 = attach_al(&mut air, ISSI2);
+    air.al_silent.push(ISSI);
+    air.send_al(ISSI, &sn_data(1, &datagram(ip, GATEWAY, 9201, &wtp_get(0x42, "/"))));
+    air.run(60);
+    assert!(air.al_segments.iter().any(|s| s.0 == ISSI), "the first radio's answer is under way");
+    air.send_al(ISSI2, &sn_data(1, &datagram(ip2, GATEWAY, 9201, &wtp_get(0x43, "/status.wml"))));
+    let mut answered = false;
+    for _ in 0..400 {
+        air.step();
+        assert!(
+            !air.down.iter().any(|d| d.issi == ISSI && d.llc == LlcPduType::AlDisc),
+            "the second radio waited until the LLC gave up on the first"
+        );
+        if air
+            .down
+            .iter()
+            .any(|d| d.issi == ISSI2 && d.llc == LlcPduType::AlDataAlFinal && d.sn.is_some())
+        {
+            answered = true;
+            break;
+        }
+    }
+    assert!(answered, "the second radio got its answer");
 }
 
 // ---------------------------------------------------------------------------------------------
