@@ -359,14 +359,15 @@ impl BsChannelScheduler {
     }
 
     /// Drop the resources, fragments, grants and random-access acknowledgements queued on `ts`
-    /// for `ssi` (others stay). Returns how many were dropped.
+    /// for `ssi`, and the group PDUs copied there for it (others stay). Returns how many were
+    /// dropped.
     fn dl_drop_queued_for_ssi(&mut self, ts: u8, ssi: u32) -> usize {
         let queue = &mut self.dltx_queues[ts as usize - 1];
         let before = queue.len();
         queue.retain(|elem| {
             let for_ssi = match elem {
-                DlSchedElem::Resource(pdu, _, _) => pdu.addr.is_some_and(|a| a.ssi == ssi),
-                DlSchedElem::FragBuf(fragger) => fragger.ssi() == Some(ssi),
+                DlSchedElem::Resource(pdu, _, _) => pdu.addr.is_some_and(|a| a.ssi == ssi || a.ssi_type == SsiType::Gssi),
+                DlSchedElem::FragBuf(fragger) => fragger.ssi() == Some(ssi) || fragger.is_for_group(),
                 DlSchedElem::Grant(addr, _, _) | DlSchedElem::RandomAccessAck(addr) => addr.ssi == ssi,
                 DlSchedElem::Broadcast(_) | DlSchedElem::Stealing(..) => false,
             };
@@ -759,6 +760,15 @@ impl BsChannelScheduler {
             tracing::warn!("identify_timeslots_for_ssi: MAC-RESOURCE has no address, dropping");
             return [0, 0, 0, 0];
         };
+
+        // `bearer = "pdch"`: group signalling copied to a member's packet-data channel goes there.
+        if addr.ssi_type == SsiType::Gssi
+            && let Ok(ts) = u8::try_from(link_id)
+            && self.pdch_owner(ts).is_some()
+            && !self.circuits.is_active(Direction::Dl, self.carrier_num, ts)
+        {
+            return [ts, 0, 0, 0];
+        }
 
         if addr.ssi_type == SsiType::Gssi || link_id == 0 {
             if self.allow_mcch() {
@@ -2619,6 +2629,26 @@ mod tests {
             (2, AccessAssignDlUsage::AssignedControl),
             "hangtime as without a PDCH"
         );
+    }
+
+    /// Group signalling the LLC copies to a member's PDCH goes on that slot, and only while it is
+    /// a PDCH; losing the PDCH drops the copies still queued there.
+    #[test]
+    fn test_group_pdus_copied_to_a_pdch_go_there() {
+        let mut sched = get_testing_slotter();
+        let group = TetraAddress {
+            ssi_type: SsiType::Gssi,
+            ssi: 91,
+        };
+        let pdu = BsChannelScheduler::dl_make_minimal_resource(&group, None, false);
+        sched.dl_enqueue_tma_for_link(4, pdu, BitBuffer::new(0), None);
+        assert_eq!((sched.dltx_queues[0].len(), sched.dltx_queues[3].len()), (1, 0), "no PDCH: MCCH");
+        sched.set_pdch(4, Some(2260618));
+        let pdu = BsChannelScheduler::dl_make_minimal_resource(&group, None, false);
+        sched.dl_enqueue_tma_for_link(4, pdu, BitBuffer::new(0), None);
+        assert_eq!((sched.dltx_queues[0].len(), sched.dltx_queues[3].len()), (1, 1), "on the PDCH");
+        sched.set_pdch(4, None);
+        assert!(sched.dltx_queues[3].is_empty(), "dropped with the PDCH");
     }
 
     /// Losing the PDCH drops what was queued on it for its radio, and only that.

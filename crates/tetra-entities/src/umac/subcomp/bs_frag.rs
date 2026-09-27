@@ -1,6 +1,6 @@
 use std::cmp::min;
 
-use tetra_core::{BitBuffer, TxReporter};
+use tetra_core::{BitBuffer, SsiType, TxReporter};
 
 use tetra_pdus::umac::pdus::{mac_end_dl::MacEndDl, mac_frag_dl::MacFragDl, mac_resource::MacResource};
 
@@ -38,6 +38,11 @@ impl BsFragger {
     /// SSI the PDU is addressed to.
     pub fn ssi(&self) -> Option<u32> {
         self.resource.addr.map(|addr| addr.ssi)
+    }
+
+    /// Whether the PDU is addressed to a group.
+    pub fn is_for_group(&self) -> bool {
+        self.resource.addr.is_some_and(|addr| addr.ssi_type == SsiType::Gssi)
     }
 
     /// Writes MAC-RESOURCE to dest_buf, starting fragmentation if needed.

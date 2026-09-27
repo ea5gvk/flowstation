@@ -3046,6 +3046,34 @@ fn a_group_call_in_a_full_cell_takes_the_pdch() {
     );
 }
 
+/// A member of a group on its PDCH listens there, not to the MCCH: the group's D-SETUP goes on the
+/// MCCH and on that PDCH, so it joins the call at once; the PDCH then goes within a second.
+#[test]
+fn a_group_call_set_up_reaches_a_member_on_its_pdch() {
+    debug::setup_logging_verbose();
+    let mut v = Voice::new(voice_config(Some(PacketDataBearer::Pdch), false), false);
+    v.register(DATA_RADIO, Some(GSSI));
+    voice_onto_pdch(&mut v);
+    v.register(ISSI, Some(GSSI));
+    v.msgs.clear();
+    v.cmce(ISSI, u_setup(GSSI, true, false, 0));
+    v.run(10);
+    let links: Vec<u32> = v
+        .msgs
+        .iter()
+        .filter_map(|m| match &m.msg {
+            SapMsgInner::TmaUnitdataReq(req) if req.main_address.ssi == GSSI => Some(req.link_id),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        links.contains(&0) && links.contains(&4),
+        "the group's D-SETUP on the MCCH and on the member's PDCH: {links:?}"
+    );
+    v.run(80);
+    assert!(v.test.config.state_read().pdch_by_issi.is_empty(), "the PDCH goes for the call");
+}
+
 /// With two carriers voice fills the secondary before touching the PDCH.
 #[test]
 fn with_two_carriers_voice_uses_the_secondary_before_the_pdch() {

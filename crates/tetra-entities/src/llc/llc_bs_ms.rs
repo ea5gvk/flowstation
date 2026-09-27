@@ -167,6 +167,48 @@ impl Llc {
             .collect()
     }
 
+    /// `bearer = "pdch"`: a group PDU (not stolen) goes also on the packet-data channel of each
+    /// member on one, which listens there and not to the MCCH: it hears its group's call set-up
+    /// or SDS at once. The copies carry no report.
+    fn group_copies_for_pdchs(&self, msg: &SapMsg) -> Vec<SapMsg> {
+        let SapMsgInner::TmaUnitdataReq(req) = &msg.msg else {
+            return Vec::new();
+        };
+        if !self.pdch_mode || req.stealing_permission || req.main_address.ssi_type != SsiType::Gssi {
+            return Vec::new();
+        }
+        let gssi = req.main_address.ssi;
+        let mut members: Vec<(u32, u8)> = {
+            let state = self.config.state_read();
+            state
+                .pdch_by_issi
+                .iter()
+                .filter(|(issi, g)| {
+                    g.on_air
+                        && state.timeslot_alloc.slot_owner(g.slot) == Some(tetra_core::TimeslotOwner::PacketData)
+                        && state.subscribers.attached_groups_of(**issi).contains(&gssi)
+                })
+                .map(|(issi, g)| (*issi, g.slot.ts))
+                .collect()
+        };
+        members.sort_unstable();
+        members
+            .into_iter()
+            .map(|(issi, ts)| {
+                tracing::info!("LLC: group {} PDU also on the PDCH ts {} of member ISSI {}", gssi, ts, issi);
+                let mut copy = req.clone();
+                copy.link_id = u32::from(ts);
+                copy.tx_reporter = None;
+                SapMsg {
+                    sap: Sap::TmaSap,
+                    src: TetraEntity::Llc,
+                    dest: TetraEntity::Umac,
+                    msg: SapMsgInner::TmaUnitdataReq(copy),
+                }
+            })
+            .collect()
+    }
+
     /// A chan_alloc that only names the traffic slot to steal on. Sent with a non-zero link id, so
     /// the UMAC drops it rather than encoding a real channel allocation if it has to fall back to
     /// the MCCH.
@@ -343,7 +385,9 @@ impl Llc {
         };
 
         // Put into transmit queue
+        let copies = self.group_copies_for_pdchs(&sapmsg);
         self.outbound_udata_messages.push_back(sapmsg);
+        self.outbound_udata_messages.extend(copies);
     }
 
     /// Schedules a message that was not acked in time for a retransmission
@@ -478,7 +522,9 @@ impl Llc {
                     tx_reporter: prim.tx_reporter.take(),
                 }),
             };
+            let copies = self.group_copies_for_pdchs(&sapmsg);
             self.outbound_udata_messages.push_back(sapmsg);
+            self.outbound_udata_messages.extend(copies);
             return;
         }
 
