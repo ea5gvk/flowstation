@@ -7,9 +7,10 @@
 //! Original acknowledged advanced link of the BS LLC (EN 300 392-2 clauses 22.2.2 and 22.3.3),
 //! used by the packet-data bearer on the MCCH. One original advanced link per radio.
 //!
-//! - AL-SETUP from a radio is answered at once: "success" with its parameters, or "service
-//!   change" with lower ones (1 phase-modulation slot, N.271 up to 2048 octets, N.273 up to 3,
-//!   N.274 up to 5), which the radio confirms with an AL-SETUP "success".
+//! - AL-SETUP from a radio is answered at once: "success" with its parameters, as Nexus-BS does
+//!   with the MXP600, or "service change" when it asks for more than 1 phase-modulation slot or
+//!   for an extended link, which the radio confirms with an AL-SETUP "success". Downlink
+//!   retransmissions are bounded here (N.273 up to 3, N.274 up to 5) whatever was agreed.
 //! - Downlink TL-SDUs get their FCS and are cut in segments that fit one SCH/F MAC-RESOURCE
 //!   together with a slot grant the MAC may add, so the MAC never fragments them. AL-DATA-AR /
 //!   AL-FINAL-AR every fourth segment, on the last one and on the last retransmitted one; T.252
@@ -56,10 +57,10 @@ const AL_ACK_MAX_BITS: usize = SCH_F_CAP - MAC_RESOURCE_HEADER_BITS;
 /// An acknowledgement is requested at least every this many segments.
 const SEGMENTS_PER_ACK_REQUEST: usize = 4;
 
-/// Negotiation limits: 1 phase-modulation slot (the data rides on the MCCH), N.271 at most
-/// 2048 octets (code 6), N.273 at most 3, N.274 at most 5 (fewer retries on the shared MCCH).
+/// Negotiation limit: 1 phase-modulation slot (the data rides on the MCCH or a 1-slot PDCH).
 const MAX_TIMESLOTS: u8 = 1;
-const MAX_N271_CODE: u8 = 6;
+/// Retransmissions of our TL-SDUs at most (fewer retries on the shared MCCH): N.273 and N.274
+/// are the radio's as agreed, the station just gives up sooner.
 const MAX_N273: u8 = 3;
 const MAX_N274: u8 = 5;
 
@@ -105,8 +106,9 @@ fn report_failed(r: &TxReporter) {
     }
 }
 
-/// The AL-SETUP answer to a radio's proposal: the same parameters ("success") or lower ones
-/// ("service change"), always a non-augmented original acknowledged link (clause 22.2.2.1).
+/// The AL-SETUP answer to a radio's proposal: its parameters ("success"), or 1 slot or an
+/// original link instead ("service change"), always a non-augmented original acknowledged link
+/// (clause 22.2.2.1).
 pub fn negotiate_setup(proposal: &AlSetup) -> AlSetup {
     let mut answer = *proposal;
     let mut changed = false;
@@ -123,16 +125,6 @@ pub fn negotiate_setup(proposal: &AlSetup) -> AlSetup {
     if answer.connection_width {
         answer = answer.response_with_lower_phase_mod_timeslots(MAX_TIMESLOTS);
         changed |= answer.setup_report == AlSetup::SETUP_REPORT_SERVICE_CHANGE;
-    }
-    for (value, max) in [
-        (&mut answer.max_tl_sdu_len_code, MAX_N271_CODE),
-        (&mut answer.max_tl_sdu_retransmissions, MAX_N273),
-        (&mut answer.max_segment_retransmissions, MAX_N274),
-    ] {
-        if *value > max {
-            *value = max;
-            changed = true;
-        }
     }
     answer.ns = None;
     answer.setup_report = if changed {
@@ -244,8 +236,8 @@ impl Link {
             al_number: setup.advanced_link_number,
             n271: n271_octets(setup.max_tl_sdu_len_code),
             window: setup.window_size_code.clamp(1, 3),
-            n273: setup.max_tl_sdu_retransmissions,
-            n274: setup.max_segment_retransmissions,
+            n273: setup.max_tl_sdu_retransmissions.min(MAX_N273),
+            n274: setup.max_segment_retransmissions.min(MAX_N274),
             state: LinkState::Connected,
             last_activity: now,
             next_ns: 0,
@@ -312,11 +304,7 @@ impl Default for AdvancedLinkEngine {
 
 impl AdvancedLinkEngine {
     pub fn new() -> Self {
-        tracing::info!(
-            "LLC: advanced link on (MCCH, {} bits per segment, N.271 up to {} octets)",
-            AL_SEGMENT_BITS,
-            n271_octets(MAX_N271_CODE)
-        );
+        tracing::info!("LLC: advanced link on ({} bits per segment)", AL_SEGMENT_BITS);
         Self {
             links: HashMap::new(),
             pending: HashMap::new(),
@@ -1314,8 +1302,10 @@ mod tests {
         }
     }
 
+    /// The radio's parameters are agreed as proposed ("success"), as Nexus-BS answers the
+    /// MXP600; only a request for more than one slot gets "service change".
     #[test]
-    fn negotiation_keeps_what_fits_and_lowers_the_rest() {
+    fn negotiation_keeps_the_radios_parameters_but_the_slots() {
         let answer = negotiate_setup(&proposal());
         assert_eq!(answer.setup_report, AlSetup::SETUP_REPORT_SUCCESS);
         assert_eq!(
@@ -1330,6 +1320,15 @@ mod tests {
         big.max_tl_sdu_retransmissions = 7;
         big.max_segment_retransmissions = 15;
         big.window_size_code = 3;
+        let answer = negotiate_setup(&big);
+        assert_eq!(answer.setup_report, AlSetup::SETUP_REPORT_SUCCESS);
+        assert_eq!(
+            AlSetup {
+                setup_report: AlSetup::SETUP_REPORT_SERVICE_DEFINITION,
+                ..answer
+            },
+            big
+        );
         big.connection_width = true;
         big.uplink_timeslots = Some(3);
         let answer = negotiate_setup(&big);
@@ -1342,7 +1341,7 @@ mod tests {
                 answer.window_size_code,
                 answer.uplink_timeslots
             ),
-            (6, 3, 5, 3, Some(0))
+            (7, 7, 15, 3, Some(0))
         );
         // Lower values are never raised.
         let mut small = proposal();
@@ -1631,6 +1630,16 @@ mod tests {
         // The answer to the request on segment 3: all up to 3 received, 4 unknown.
         ack(&mut engine, &mut queue, AlAck::selective(true, 0, 4, 0, 1));
         assert!(run(&mut engine, &mut queue, 3).is_empty(), "segment 4 left after that request");
+    }
+
+    /// N.273 and N.274 as agreed with the radio, but at most 3 and 5 retries here.
+    #[test]
+    fn retries_are_bounded_whatever_was_agreed() {
+        let mut engine = AdvancedLinkEngine::new();
+        let mut queue = MessageQueue::new();
+        setup_link(&mut engine, &mut queue, 15, 7);
+        let link = &engine.links[&ISSI];
+        assert_eq!((link.n273, link.n274, link.n271), (3, 5, 2048));
     }
 
     #[test]
