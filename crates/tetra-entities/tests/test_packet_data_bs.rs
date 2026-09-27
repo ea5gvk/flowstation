@@ -876,3 +876,431 @@ fn nothing_goes_down_to_a_radio_in_a_call() {
     air.test.config.state_write().active_call_ts.clear();
     assert!(air.next_sn(200).is_some());
 }
+
+// ---------------------------------------------------------------------------------------------
+// Voice first: with the bearer on and no data, voice, SDS, registration and DGNA produce exactly
+// the same messages as with it off
+// ---------------------------------------------------------------------------------------------
+
+const GSSI: u32 = 91;
+const SECONDARY_CARRIER: u16 = 1522;
+
+/// The stack from the LLC up (LLC, MLE, MM, CMCE, SNDCP), MAC and Brew as sinks, the radios'
+/// PDUs coming in under the LLC. Every tick's output is kept as its sorted Debug lines (sorted:
+/// entities keep calls in hash maps, whose order changes from run to run).
+struct Voice {
+    test: ComponentTest,
+    dgna: tetra_entities::net_control::CommandDispatcher,
+    ns: HashMap<u32, u8>,
+    acks: Vec<(u32, u8, usize)>,
+    ticks: usize,
+    log: Vec<String>,
+    msgs: Vec<SapMsg>,
+}
+
+impl Voice {
+    fn new(packet_data: bool, secondary: bool) -> Self {
+        let mut cfg = config(packet_data, packet_data);
+        if secondary {
+            cfg.cell.secondary_carrier = Some(SECONDARY_CARRIER);
+        }
+        let mut test = ComponentTest::from_config(cfg, Some(TdmaTime::default()));
+        test.populate_entities(
+            vec![TetraEntity::Llc, TetraEntity::Mle, TetraEntity::Cmce, TetraEntity::Sndcp],
+            vec![TetraEntity::Umac, TetraEntity::Brew],
+        );
+        let (dgna, endpoint) = tetra_entities::net_control::make_control_link();
+        let mm = tetra_entities::mm::mm_bs::MmBs::new(test.get_shared_config(), None, Some(endpoint));
+        test.register_entity(mm);
+        Self {
+            test,
+            dgna,
+            ns: HashMap::new(),
+            acks: Vec::new(),
+            ticks: 0,
+            log: Vec::new(),
+            msgs: Vec::new(),
+        }
+    }
+
+    /// Run `ticks` ticks; the radios behave like the air: every PDU is reported transmitted and
+    /// each BL-DATA to a radio is acknowledged two slots later.
+    fn run(&mut self, ticks: usize) {
+        for _ in 0..ticks {
+            let due: Vec<(u32, u8)> = self.acks.iter().filter(|a| a.2 <= self.ticks).map(|a| (a.0, a.1)).collect();
+            self.acks.retain(|a| a.2 > self.ticks);
+            for (issi, nr) in due {
+                let mut pdu = BitBuffer::new_autoexpand(8);
+                BlAck { has_fcs: false, nr }.to_bitbuf(&mut pdu);
+                pdu.seek(0);
+                self.test.submit_message(tma_ind(issi, pdu, 1));
+            }
+            self.test.run_stack(Some(1));
+            self.ticks += 1;
+            let msgs = self.test.dump_sinks();
+            let mut lines: Vec<String> = msgs.iter().map(|m| format!("{m:?}")).collect();
+            lines.sort();
+            for line in lines {
+                self.log.push(format!("{} {line}", self.ticks));
+            }
+            for m in &msgs {
+                let SapMsgInner::TmaUnitdataReq(req) = &m.msg else { continue };
+                if let Some(reporter) = &req.tx_reporter
+                    && reporter.get_state() == TxState::Pending
+                {
+                    reporter.mark_transmitted();
+                }
+                if req.main_address.ssi_type != SsiType::Gssi
+                    && let Some(ns) = down_ns(&req.pdu)
+                {
+                    self.acks.push((req.main_address.ssi, ns, self.ticks + 1));
+                }
+            }
+            self.msgs.extend(msgs);
+        }
+    }
+
+    /// A PDU of protocol `pd` from `issi` on the MCCH (BL-DATA, uplink slot TS1).
+    fn uplink(&mut self, issi: u32, pd: MleProtocolDiscriminator, sdu: BitBuffer) {
+        while self.ticks % 4 != 2 {
+            self.run(1);
+        }
+        let ns = self.ns.entry(issi).or_insert(0);
+        let mut pdu = BitBuffer::new_autoexpand(96);
+        BlData { has_fcs: false, ns: *ns }.to_bitbuf(&mut pdu);
+        *ns ^= 1;
+        pdu.write_bits(pd.into_raw(), 3);
+        let mut sdu = BitBuffer::from_bitbuffer(&sdu);
+        let len = sdu.get_len();
+        pdu.copy_bits(&mut sdu, len);
+        pdu.seek(0);
+        self.test.submit_message(tma_ind(issi, pdu, 1));
+        self.run(1);
+    }
+
+    fn cmce(&mut self, issi: u32, sdu: BitBuffer) {
+        self.uplink(issi, MleProtocolDiscriminator::Cmce, sdu);
+    }
+
+    /// Register `issi` and affiliate it to `gssi` in CMCE, as the MM does.
+    fn register(&mut self, issi: u32, gssi: Option<u32>) {
+        use tetra_saps::control::brew::{BrewSubscriberAction, MmSubscriberUpdate};
+        let mut update = |groups: Vec<u32>, action| {
+            self.test.submit_message(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Mm,
+                dest: TetraEntity::Cmce,
+                msg: SapMsgInner::MmSubscriberUpdate(MmSubscriberUpdate { issi, groups, action }),
+            });
+        };
+        update(Vec::new(), BrewSubscriberAction::Register);
+        if let Some(gssi) = gssi {
+            update(vec![gssi], BrewSubscriberAction::Affiliate);
+        }
+        let mut state = self.test.config.state_write();
+        state.subscribers.register(issi);
+        if let Some(gssi) = gssi {
+            state.subscribers.affiliate(issi, gssi);
+        }
+        drop(state);
+        self.run(1);
+    }
+
+    /// Call identifier of the last D-SETUP that went down to `ssi`.
+    fn d_setup_call_id(&self, ssi: u32) -> u16 {
+        use tetra_pdus::cmce::enums::cmce_pdu_type_dl::CmcePduTypeDl;
+        use tetra_pdus::cmce::pdus::d_setup::DSetup;
+        self.msgs
+            .iter()
+            .rev()
+            .find_map(|m| {
+                let SapMsgInner::TmaUnitdataReq(req) = &m.msg else { return None };
+                if req.main_address.ssi != ssi {
+                    return None;
+                }
+                let mut pdu = req.pdu.clone();
+                match LlcPduType::try_from(pdu.peek_bits(4)?).ok()? {
+                    LlcPduType::BlData => BlData::from_bitbuf(&mut pdu).ok().map(|_| ())?,
+                    LlcPduType::BlAdata => BlAdata::from_bitbuf(&mut pdu).ok().map(|_| ())?,
+                    LlcPduType::BlUdata => BlUdata::from_bitbuf(&mut pdu).ok().map(|_| ())?,
+                    _ => return None,
+                }
+                if pdu.read_bits(3)? != MleProtocolDiscriminator::Cmce.into_raw() {
+                    return None;
+                }
+                if CmcePduTypeDl::try_from(pdu.peek_bits(5)?).ok()? != CmcePduTypeDl::DSetup {
+                    return None;
+                }
+                DSetup::from_bitbuf(&mut pdu).ok().map(|d| d.call_identifier)
+            })
+            .expect("a D-SETUP went down")
+    }
+}
+
+fn u_setup(called_ssi: u32, group: bool, duplex: bool, call_priority: u8) -> BitBuffer {
+    use tetra_pdus::cmce::enums::party_type_identifier::PartyTypeIdentifier;
+    use tetra_pdus::cmce::fields::basic_service_information::BasicServiceInformation;
+    use tetra_pdus::cmce::pdus::u_setup::USetup;
+    use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
+    use tetra_saps::control::enums::communication_type::CommunicationType;
+    let u_setup = USetup {
+        area_selection: 0,
+        hook_method_selection: !group,
+        simplex_duplex_selection: duplex,
+        basic_service_information: BasicServiceInformation {
+            circuit_mode_type: CircuitModeType::TchS,
+            encryption_flag: false,
+            communication_type: if group { CommunicationType::P2Mp } else { CommunicationType::P2p },
+            slots_per_frame: None,
+            speech_service: Some(0),
+        },
+        request_to_transmit_send_data: false,
+        call_priority,
+        clir_control: 0,
+        called_party_type_identifier: PartyTypeIdentifier::Ssi,
+        called_party_ssi: Some(called_ssi as u64),
+        called_party_short_number_address: None,
+        called_party_extension: None,
+        external_subscriber_number: None,
+        facility: None,
+        dm_ms_address: None,
+        proprietary: None,
+    };
+    let mut sdu = BitBuffer::new_autoexpand(80);
+    u_setup.to_bitbuf(&mut sdu).expect("Failed to serialize USetup");
+    sdu.seek(0);
+    sdu
+}
+
+fn u_connect(call_id: u16, duplex: bool) -> BitBuffer {
+    use tetra_pdus::cmce::pdus::u_connect::UConnect;
+    let mut sdu = BitBuffer::new_autoexpand(80);
+    UConnect {
+        call_identifier: call_id,
+        hook_method_selection: true,
+        simplex_duplex_selection: duplex,
+        basic_service_information: None,
+        facility: None,
+        proprietary: None,
+    }
+    .to_bitbuf(&mut sdu)
+    .expect("Failed to serialize UConnect");
+    sdu.seek(0);
+    sdu
+}
+
+fn u_tx_ceased(call_id: u16) -> BitBuffer {
+    use tetra_pdus::cmce::pdus::u_tx_ceased::UTxCeased;
+    let mut sdu = BitBuffer::new_autoexpand(80);
+    UTxCeased {
+        call_identifier: call_id,
+        facility: None,
+        dm_ms_address: None,
+        proprietary: None,
+    }
+    .to_bitbuf(&mut sdu)
+    .expect("Failed to serialize UTxCeased");
+    sdu.seek(0);
+    sdu
+}
+
+fn u_disconnect(call_id: u16) -> BitBuffer {
+    use tetra_pdus::cmce::enums::disconnect_cause::DisconnectCause;
+    use tetra_pdus::cmce::pdus::u_disconnect::UDisconnect;
+    let mut sdu = BitBuffer::new_autoexpand(80);
+    UDisconnect {
+        call_identifier: call_id,
+        disconnect_cause: DisconnectCause::UserRequestedDisconnection,
+        facility: None,
+        proprietary: None,
+    }
+    .to_bitbuf(&mut sdu)
+    .expect("Failed to serialize UDisconnect");
+    sdu.seek(0);
+    sdu
+}
+
+fn u_sds_data(dest_ssi: u32, payload: u16) -> BitBuffer {
+    use tetra_pdus::cmce::enums::party_type_identifier::PartyTypeIdentifier;
+    use tetra_pdus::cmce::pdus::u_sds_data::USdsData;
+    use tetra_saps::control::enums::sds_user_data::SdsUserData;
+    let mut sdu = BitBuffer::new_autoexpand(80);
+    USdsData {
+        area_selection: 0,
+        called_party_type_identifier: PartyTypeIdentifier::Ssi,
+        called_party_short_number_address: None,
+        called_party_ssi: Some(dest_ssi as u64),
+        called_party_extension: None,
+        user_defined_data: SdsUserData::Type1(payload),
+        external_subscriber_number: None,
+        dm_ms_address: None,
+    }
+    .to_bitbuf(&mut sdu)
+    .expect("Failed to serialize U-SDS-DATA");
+    sdu.seek(0);
+    sdu
+}
+
+fn u_location_update_demand(issi: u32) -> BitBuffer {
+    use tetra_pdus::mm::enums::location_update_type::LocationUpdateType;
+    use tetra_pdus::mm::pdus::u_location_update_demand::ULocationUpdateDemand;
+    let mut sdu = BitBuffer::new_autoexpand(32);
+    ULocationUpdateDemand {
+        location_update_type: LocationUpdateType::RoamingLocationUpdating,
+        request_to_append_la: false,
+        cipher_control: false,
+        ciphering_parameters: None,
+        class_of_ms: None,
+        energy_saving_mode: None,
+        la_information: None,
+        ssi: Some(issi as u64),
+        address_extension: None,
+        group_identity_location_demand: None,
+        group_report_response: None,
+        authentication_uplink: None,
+        extended_capabilities: None,
+        proprietary: None,
+    }
+    .to_bitbuf(&mut sdu)
+    .expect("serialize U-LOCATION-UPDATE-DEMAND");
+    sdu.seek(0);
+    sdu
+}
+
+/// Run `scenario` with the bearer off and on (no data traffic) and require the same output.
+fn same_with_and_without_packet_data(secondary: bool, scenario: impl Fn(&mut Voice)) -> Vec<String> {
+    let mut off = Voice::new(false, secondary);
+    scenario(&mut off);
+    let mut on = Voice::new(true, secondary);
+    scenario(&mut on);
+    assert_eq!(off.log.len(), on.log.len(), "as many messages with [packet_data] on");
+    for (a, b) in off.log.iter().zip(&on.log) {
+        assert_eq!(a, b, "first difference with [packet_data] on");
+    }
+    off.log
+}
+
+fn count(log: &[String], what: &str) -> usize {
+    log.iter().filter(|l| l.contains(what)).count()
+}
+
+#[test]
+fn group_call_is_the_same_with_packet_data_on() {
+    let log = same_with_and_without_packet_data(false, |v| {
+        v.register(ISSI, Some(GSSI));
+        v.register(ISSI2, Some(GSSI));
+        v.cmce(ISSI, u_setup(GSSI, true, false, 0));
+        v.run(20);
+        let call_id = v.d_setup_call_id(GSSI);
+        v.cmce(ISSI, u_tx_ceased(call_id));
+        // Hangtime (5 s) and the D-RELEASE.
+        v.run(450);
+    });
+    assert!(count(&log, "Open(") >= 1, "the group call opened a circuit");
+    assert!(count(&log, "CallEnded") >= 1, "and ended after the hangtime");
+}
+
+#[test]
+fn simplex_individual_call_is_the_same_with_packet_data_on() {
+    let log = same_with_and_without_packet_data(false, |v| {
+        v.register(ISSI2, None);
+        v.cmce(ISSI, u_setup(ISSI2, false, false, 0));
+        v.run(10);
+        let call_id = v.d_setup_call_id(ISSI2);
+        v.cmce(ISSI2, u_connect(call_id, false));
+        v.run(10);
+        v.cmce(ISSI, u_tx_ceased(call_id));
+        v.run(10);
+        v.cmce(ISSI, u_disconnect(call_id));
+        v.run(60);
+    });
+    assert!(count(&log, "Open(") >= 1);
+}
+
+#[test]
+fn duplex_individual_calls_are_the_same_with_packet_data_on() {
+    let log = same_with_and_without_packet_data(false, |v| {
+        v.register(ISSI2, None);
+        v.cmce(ISSI, u_setup(ISSI2, false, true, 0));
+        v.run(10);
+        let call_id = v.d_setup_call_id(ISSI2);
+        v.cmce(ISSI2, u_connect(call_id, true));
+        v.run(10);
+        v.cmce(ISSI, u_disconnect(call_id));
+        v.run(60);
+    });
+    assert!(count(&log, "Open(") >= 2, "a duplex call opens two circuits");
+}
+
+/// Two duplex calls need four slots: the second one goes to the secondary carrier.
+#[test]
+fn duplex_calls_on_two_carriers_are_the_same_with_packet_data_on() {
+    let log = same_with_and_without_packet_data(true, |v| {
+        v.register(ISSI2, None);
+        v.register(ISSI2 + 2, None);
+        v.cmce(ISSI, u_setup(ISSI2, false, true, 0));
+        v.run(10);
+        let first = v.d_setup_call_id(ISSI2);
+        v.cmce(ISSI2, u_connect(first, true));
+        v.run(10);
+        v.cmce(ISSI + 2, u_setup(ISSI2 + 2, false, true, 0));
+        v.run(10);
+        let second = v.d_setup_call_id(ISSI2 + 2);
+        v.cmce(ISSI2 + 2, u_connect(second, true));
+        v.run(10);
+        v.cmce(ISSI, u_disconnect(first));
+        v.cmce(ISSI + 2, u_disconnect(second));
+        v.run(60);
+    });
+    assert!(count(&log, "Open(") >= 4);
+    assert!(count(&log, "carrier_num: 1522") >= 1, "the second call on the secondary carrier");
+}
+
+#[test]
+fn local_sds_is_the_same_with_packet_data_on() {
+    let log = same_with_and_without_packet_data(false, |v| {
+        v.register(ISSI2, None);
+        v.cmce(ISSI, u_sds_data(ISSI2, 0xABCD));
+        v.run(20);
+    });
+    assert!(
+        log.iter()
+            .any(|l| l.contains("TmaUnitdataReq") && l.contains(&format!("ssi: {ISSI2}")))
+    );
+}
+
+#[test]
+fn registration_and_dgna_are_the_same_with_packet_data_on() {
+    let log = same_with_and_without_packet_data(false, |v| {
+        v.uplink(ISSI, MleProtocolDiscriminator::Mm, u_location_update_demand(ISSI));
+        v.run(20);
+        v.dgna.send(tetra_entities::net_control::ControlCommand::Dgna {
+            issi: ISSI,
+            gssi: 100,
+            mnemonic: None,
+            attachment_mode: 0,
+            attach: true,
+        });
+        v.run(40);
+    });
+    assert!(
+        count(&log, &format!("ssi: {ISSI}")) >= 2,
+        "D-LOCATION UPDATE ACCEPT and the DGNA went down"
+    );
+}
+
+#[test]
+fn emergency_call_in_a_full_cell_is_the_same_with_packet_data_on() {
+    let log = same_with_and_without_packet_data(false, |v| {
+        for (i, g) in [101u32, 102, 103, 199].into_iter().enumerate() {
+            v.register(2_000_001 + i as u32, Some(g));
+        }
+        for (i, g) in [101u32, 102, 103].into_iter().enumerate() {
+            v.cmce(3_000_001 + i as u32, u_setup(g, true, false, 0));
+            v.run(4);
+        }
+        v.cmce(3_000_099, u_setup(199, true, false, 15));
+        v.run(20);
+    });
+    assert!(count(&log, "CallEnded") >= 1, "the emergency call pre-empted one");
+}
