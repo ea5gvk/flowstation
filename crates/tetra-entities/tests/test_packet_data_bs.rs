@@ -3,21 +3,25 @@
 
 mod common;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::Ipv4Addr;
 
 use common::ComponentTest;
 use tetra_config::bluestation::{StackConfig, StackMode};
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Sap, SsiType, TdmaTime, TetraAddress, TxReporter, TxState, debug};
+use tetra_entities::llc::components::fcs;
 use tetra_entities::sndcp::ip::{build_ipv4_udp_npdu, parse_ipv4_packet, parse_udp_datagram};
 use tetra_entities::sndcp::transfer::{
     SndcpDataTransmitRequest, SndcpDataTransmitResponseResult, SndcpEndOfData, SndcpPacketDataResourceRequest,
     SndcpPhaseModulationResourceRequest, SndcpReconnect, SndcpTransferRejectCause, decode_data_transmit_response, decode_end_of_data,
     decode_not_supported, encode_data_transmit_request, encode_end_of_data, encode_reconnect,
 };
-use tetra_entities::sndcp::unitdata::{decode_sn_unitdata_pdu, encode_sn_unitdata};
+use tetra_entities::sndcp::unitdata::{decode_sn_user_data_pdu, encode_sn_unitdata};
 use tetra_pdus::llc::enums::llc_pdu_type::LlcPduType;
+use tetra_pdus::llc::pdus::al_ack::AlAck;
+use tetra_pdus::llc::pdus::al_data::AlData;
+use tetra_pdus::llc::pdus::al_setup::AlSetup;
 use tetra_pdus::llc::pdus::{bl_ack::BlAck, bl_adata::BlAdata, bl_data::BlData, bl_udata::BlUdata};
 use tetra_pdus::mle::enums::mle_protocol_discriminator::MleProtocolDiscriminator;
 use tetra_saps::ltpd::LtpdBearer;
@@ -159,8 +163,11 @@ struct Down {
     link_id: u32,
     stealing: bool,
     chan_alloc: bool,
-    /// The SN-PDU (bits after the MLE discriminator) when the TL-SDU is for SNDCP.
+    /// The SN-PDU (bits after the MLE discriminator) when the TL-SDU is for SNDCP. On the advanced
+    /// link, the TL-SDU the radio reassembled (a Down of its own after the segments).
     sn: Option<String>,
+    /// The LLC PDU (the reassembled TL-SDU for an advanced link one).
+    pdu: BitBuffer,
 }
 
 impl Down {
@@ -184,6 +191,14 @@ struct Air {
     transmit: bool,
     held: Vec<TxReporter>,
     down: Vec<Down>,
+    /// The radio's advanced link: next N(S) it sends, segments it got per (ISSI, N(S)), AL PDUs
+    /// it sends up (ISSI, PDU, tick), whether it answers acknowledgement requests, and every
+    /// AL-DATA / AL-FINAL that came down (ISSI, header, payload bits).
+    al_ns: HashMap<u32, u8>,
+    al_rx: HashMap<(u32, u8), (BTreeMap<u8, BitBuffer>, Option<u8>)>,
+    al_up: Vec<(u32, BitBuffer, usize)>,
+    al_answer: bool,
+    al_segments: Vec<(u32, AlData, usize)>,
 }
 
 impl Air {
@@ -201,6 +216,11 @@ impl Air {
             transmit: true,
             held: Vec::new(),
             down: Vec::new(),
+            al_ns: HashMap::new(),
+            al_rx: HashMap::new(),
+            al_up: Vec::new(),
+            al_answer: true,
+            al_segments: Vec::new(),
         }
     }
 
@@ -213,11 +233,28 @@ impl Air {
             pdu.seek(0);
             self.test.submit_message(tma_ind(issi, pdu, 1));
         }
+        let due: Vec<(u32, BitBuffer)> = self
+            .al_up
+            .iter()
+            .filter(|a| a.2 <= self.ticks)
+            .map(|a| (a.0, a.1.clone()))
+            .collect();
+        self.al_up.retain(|a| a.2 > self.ticks);
+        for (issi, pdu) in due {
+            self.test.submit_message(tma_ind(issi, pdu, 1));
+        }
         self.test.run_stack(Some(1));
         self.ticks += 1;
         for msg in self.test.dump_sinks() {
             let SapMsgInner::TmaUnitdataReq(req) = msg.msg else { continue };
             let down = parse_down(&req);
+            if down.llc == LlcPduType::AlDataAlFinal {
+                assert!(
+                    !req.stealing_permission && req.chan_alloc.is_none() && req.link_id == 0,
+                    "advanced link data on the MCCH, never stolen"
+                );
+                self.radio_al_segment(down.issi, &req.pdu);
+            }
             if let Some(reporter) = req.tx_reporter {
                 if self.transmit {
                     if reporter.get_state() == TxState::Pending {
@@ -231,6 +268,113 @@ impl Air {
                 self.acks.push((down.issi, ns, self.ticks + 1));
             }
             self.down.push(down);
+        }
+    }
+
+    /// The radio gets a segment of its advanced link; on an acknowledgement request it answers
+    /// with an AL-ACK two slots later and, with the TL-SDU complete, hands it over as a Down.
+    fn radio_al_segment(&mut self, issi: u32, pdu: &BitBuffer) {
+        let mut pdu = pdu.clone();
+        let h = AlData::from_bitbuf(&mut pdu).unwrap();
+        let payload = BitBuffer::from_bitbuffer_pos(&pdu);
+        self.al_segments.push((issi, h, payload.get_len()));
+        let entry = self.al_rx.entry((issi, h.ns)).or_default();
+        entry.0.entry(h.ss).or_insert(payload);
+        if h.final_segment {
+            entry.1 = Some(h.ss);
+        }
+        if !h.acknowledgement_requested || !self.al_answer {
+            return;
+        }
+        let complete = entry.1.is_some_and(|f| (0..=f).all(|ss| entry.0.contains_key(&ss)));
+        let ack = if complete {
+            let (segments, _) = self.al_rx.remove(&(issi, h.ns)).unwrap();
+            let mut sdu = BitBuffer::new_autoexpand(1024);
+            for seg in segments.values() {
+                let mut seg = BitBuffer::from_bitbuffer(seg);
+                seg.seek(0);
+                let len = seg.get_len();
+                sdu.copy_bits(&mut seg, len);
+            }
+            sdu.seek(0);
+            assert!(fcs::check_fcs(&sdu), "AL FCS of the TL-SDU");
+            let end = sdu.get_raw_end() - 32;
+            sdu.set_raw_end(end);
+            let bits = sdu.to_bitstr();
+            let sn = bits.strip_prefix("100").map(str::to_string);
+            self.down.push(Down {
+                issi,
+                llc: LlcPduType::AlDataAlFinal,
+                link_id: 0,
+                stealing: false,
+                chan_alloc: false,
+                sn,
+                pdu: sdu,
+            });
+            AlAck::complete(h.ns)
+        } else {
+            let (segments, fin) = &self.al_rx[&(issi, h.ns)];
+            let highest = fin.unwrap_or(*segments.keys().next_back().unwrap());
+            let sr = (0..=highest).find(|s| !segments.contains_key(s)).unwrap_or(highest + 1);
+            let len = (highest.max(sr) - sr + 1).min(62);
+            let mut bitmap = 0u64;
+            for off in 1..len {
+                if segments.contains_key(&(sr + off)) {
+                    bitmap |= 1 << (off - 1);
+                }
+            }
+            AlAck::selective(true, h.ns, sr, bitmap, len)
+        };
+        let mut up = BitBuffer::new_autoexpand(32);
+        ack.to_bitbuf(&mut up);
+        up.seek(0);
+        self.al_up.push((issi, up, self.ticks + 2));
+    }
+
+    /// The radio sets up its advanced link 1 (the AL-SETUP of `radio_al_setup`); returns the
+    /// station's answer.
+    fn al_setup(&mut self, issi: u32) -> AlSetup {
+        let mut pdu = BitBuffer::new_autoexpand(32);
+        radio_al_setup().to_bitbuf(&mut pdu);
+        pdu.seek(0);
+        self.uplink(issi, pdu);
+        for _ in 0..8 {
+            if let Some(i) = self.down.iter().position(|d| d.issi == issi && d.llc == LlcPduType::AlSetup) {
+                let mut pdu = self.down.remove(i).pdu;
+                return AlSetup::from_bitbuf(&mut pdu).unwrap();
+            }
+            self.step();
+        }
+        panic!("no AL-SETUP answer");
+    }
+
+    /// An SN-PDU on the radio's advanced link: the TL-SDU with its FCS in AL-DATA segments of
+    /// 200 bits, the last an AL-FINAL-AR, one per MCCH uplink slot.
+    fn send_al(&mut self, issi: u32, sn: &str) {
+        let ns = self.al_ns.entry(issi).or_insert(0);
+        let this_ns = *ns;
+        *ns = (*ns + 1) & 7;
+        let mut sdu = BitBuffer::from_bitstr(&format!("100{sn}"));
+        let mut with_fcs = BitBuffer::new_autoexpand(sdu.get_len() + 32);
+        let len = sdu.get_len();
+        with_fcs.copy_bits(&mut sdu, len);
+        let value = fcs::compute_fcs(&with_fcs, 0, with_fcs.get_len());
+        with_fcs.write_bits(value as u64, 32);
+        with_fcs.seek(0);
+        let count = with_fcs.get_len().div_ceil(200);
+        for ss in 0..count {
+            let n = with_fcs.get_len_remaining().min(200);
+            let mut pdu = BitBuffer::new_autoexpand(17 + n);
+            AlData {
+                final_segment: ss + 1 == count,
+                acknowledgement_requested: ss + 1 == count,
+                ns: this_ns,
+                ss: ss as u8,
+            }
+            .to_bitbuf(&mut pdu);
+            pdu.copy_bits(&mut with_fcs, n);
+            pdu.seek(0);
+            self.uplink(issi, pdu);
         }
     }
 
@@ -341,6 +485,20 @@ fn down_ns(pdu: &BitBuffer) -> Option<u8> {
 fn parse_down(req: &TmaUnitdataReq) -> Down {
     let mut pdu = req.pdu.clone();
     let llc = LlcPduType::try_from(pdu.peek_bits(4).unwrap()).unwrap();
+    if matches!(
+        llc,
+        LlcPduType::AlSetup | LlcPduType::AlDataAlFinal | LlcPduType::AlAckAlRnr | LlcPduType::AlReconnect | LlcPduType::AlDisc
+    ) {
+        return Down {
+            issi: req.main_address.ssi,
+            llc,
+            link_id: req.link_id,
+            stealing: req.stealing_permission,
+            chan_alloc: req.chan_alloc.is_some(),
+            sn: None,
+            pdu,
+        };
+    }
     match llc {
         LlcPduType::BlData => {
             BlData::from_bitbuf(&mut pdu).unwrap();
@@ -365,6 +523,28 @@ fn parse_down(req: &TmaUnitdataReq) -> Down {
         stealing: req.stealing_permission,
         chan_alloc: req.chan_alloc.is_some(),
         sn,
+        pdu: req.pdu.clone(),
+    }
+}
+
+/// The AL-SETUP a radio sends for its original acknowledged advanced link 1: N.271 2048 octets,
+/// no slot request, window 1, N.273 3, N.274 3.
+fn radio_al_setup() -> AlSetup {
+    AlSetup {
+        acknowledged_service: true,
+        advanced_link_number: 0,
+        max_tl_sdu_len_code: 6,
+        connection_width: false,
+        advanced_link_symmetry: false,
+        uplink_timeslots: None,
+        downlink_timeslots: None,
+        throughput_code: 6,
+        window_size_code: 1,
+        max_tl_sdu_retransmissions: 3,
+        max_segment_retransmissions: 3,
+        setup_report: AlSetup::SETUP_REPORT_SERVICE_DEFINITION,
+        ns: None,
+        augmented: None,
     }
 }
 
@@ -389,8 +569,13 @@ fn accept_ip(down: &Down) -> Ipv4Addr {
 
 /// The WTP packet inside a downlink SN-UNITDATA, with the IPv4 datagram's size.
 fn wtp_down(down: &Down, radio_ip: Ipv4Addr) -> (Vec<u8>, usize) {
-    assert_eq!(down.sn_type(), Some(4), "SN-UNITDATA");
-    let unitdata = decode_sn_unitdata_pdu(&down.sn_buf()).unwrap();
+    let expected = if down.llc == LlcPduType::AlDataAlFinal { 5 } else { 4 };
+    assert_eq!(
+        down.sn_type(),
+        Some(expected),
+        "SN-UNITDATA on the basic link, SN-DATA on the advanced link"
+    );
+    let unitdata = decode_sn_user_data_pdu(&down.sn_buf()).unwrap();
     let mut npdu = unitdata.n_pdu.clone();
     let mut octets = Vec::new();
     while let Some(b) = npdu.read_bits(8) {
@@ -550,17 +735,320 @@ fn tl_data_on_an_advanced_link_for_cmce_or_mm_is_dropped() {
     }
 }
 
-/// An advanced-link PDU from a radio makes nothing go down, with `[packet_data]` on (it is only
-/// logged, as the field probe) or off.
+// ---------------------------------------------------------------------------------------------
+// Advanced link in the LLC
+// ---------------------------------------------------------------------------------------------
+
+fn al_pdu(write: impl FnOnce(&mut BitBuffer)) -> BitBuffer {
+    let mut pdu = BitBuffer::new_autoexpand(64);
+    write(&mut pdu);
+    pdu.seek(0);
+    pdu
+}
+
+/// With `[packet_data]` off, the advanced link PDUs of a radio make nothing go down, exactly as
+/// before the advanced link existed.
 #[test]
-fn advanced_link_pdus_produce_nothing() {
-    for packet_data in [false, true] {
-        let mut air = Air::new(config(packet_data, false));
-        // AL-SETUP (LLC PDU type 8) and AL-DATA (type 9).
-        air.uplink(ISSI, BitBuffer::from_bitstr("1000000000000000000000000000"));
-        air.uplink(ISSI, BitBuffer::from_bitstr("1001000000000000000000000000"));
-        air.run(4);
-        assert!(air.down.is_empty(), "packet_data {packet_data}: {:?}", air.down);
+fn advanced_link_pdus_produce_nothing_with_packet_data_off() {
+    use tetra_pdus::llc::pdus::al_disc::{AlDisc, AlDiscReport};
+    use tetra_pdus::llc::pdus::al_reconnect::{AlReconnect, AlReconnectReport};
+    let mut air = Air::new(config(false, false));
+    air.uplink(ISSI, al_pdu(|b| radio_al_setup().to_bitbuf(b)));
+    air.uplink(
+        ISSI,
+        al_pdu(|b| {
+            AlData {
+                final_segment: true,
+                acknowledgement_requested: true,
+                ns: 0,
+                ss: 0,
+            }
+            .to_bitbuf(b);
+            b.write_bits(0xdead_beef_0123, 48);
+        }),
+    );
+    air.uplink(ISSI, al_pdu(|b| AlAck::complete(0).to_bitbuf(b)));
+    air.uplink(
+        ISSI,
+        al_pdu(|b| {
+            AlReconnect {
+                acknowledged_service: true,
+                advanced_link_number: 0,
+                report: AlReconnectReport::Propose,
+            }
+            .to_bitbuf(b)
+        }),
+    );
+    air.uplink(
+        ISSI,
+        al_pdu(|b| {
+            AlDisc {
+                acknowledged_service: true,
+                advanced_link_number: 0,
+                report: AlDiscReport::Close,
+            }
+            .to_bitbuf(b)
+        }),
+    );
+    air.run(8);
+    assert!(air.down.is_empty(), "{:?}", air.down);
+}
+
+/// With `[packet_data]` on, AL-SETUP is answered on the MCCH with the radio's own parameters.
+#[test]
+fn advanced_link_setup_is_answered_with_packet_data_on() {
+    debug::setup_logging_verbose();
+    let mut air = Air::new(config(true, false));
+    let answer = air.al_setup(ISSI);
+    assert_eq!(answer.setup_report, AlSetup::SETUP_REPORT_SUCCESS);
+    assert_eq!(
+        AlSetup {
+            setup_report: AlSetup::SETUP_REPORT_SERVICE_DEFINITION,
+            ..answer
+        },
+        radio_al_setup()
+    );
+    assert!(air.down.iter().all(|d| d.link_id == 0 && !d.stealing && !d.chan_alloc));
+}
+
+/// An SN-PDU the radio sends on its advanced link reaches SNDCP (here an SN-DATA TRANSMIT
+/// REQUEST, which is answered on the basic link) and the TL-SDU is acknowledged on the MCCH.
+#[test]
+fn an_sn_pdu_on_the_advanced_link_reaches_sndcp() {
+    debug::setup_logging_verbose();
+    let mut air = Air::new(config(true, true));
+    air.send(ISSI, &demand(1, None, false));
+    air.next_sn(8).expect("ACCEPT");
+    air.al_setup(ISSI);
+    air.take_sn();
+    air.send_al(ISSI, &transmit_request(1, None));
+    let response = air.next_sn(8).expect("RESPONSE");
+    assert!(
+        matches!(response.llc, LlcPduType::BlData | LlcPduType::BlAdata),
+        "transfer control on the acknowledged basic link: {:?}",
+        response.llc
+    );
+    assert_eq!(
+        decode_data_transmit_response(&response.sn_buf()).unwrap().result,
+        SndcpDataTransmitResponseResult::Accepted
+    );
+    let ack = air
+        .down
+        .iter()
+        .find(|d| d.llc == LlcPduType::AlAckAlRnr)
+        .map(|d| AlAck::from_bitbuf(&mut d.pdu.clone()).unwrap())
+        .expect("AL-ACK for the AL-FINAL-AR");
+    assert!(ack.acknowledges_complete_tl_sdu() && ack.nr == 0);
+}
+
+// The advanced link through the real MAC -------------------------------------------------------
+
+/// MAC-RESOURCE PDUs of a downlink block: (SSI, length indication, slot grant, LLC PDU type).
+fn resources_in(block: &BitBuffer) -> Vec<(u32, u8, bool, Option<LlcPduType>)> {
+    use tetra_pdus::umac::pdus::mac_resource::MacResource;
+    let mut out = Vec::new();
+    let len = block.get_len();
+    let mut pos = 0;
+    while pos + 16 <= len {
+        let mut b = BitBuffer::from_bitbuffer(block);
+        b.seek(pos);
+        if b.peek_bits(2) != Some(0) {
+            break;
+        }
+        let Ok(res) = MacResource::from_bitbuf(&mut b) else { break };
+        let Some(addr) = res.addr else { break };
+        let llc = b.peek_bits(4).and_then(|t| LlcPduType::try_from(t).ok());
+        out.push((addr.ssi, res.length_ind, res.slot_granting_element.is_some(), llc));
+        if res.length_ind == 0b111111 {
+            break;
+        }
+        pos += res.length_ind as usize * 8;
+    }
+    out
+}
+
+/// UMAC and LLC (with MLE as a sink) and the LMAC collecting what goes on the air.
+struct MacAir {
+    test: ComponentTest,
+    tick: usize,
+}
+
+/// One downlink block: (tick, carrier, timeslot, MAC-RESOURCEs).
+type AirBlock = (usize, u16, u8, Vec<(u32, u8, bool, Option<LlcPduType>)>);
+
+impl MacAir {
+    fn new() -> Self {
+        let mut test = ComponentTest::from_config(config(true, false), Some(TdmaTime { h: 0, m: 1, f: 1, t: 1 }));
+        test.populate_entities(vec![TetraEntity::Umac, TetraEntity::Llc], vec![TetraEntity::Lmac, TetraEntity::Mle]);
+        Self { test, tick: 0 }
+    }
+
+    fn run(&mut self, ticks: usize) -> Vec<AirBlock> {
+        let mut out = Vec::new();
+        for _ in 0..ticks {
+            self.test.run_stack(Some(1));
+            self.tick += 1;
+            for msg in self.test.dump_sinks() {
+                let slots = match msg.msg {
+                    SapMsgInner::TmvUnitdataReq(slot) => vec![slot],
+                    SapMsgInner::TmvUnitdataReqSlots(slots) => slots.slots,
+                    _ => continue,
+                };
+                for slot in slots {
+                    for blk in [&slot.blk1, &slot.blk2].into_iter().flatten() {
+                        out.push((self.tick, slot.carrier_num, slot.ts.t, resources_in(&blk.mac_block)));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn uplink(&mut self, pdu: BitBuffer) {
+        let mut msg = tma_ind(ISSI, pdu, 1);
+        let SapMsgInner::TmaUnitdataInd(ind) = &mut msg.msg else {
+            unreachable!()
+        };
+        ind.carrier_num = self.test.config.config().cell.main_carrier;
+        self.test.submit_message(msg);
+    }
+
+    /// AL-SETUP from the radio, then a TL-SDU of `octets` for it on the advanced link.
+    fn transfer(&mut self, octets: usize) -> TxReporter {
+        self.uplink(al_pdu(|b| radio_al_setup().to_bitbuf(b)));
+        let setup = self.run(12);
+        assert!(
+            setup
+                .iter()
+                .any(|b| b.3.iter().any(|r| r.0 == ISSI && r.3 == Some(LlcPduType::AlSetup))),
+            "AL-SETUP answered on the air"
+        );
+        let reporter = TxReporter::new();
+        self.test.submit_message(SapMsg {
+            sap: Sap::TlaSap,
+            src: TetraEntity::Sndcp,
+            dest: TetraEntity::Llc,
+            msg: SapMsgInner::TlaTlDataReqAl(tetra_saps::tla::TlDataReqAl {
+                main_address: TetraAddress::new(ISSI, SsiType::Issi),
+                al_number: 0,
+                tl_sdu: BitBuffer::from_bytes(&vec![0x3c; octets]),
+                tx_reporter: Some(reporter.clone()),
+            }),
+        });
+        reporter
+    }
+}
+
+fn al_segments_on_air(blocks: &[AirBlock]) -> Vec<(u16, u8, u8)> {
+    blocks
+        .iter()
+        .flat_map(|(_, carrier, ts, res)| {
+            res.iter()
+                .filter(|r| r.0 == ISSI && r.3 == Some(LlcPduType::AlDataAlFinal))
+                .map(move |r| (*carrier, *ts, r.1))
+        })
+        .collect()
+}
+
+/// Every AL segment goes out whole in one MCCH block (no MAC fragmentation), one per frame,
+/// and the whole TL-SDU reaches the air.
+#[test]
+fn advanced_link_segments_fill_one_mcch_block_each() {
+    debug::setup_logging_verbose();
+    let mut mac = MacAir::new();
+    let reporter = mac.transfer(300);
+    let blocks = mac.run(4 * 20);
+    let segments = al_segments_on_air(&blocks);
+    // 300 octets + FCS = 2432 bits in segments of 194.
+    assert_eq!(segments.len(), 13, "{segments:?}");
+    for (carrier, ts, length_ind) in &segments {
+        assert_eq!((*carrier, *ts), (MAIN_CARRIER, 1), "on the MCCH");
+        assert_ne!(*length_ind, 0b111111, "never fragmented by the MAC");
+    }
+    assert_eq!(reporter.get_state(), TxState::Transmitted);
+}
+
+/// A D-SETUP for a group queued in the middle of a long AL transfer goes out within the next two
+/// MCCH blocks: the AL keeps at most one segment waiting in the MAC.
+#[test]
+fn group_call_setup_is_not_held_behind_an_al_transfer() {
+    debug::setup_logging_verbose();
+    let mut mac = MacAir::new();
+    mac.transfer(400);
+    let before = mac.run(4 * 5);
+    assert!(al_segments_on_air(&before).len() >= 3, "the transfer is under way");
+    let mut pdu = BitBuffer::new_autoexpand(128);
+    BlUdata { has_fcs: false }.to_bitbuf(&mut pdu);
+    pdu.write_bits(0b010, 3); // CMCE
+    pdu.write_bits(0x1234_5678_9abc_def0, 64);
+    pdu.write_bits(0x0fed_cba9_8765, 48);
+    pdu.seek(0);
+    mac.test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+            carrier_num: Some(MAIN_CARRIER),
+            req_handle: 0,
+            pdu,
+            main_address: TetraAddress::new(GSSI, SsiType::Gssi),
+            link_id: 0,
+            endpoint_id: 0,
+            stealing_permission: false,
+            subscriber_class: 0,
+            air_interface_encryption: None,
+            stealing_repeats_flag: None,
+            data_category: None,
+            chan_alloc: None,
+            tx_reporter: None,
+        }),
+    });
+    let after = mac.run(4 * 6);
+    let mcch: Vec<&AirBlock> = after
+        .iter()
+        .filter(|b| b.1 == MAIN_CARRIER && b.2 == 1 && !b.3.is_empty())
+        .collect();
+    let at = mcch
+        .iter()
+        .position(|b| b.3.iter().any(|r| r.0 == GSSI))
+        .expect("the group PDU went out");
+    assert!(at < 2, "the group PDU waited {} MCCH blocks: {:?}", at, &mcch[..=at]);
+    assert!(al_segments_on_air(&after).len() >= 3, "the transfer goes on after it");
+}
+
+/// With a call on timeslot 2, nothing of the advanced link is stolen from it: every AL PDU goes
+/// out on the MCCH.
+#[test]
+fn advanced_link_never_steals_from_a_call() {
+    use tetra_core::Direction;
+    use tetra_saps::control::call_control::{CallControl, Circuit, CircuitDlMediaSource};
+    use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
+    let mut mac = MacAir::new();
+    mac.test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Cmce,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::CmceCallControl(CallControl::Open(Circuit {
+            direction: Direction::Both,
+            carrier_num: MAIN_CARRIER,
+            ts: 2,
+            peer_carrier_num: None,
+            peer_ts: None,
+            usage: 4,
+            circuit_mode: CircuitModeType::TchS,
+            speech_service: Some(0),
+            etee_encrypted: false,
+            dl_media_source: CircuitDlMediaSource::SwMI,
+        })),
+    });
+    mac.run(4);
+    mac.transfer(120);
+    let blocks = mac.run(4 * 12);
+    assert_eq!(al_segments_on_air(&blocks).len(), 6);
+    for (_, carrier, ts, res) in &blocks {
+        if res.iter().any(|r| r.0 == ISSI) {
+            assert_eq!((*carrier, *ts), (MAIN_CARRIER, 1), "AL PDU outside the MCCH: {res:?}");
+        }
     }
 }
 

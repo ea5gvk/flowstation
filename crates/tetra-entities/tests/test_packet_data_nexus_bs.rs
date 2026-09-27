@@ -2,14 +2,15 @@
 // SPDX-FileCopyrightText: 2026 Chris YO3TCO / Nexus-BS Project
 // SPDX-License-Identifier: Apache-2.0 AND PolyForm-Noncommercial-1.0.0
 // SPDX-FileComment: Modified by Nexus-BS Project; see CHANGES-NEXUS.md for change notices.
-// SPDX-FileComment: Packet-data tests adapted from Nexus-BS test_mle_bs.rs and test_sndcp_bs.rs for flowstation-miura (no LTPD report / configure primitives, SNDCP answers straight to the LLC, [packet_data] instead of cell_info wap_ip) by EA5GVK.
+// SPDX-FileComment: Packet-data tests adapted from Nexus-BS test_mle_bs.rs, test_sndcp_bs.rs and test_llc_bs.rs for flowstation-miura (no LTPD report / configure primitives, SNDCP answers straight to the LLC, [packet_data] instead of cell_info wap_ip, advanced link TL-DATA primitives instead of non-zero link ids) by EA5GVK.
 
 mod common;
 
 use common::ComponentTest;
 use tetra_config::bluestation::StackMode;
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, Sap, SsiType, TetraAddress};
+use tetra_core::{BitBuffer, Sap, SsiType, TdmaTime, TetraAddress, TxReporter, TxState, debug};
+use tetra_entities::llc::components::fcs;
 use tetra_entities::sndcp::ip::{bitbuffer_npdu_octets, build_ipv4_udp_npdu, parse_ipv4_packet, parse_udp_datagram};
 use tetra_entities::sndcp::transfer::{
     SN_PDU_TYPE_DATA, SN_PDU_TYPE_END_OF_DATA, SndcpDataTransmitRequest, SndcpDataTransmitResponseResult, SndcpEndOfData,
@@ -21,10 +22,16 @@ use tetra_entities::sndcp::unitdata::{
     NetworkPduKind, SndcpEncodeError, SndcpUnitdataError, decode_sn_data_pdu, decode_sn_unitdata_pdu, decode_sn_user_data_pdu,
     encode_sn_unitdata,
 };
+use tetra_pdus::llc::consts::timers::{T251_SENDER_RETRY_TIMER, T252_ACK_WAITING_TIMER, T271_RECEIVER_NOT_READY_FOR_TX_TIMER};
+use tetra_pdus::llc::enums::llc_pdu_type::LlcPduType;
+use tetra_pdus::llc::pdus::al_ack::AlAck;
+use tetra_pdus::llc::pdus::al_data::AlData;
+use tetra_pdus::llc::pdus::al_setup::AlSetup;
 use tetra_pdus::mle::enums::mle_protocol_discriminator::MleProtocolDiscriminator;
 use tetra_saps::ltpd::{LtpdBearer, LtpdMleUnitdataInd};
 use tetra_saps::sapmsg::{SapMsg, SapMsgInner};
-use tetra_saps::tla::TlaTlDataIndBl;
+use tetra_saps::tla::{TlDataIndAl, TlDataReqAl, TlaTlDataIndBl};
+use tetra_saps::tma::TmaUnitdataInd;
 
 const TEST_ISSI: u32 = 1_000_001;
 const TEST_BITS: &str = "10101100";
@@ -615,4 +622,516 @@ fn sndcp_unexpected_primitive_drops_without_panic() {
         test.run_stack(Some(2));
         assert!(take_llc_reqs(&mut test).is_empty());
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// LLC advanced link (Nexus-BS test_llc_bs.rs, adapted: TL-DATA on an advanced link is
+// TlaTlDataReqAl / TlaTlDataIndAl instead of a TL-DATA with a non-zero link id, MAC reports are
+// TxReporter states, AL PDUs never steal, one segment at a time on the MCCH)
+// ---------------------------------------------------------------------------------------------
+
+const AL_ISSI: u32 = 2_065_022;
+
+fn al_addr() -> TetraAddress {
+    TetraAddress::new(AL_ISSI, SsiType::Issi)
+}
+
+/// The LLC alone with `[packet_data]` on, MAC and MLE as sinks.
+fn llc_test() -> ComponentTest {
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.packet_data.enabled = true;
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime { t: 1, f: 1, m: 1, h: 0 }));
+    test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
+    test
+}
+
+fn default_al_setup() -> AlSetup {
+    AlSetup {
+        acknowledged_service: true,
+        advanced_link_number: 0,
+        max_tl_sdu_len_code: 6,
+        connection_width: false,
+        advanced_link_symmetry: false,
+        uplink_timeslots: None,
+        downlink_timeslots: None,
+        throughput_code: 6,
+        window_size_code: 1,
+        max_tl_sdu_retransmissions: 3,
+        max_segment_retransmissions: 3,
+        setup_report: AlSetup::SETUP_REPORT_SERVICE_DEFINITION,
+        ns: None,
+        augmented: None,
+    }
+}
+
+fn tma_unitdata_ind(pdu: BitBuffer) -> SapMsg {
+    SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Umac,
+        dest: TetraEntity::Llc,
+        msg: SapMsgInner::TmaUnitdataInd(TmaUnitdataInd {
+            carrier_num: 1521,
+            pdu: Some(pdu),
+            main_address: al_addr(),
+            scrambling_code: 0,
+            link_id: 1,
+            endpoint_id: 0,
+            new_endpoint_id: None,
+            css_endpoint_id: None,
+            air_interface_encryption: 0,
+            chan_change_response_req: false,
+            chan_change_handle: None,
+            chan_info: None,
+        }),
+    }
+}
+
+fn build_al_setup_ind_with_setup(setup: AlSetup) -> SapMsg {
+    let mut pdu = BitBuffer::new_autoexpand(32);
+    setup.to_bitbuf(&mut pdu);
+    pdu.seek(0);
+    tma_unitdata_ind(pdu)
+}
+
+fn build_al_setup_ind() -> SapMsg {
+    build_al_setup_ind_with_setup(default_al_setup())
+}
+
+/// One AL-DATA / AL-FINAL segment carrying `payload` as is.
+fn build_al_segment_ind(final_segment: bool, ar: bool, ns: u8, ss: u8, payload: &BitBuffer) -> SapMsg {
+    let mut pdu = BitBuffer::new_autoexpand(64);
+    AlData {
+        final_segment,
+        acknowledgement_requested: ar,
+        ns,
+        ss,
+    }
+    .to_bitbuf(&mut pdu);
+    let mut payload = BitBuffer::from_bitbuffer(payload);
+    payload.seek(0);
+    let len = payload.get_len();
+    pdu.copy_bits(&mut payload, len);
+    pdu.seek(0);
+    tma_unitdata_ind(pdu)
+}
+
+/// A whole TL-SDU in one AL-FINAL-AR, FCS appended.
+fn build_al_final_ar_ind(ns: u8, tl_sdu: &[u8]) -> SapMsg {
+    let mut with_fcs = BitBuffer::new_autoexpand(64);
+    with_fcs.copy_bits(&mut BitBuffer::from_bytes(tl_sdu), tl_sdu.len() * 8);
+    let value = fcs::compute_fcs(&with_fcs, 0, with_fcs.get_len());
+    with_fcs.write_bits(value as u64, 32);
+    with_fcs.seek(0);
+    build_al_segment_ind(true, true, ns, 0, &with_fcs)
+}
+
+fn build_al_ack_ind(ack: AlAck) -> SapMsg {
+    let mut pdu = BitBuffer::new_autoexpand(32);
+    ack.to_bitbuf(&mut pdu);
+    pdu.seek(0);
+    tma_unitdata_ind(pdu)
+}
+
+fn build_al_rnr_complete_ind(nr: u8) -> SapMsg {
+    let mut rnr = AlAck::complete(nr);
+    rnr.receiver_ready = false;
+    build_al_ack_ind(rnr)
+}
+
+/// TL-DATA on advanced link 1, as the SNDCP runtime sends it.
+fn tl_data_req_al(tl_sdu: &[u8]) -> (SapMsg, TxReporter) {
+    let reporter = TxReporter::new();
+    let msg = SapMsg {
+        sap: Sap::TlaSap,
+        src: TetraEntity::Sndcp,
+        dest: TetraEntity::Llc,
+        msg: SapMsgInner::TlaTlDataReqAl(TlDataReqAl {
+            main_address: al_addr(),
+            al_number: 0,
+            tl_sdu: BitBuffer::from_bytes(tl_sdu),
+            tx_reporter: Some(reporter.clone()),
+        }),
+    };
+    (msg, reporter)
+}
+
+/// What reached the sinks; the MAC reports every TMA request transmitted when `transmit`.
+fn drain(test: &mut ComponentTest, transmit: bool) -> Vec<SapMsg> {
+    let msgs = test.dump_sinks();
+    for msg in &msgs {
+        if let SapMsgInner::TmaUnitdataReq(req) = &msg.msg {
+            assert!(
+                !req.stealing_permission && req.chan_alloc.is_none() && req.link_id == 0,
+                "advanced link PDUs go on the MCCH, never stolen: {req:?}"
+            );
+            if transmit
+                && let Some(r) = &req.tx_reporter
+                && r.get_state() == TxState::Pending
+            {
+                r.mark_transmitted();
+            }
+        }
+    }
+    msgs
+}
+
+/// Run `ticks` ticks with the MAC transmitting everything; returns all the sinks got.
+fn run_llc(test: &mut ComponentTest, ticks: usize) -> Vec<SapMsg> {
+    let mut all = Vec::new();
+    for _ in 0..ticks {
+        test.run_stack(Some(1));
+        all.extend(drain(test, true));
+    }
+    all
+}
+
+fn llc_type(msg: &SapMsg) -> Option<LlcPduType> {
+    let SapMsgInner::TmaUnitdataReq(req) = &msg.msg else { return None };
+    LlcPduType::try_from(req.pdu.peek_bits(4)?).ok()
+}
+
+fn pdu_of(msg: &SapMsg) -> BitBuffer {
+    let SapMsgInner::TmaUnitdataReq(req) = &msg.msg else {
+        panic!("TMA-UNITDATA request expected");
+    };
+    req.pdu.clone()
+}
+
+/// (final, AR, N(S), S(S), payload bits) of the AL-DATA / AL-FINAL segments.
+fn al_segment_headers(msgs: &[SapMsg]) -> Vec<(bool, bool, u8, u8, usize)> {
+    msgs.iter()
+        .filter(|m| llc_type(m) == Some(LlcPduType::AlDataAlFinal))
+        .map(|m| {
+            let mut pdu = pdu_of(m);
+            let h = AlData::from_bitbuf(&mut pdu).unwrap();
+            (h.final_segment, h.acknowledgement_requested, h.ns, h.ss, pdu.get_len_remaining())
+        })
+        .collect()
+}
+
+fn al_setup_from(msgs: &[SapMsg]) -> Option<AlSetup> {
+    msgs.iter()
+        .find(|m| llc_type(m) == Some(LlcPduType::AlSetup))
+        .map(|m| AlSetup::from_bitbuf(&mut pdu_of(m)).unwrap())
+}
+
+fn al_ack_from(msgs: &[SapMsg]) -> Option<AlAck> {
+    msgs.iter()
+        .find(|m| llc_type(m) == Some(LlcPduType::AlAckAlRnr))
+        .map(|m| AlAck::from_bitbuf(&mut pdu_of(m)).unwrap())
+}
+
+fn data_ind_al(msgs: &[SapMsg]) -> Option<&TlDataIndAl> {
+    msgs.iter().find_map(|m| match &m.msg {
+        SapMsgInner::TlaTlDataIndAl(prim) => Some(prim),
+        _ => None,
+    })
+}
+
+fn establish(test: &mut ComponentTest, setup: AlSetup) {
+    test.submit_message(build_al_setup_ind_with_setup(setup));
+    test.deliver_all_messages();
+    let msgs = drain(test, true);
+    assert_eq!(al_setup_from(&msgs).map(|s| s.setup_report), Some(AlSetup::SETUP_REPORT_SUCCESS));
+}
+
+/// Nexus-BS `test_al_setup_success_response_establishes_original_acknowledged_link`.
+#[test]
+fn test_al_setup_success_response_establishes_original_acknowledged_link() {
+    debug::setup_logging_verbose();
+    let mut test = llc_test();
+    test.submit_message(build_al_setup_ind());
+    test.deliver_all_messages();
+    let msgs = drain(&mut test, true);
+    let response = al_setup_from(&msgs).expect("supported AL-SETUP should produce AL-SETUP success response");
+    assert_eq!(response.setup_report, AlSetup::SETUP_REPORT_SUCCESS);
+    assert!(
+        msgs.iter()
+            .all(|m| !matches!(&m.msg, SapMsgInner::TlaTlDataIndAl(_) | SapMsgInner::TlaTlDataIndBl(_))),
+        "AL-SETUP establishes LLC link state; it must not be delivered to MLE"
+    );
+}
+
+/// Nexus-BS `test_al_setup_four_slot_phase_mod_request_is_negotiated_down_before_data_transfer`.
+#[test]
+fn test_al_setup_four_slot_phase_mod_request_is_negotiated_down_before_data_transfer() {
+    debug::setup_logging_verbose();
+    let mut test = llc_test();
+    let mut request = default_al_setup();
+    request.connection_width = true;
+    request.uplink_timeslots = Some(3);
+    test.submit_message(build_al_setup_ind_with_setup(request));
+    test.deliver_all_messages();
+    let response = al_setup_from(&drain(&mut test, true)).expect("4-slot AL-SETUP should produce a negotiated response");
+    assert_eq!(response.setup_report, AlSetup::SETUP_REPORT_SERVICE_CHANGE);
+    assert_eq!(response.uplink_timeslots, Some(0), "N.264 answered with one slot, not the 4 asked");
+    assert_eq!(response.throughput_code, 6);
+
+    test.submit_message(build_al_final_ar_ind(0, &[0xA5]));
+    test.deliver_all_messages();
+    assert!(
+        data_ind_al(&drain(&mut test, true)).is_none(),
+        "AL-DATA before the MS accepts lower QoS must not be delivered"
+    );
+
+    let mut accepted = response;
+    accepted.setup_report = AlSetup::SETUP_REPORT_SUCCESS;
+    test.submit_message(build_al_setup_ind_with_setup(accepted));
+    test.deliver_all_messages();
+    assert!(drain(&mut test, true).is_empty(), "the radio's success needs no answer");
+
+    test.submit_message(build_al_final_ar_ind(0, &[0xA5]));
+    test.deliver_all_messages();
+    let msgs = drain(&mut test, true);
+    let ind = data_ind_al(&msgs).expect("accepted lower-QoS original AL should deliver AL-FINAL-AR");
+    assert_eq!(ind.al_number, 0);
+}
+
+/// Nexus-BS `test_inbound_al_final_ar_delivers_tldata_with_link_id_and_ack` (the AL-ACK is not
+/// stolen here: it waits for the MCCH).
+#[test]
+fn test_inbound_al_final_ar_delivers_tldata_with_link_id_and_ack() {
+    debug::setup_logging_verbose();
+    let mut test = llc_test();
+    establish(&mut test, default_al_setup());
+    test.submit_message(build_al_final_ar_ind(0, &[0xA5]));
+    test.deliver_all_messages();
+    let msgs = drain(&mut test, true);
+    let ind = data_ind_al(&msgs).expect("complete AL-FINAL-AR should deliver TL-DATA to MLE");
+    assert_eq!(ind.main_address, al_addr());
+    assert_eq!((ind.al_number, ind.max_sdu_bytes, ind.link_id), (0, 2048, 1));
+    assert_eq!(ind.tl_sdu.to_bitstr(), "10100101", "LLC must strip the AL FCS");
+    let ack = al_ack_from(&msgs).expect("AL-FINAL-AR should be acknowledged");
+    assert!(ack.receiver_ready && ack.acknowledges_complete_tl_sdu());
+    assert_eq!(ack.nr, 0);
+}
+
+/// Nexus-BS `test_inbound_incomplete_al_data_ar_sends_selective_ack_not_whole_repeat`.
+#[test]
+fn test_inbound_incomplete_al_data_ar_sends_selective_ack_not_whole_repeat() {
+    debug::setup_logging_verbose();
+    let mut test = llc_test();
+    establish(&mut test, default_al_setup());
+    test.submit_message(build_al_segment_ind(false, true, 0, 1, &BitBuffer::from_bytes(&[0xA5])));
+    test.deliver_all_messages();
+    let msgs = drain(&mut test, true);
+    assert!(data_ind_al(&msgs).is_none(), "incomplete TL-SDU must not be delivered");
+    let ack = al_ack_from(&msgs).expect("AL-DATA-AR with a missing older segment should be selectively acknowledged");
+    assert_eq!(
+        (ack.nr, ack.sr, ack.acknowledgement_length, ack.acknowledgement_bitmap),
+        (0, Some(0), 2, 1)
+    );
+    assert!(!ack.requests_repeat_entire_tl_sdu());
+}
+
+/// Nexus-BS `test_outbound_nonzero_link_tldata_uses_al_final_ar_and_completes_on_al_ack`.
+#[test]
+fn test_outbound_al_tldata_uses_al_final_ar_and_completes_on_al_ack() {
+    debug::setup_logging_verbose();
+    let mut test = llc_test();
+    establish(&mut test, default_al_setup());
+    let (req, reporter) = tl_data_req_al(&[0x12, 0x34]);
+    test.submit_message(req);
+    test.run_stack(Some(1));
+    let msgs = drain(&mut test, false);
+    assert!(
+        msgs.iter().all(|m| llc_type(m) != Some(LlcPduType::BlData)),
+        "no fall back to BL-DATA"
+    );
+    let segment = msgs
+        .iter()
+        .find(|m| llc_type(m) == Some(LlcPduType::AlDataAlFinal))
+        .expect("TL-DATA on the AL should emit AL-FINAL-AR");
+    let mut pdu = pdu_of(segment);
+    let h = AlData::from_bitbuf(&mut pdu).unwrap();
+    assert_eq!((h.final_segment, h.acknowledgement_requested, h.ns, h.ss), (true, true, 0, 0));
+    assert_eq!(pdu.get_len_remaining(), 16 + 32);
+    assert!(fcs::check_fcs(&pdu), "mandatory AL FCS");
+    assert_eq!(reporter.get_state(), TxState::Pending);
+    let SapMsgInner::TmaUnitdataReq(req) = &segment.msg else {
+        unreachable!()
+    };
+    req.tx_reporter.as_ref().unwrap().mark_transmitted();
+    run_llc(&mut test, 1);
+    assert_eq!(reporter.get_state(), TxState::Transmitted, "first complete transmission");
+    test.submit_message(build_al_ack_ind(AlAck::complete(0)));
+    test.deliver_all_messages();
+    assert_eq!(reporter.get_state(), TxState::Acknowledged);
+}
+
+/// Nexus-BS `test_same_link_al_setup_clears_pending_outbound_before_ns_reset`.
+#[test]
+fn test_same_link_al_setup_clears_pending_outbound_before_ns_reset() {
+    debug::setup_logging_verbose();
+    let mut test = llc_test();
+    establish(&mut test, default_al_setup());
+    let (first, first_reporter) = tl_data_req_al(&[1, 2, 3]);
+    test.submit_message(first);
+    let msgs = run_llc(&mut test, 1);
+    assert!(al_segment_headers(&msgs).iter().any(|s| s.2 == 0));
+
+    test.submit_message(build_al_setup_ind());
+    test.deliver_all_messages();
+    let reset = drain(&mut test, true);
+    assert!(
+        first_reporter.is_in_final_state() && first_reporter.get_state() != TxState::Acknowledged,
+        "a reset fails the pending transfer: {:?}",
+        first_reporter.get_state()
+    );
+    assert!(al_setup_from(&reset).is_some(), "same-link setup is still answered");
+
+    let (second, second_reporter) = tl_data_req_al(&[4, 5, 6]);
+    test.submit_message(second);
+    let msgs = run_llc(&mut test, 2);
+    assert!(al_segment_headers(&msgs).iter().any(|s| s.2 == 0), "N(S) starts again from 0");
+    test.submit_message(build_al_ack_ind(AlAck::complete(0)));
+    test.deliver_all_messages();
+    assert_eq!(second_reporter.get_state(), TxState::Acknowledged);
+}
+
+/// Nexus-BS `test_outbound_nonzero_link_tldata_completes_on_complete_al_rnr`.
+#[test]
+fn test_outbound_al_tldata_completes_on_complete_al_rnr() {
+    let mut test = llc_test();
+    establish(&mut test, default_al_setup());
+    let (req, reporter) = tl_data_req_al(&[7]);
+    test.submit_message(req);
+    run_llc(&mut test, 2);
+    test.submit_message(build_al_rnr_complete_ind(0));
+    test.deliver_all_messages();
+    assert_eq!(
+        reporter.get_state(),
+        TxState::Acknowledged,
+        "a complete AL-RNR acknowledges the TL-SDU while it stops new ones"
+    );
+}
+
+/// Nexus-BS `test_outbound_al_rnr_blocks_new_tldata_until_receiver_ready` and
+/// `..._until_t271_expires`.
+#[test]
+fn test_outbound_al_rnr_blocks_new_tldata_until_receiver_ready_or_t271() {
+    let mut test = llc_test();
+    establish(&mut test, default_al_setup());
+    let (first, _) = tl_data_req_al(&[1]);
+    test.submit_message(first);
+    assert_eq!(al_segment_headers(&run_llc(&mut test, 2)).len(), 1);
+    test.submit_message(build_al_rnr_complete_ind(0));
+    test.deliver_all_messages();
+    let (second, _) = tl_data_req_al(&[2]);
+    test.submit_message(second);
+    assert!(al_segment_headers(&run_llc(&mut test, 4)).is_empty(), "receiver not ready");
+    test.submit_message(build_al_ack_ind(AlAck::complete(0)));
+    assert_eq!(al_segment_headers(&run_llc(&mut test, 2)).len(), 1, "AL-ACK: receiver ready again");
+
+    test.submit_message(build_al_rnr_complete_ind(1));
+    test.deliver_all_messages();
+    let (third, _) = tl_data_req_al(&[3]);
+    test.submit_message(third);
+    assert!(al_segment_headers(&run_llc(&mut test, 8)).is_empty());
+    assert_eq!(
+        al_segment_headers(&run_llc(&mut test, T271_RECEIVER_NOT_READY_FOR_TX_TIMER as usize)).len(),
+        1,
+        "T.271 expiry lets the LLC try new TL-SDUs again"
+    );
+}
+
+/// Nexus-BS `test_outbound_nonzero_link_tldata_waits_t252_before_al_retransmission`.
+#[test]
+fn test_outbound_al_tldata_waits_t252_before_retransmission() {
+    let mut test = llc_test();
+    establish(&mut test, default_al_setup());
+    let (req, reporter) = tl_data_req_al(&[9, 9]);
+    test.submit_message(req);
+    assert_eq!(al_segment_headers(&run_llc(&mut test, 2)).len(), 1);
+    assert_eq!(reporter.get_state(), TxState::Transmitted);
+    assert!(
+        al_segment_headers(&run_llc(&mut test, T251_SENDER_RETRY_TIMER as usize + 4)).is_empty(),
+        "the AL waits T.252, not T.251"
+    );
+    let retry = al_segment_headers(&run_llc(&mut test, T252_ACK_WAITING_TIMER as usize));
+    assert_eq!(retry.len(), 1, "T.252 expiry asks again");
+    assert!(retry[0].0 && retry[0].1);
+}
+
+/// Nexus-BS `test_outbound_nonzero_link_tldata_segments_large_tl_sdu_and_completes_on_al_ack`.
+#[test]
+fn test_outbound_al_tldata_segments_large_tl_sdu_and_completes_on_al_ack() {
+    let mut test = llc_test();
+    establish(&mut test, default_al_setup());
+    let payload: Vec<u8> = (0..180).map(|i| i as u8).collect();
+    let (req, reporter) = tl_data_req_al(&payload);
+    test.submit_message(req);
+    let segments = al_segment_headers(&run_llc(&mut test, 12));
+    assert!(segments.len() > 1, "large TL-SDU segmented");
+    for (idx, (final_segment, ar, ns, ss, bits)) in segments.iter().enumerate() {
+        assert_eq!((*ns, *ss as usize), (0, idx));
+        assert!(*bits <= 194, "segment payload inside one SCH/F MAC-RESOURCE");
+        assert_eq!(*final_segment, idx == segments.len() - 1);
+        assert_eq!(*ar, idx == segments.len() - 1 || (idx + 1) % 4 == 0);
+    }
+    assert_eq!(segments.iter().map(|s| s.4).sum::<usize>(), 180 * 8 + 32);
+    assert_eq!(reporter.get_state(), TxState::Transmitted);
+    test.submit_message(build_al_ack_ind(AlAck::complete(0)));
+    test.deliver_all_messages();
+    assert_eq!(reporter.get_state(), TxState::Acknowledged);
+}
+
+/// Nexus-BS `test_outbound_al_rejects_tldata_exceeding_negotiated_n271_before_ns_use`.
+#[test]
+fn test_outbound_al_rejects_tldata_exceeding_negotiated_n271_before_ns_use() {
+    let mut test = llc_test();
+    let mut setup = default_al_setup();
+    setup.max_tl_sdu_len_code = 3; // 256 octets including the FCS.
+    establish(&mut test, setup);
+    let (req, reporter) = tl_data_req_al(&[0x81; 253]);
+    test.submit_message(req);
+    assert!(al_segment_headers(&run_llc(&mut test, 2)).is_empty());
+    assert_eq!(reporter.get_state(), TxState::Discarded, "longer than N.271: fails at once");
+    let (next, _) = tl_data_req_al(&[0x42; 20]);
+    test.submit_message(next);
+    assert!(
+        al_segment_headers(&run_llc(&mut test, 2)).iter().any(|s| s.2 == 0),
+        "the rejected TL-SDU did not use N(S) 0"
+    );
+}
+
+/// Nexus-BS `test_outbound_segmented_al_requests_periodic_ack_and_retries_selective_missing_segment`.
+#[test]
+fn test_outbound_segmented_al_requests_periodic_ack_and_retries_selective_missing_segment() {
+    let mut test = llc_test();
+    establish(&mut test, default_al_setup());
+    let payload: Vec<u8> = (0..560).map(|i| i as u8).collect();
+    let (req, reporter) = tl_data_req_al(&payload);
+    test.submit_message(req);
+    let segments = al_segment_headers(&run_llc(&mut test, 30));
+    assert!(segments.len() > 16);
+    for (idx, (final_segment, ar, _, ss, _)) in segments.iter().enumerate() {
+        assert_eq!(*ss as usize, idx);
+        assert_eq!(*ar, *final_segment || (idx + 1) % 4 == 0, "periodic AR and on AL-FINAL");
+    }
+    test.submit_message(build_al_ack_ind(AlAck::selective(true, 0, 8, 0, 1)));
+    let retry = al_segment_headers(&run_llc(&mut test, 3));
+    assert_eq!(retry.iter().map(|s| s.3).collect::<Vec<_>>(), vec![8], "only the missing segment");
+    assert!(retry[0].1, "the retransmission asks for an acknowledgement");
+    assert_ne!(reporter.get_state(), TxState::Acknowledged, "a partial AL-ACK does not complete it");
+}
+
+/// Nexus-BS `test_outbound_segmented_al_t252_repeats_ack_request_before_full_tl_sdu_retransmit`.
+#[test]
+fn test_outbound_segmented_al_t252_repeats_ack_request_before_full_tl_sdu_retransmit() {
+    let mut test = llc_test();
+    let mut setup = default_al_setup();
+    setup.max_tl_sdu_retransmissions = 1;
+    establish(&mut test, setup);
+    let (req, reporter) = tl_data_req_al(&[0x5a; 50]);
+    test.submit_message(req);
+    let first = al_segment_headers(&run_llc(&mut test, 4));
+    assert_eq!(first.iter().map(|s| s.3).collect::<Vec<_>>(), vec![0, 1, 2]);
+    let retry = al_segment_headers(&run_llc(&mut test, T252_ACK_WAITING_TIMER as usize + 1));
+    assert_eq!(
+        retry.iter().map(|s| (s.0, s.1, s.3)).collect::<Vec<_>>(),
+        vec![(true, true, 2)],
+        "T.252 repeats the AL-FINAL-AR, it does not restart the TL-SDU"
+    );
+    assert_eq!(reporter.get_state(), TxState::Transmitted, "not failed while N.274 remains");
 }

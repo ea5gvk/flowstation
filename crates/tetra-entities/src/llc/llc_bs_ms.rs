@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::{MessageQueue, TetraEntityTrait};
-use tetra_config::bluestation::SharedConfig;
+use tetra_config::bluestation::{SharedConfig, StackMode};
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress, TxReporter, TxState, unimplemented_log};
 use tetra_saps::lcmc::enums::alloc_type::ChanAllocType;
@@ -11,6 +11,7 @@ use tetra_saps::tla::{TlaTlDataIndBl, TlaTlUnitdataIndBl};
 use tetra_saps::tma::TmaUnitdataReq;
 use tetra_saps::{SapMsg, SapMsgInner};
 
+use crate::llc::advanced_link::AdvancedLinkEngine;
 use crate::llc::components::fcs;
 use tetra_pdus::llc::consts::consts::N252_BL_MAX_TLSDU_RETRANSMITS_ACKED;
 use tetra_pdus::llc::consts::timers::T251_SENDER_RETRY_TIMER;
@@ -90,11 +91,19 @@ pub struct Llc {
 
     /// Carrier, timeslot and time of the last uplink PDU received from each individual SSI.
     last_uplink: HashMap<u32, (u16, u8, TdmaTime)>,
+
+    /// Advanced links of the packet-data bearer: only with `[packet_data]` on (BS).
+    al: Option<AdvancedLinkEngine>,
 }
 
 impl Llc {
     pub fn new(config: SharedConfig) -> Self {
+        let al = {
+            let cfg = config.config();
+            (cfg.packet_data.enabled && cfg.stack_mode == StackMode::Bs).then(AdvancedLinkEngine::new)
+        };
         Self {
+            al,
             dltime: TdmaTime::default(),
             config,
             scheduled_out_acks: VecDeque::new(),
@@ -526,6 +535,18 @@ impl Llc {
             SapMsgInner::TlaTlUnitdataReqBl(_) => {
                 self.rx_tla_tlunitdata_req_bl(queue, message);
             }
+            SapMsgInner::TlaTlDataReqAl(_) => {
+                let SapMsgInner::TlaTlDataReqAl(prim) = message.msg else { return };
+                match self.al.as_mut() {
+                    Some(al) => al.tx_request(prim),
+                    None => {
+                        tracing::warn!("LLC: TL-DATA for an advanced link without [packet_data], discarded");
+                        if let Some(r) = prim.tx_reporter.filter(|r| r.get_state() == TxState::Pending) {
+                            r.mark_discarded();
+                        }
+                    }
+                }
+            }
             _ => {
                 tracing::warn!("unhandled match variant, ignoring");
             }
@@ -576,6 +597,18 @@ impl Llc {
             | LlcPduType::BlAck
             | LlcPduType::BlAckFcs => {
                 self.rx_tma_unitdata_ind_bl(queue, message);
+            }
+
+            LlcPduType::AlSetup | LlcPduType::AlDataAlFinal | LlcPduType::AlAckAlRnr | LlcPduType::AlReconnect | LlcPduType::AlDisc
+                if self.al.is_some() =>
+            {
+                let main_carrier = self.main_carrier();
+                if let SapMsgInner::TmaUnitdataInd(prim) = &mut message.msg
+                    && let Some(pdu) = prim.pdu.take()
+                    && let Some(al) = self.al.as_mut()
+                {
+                    al.rx(queue, prim, pdu, pdu_type, main_carrier);
+                }
             }
 
             LlcPduType::AlSetup
@@ -1065,6 +1098,14 @@ impl TetraEntityTrait for Llc {
 
         // Step 4 / 4: Send any U-DATA messages
         had_activity |= self.submit_udata_msgs_to_umac(queue);
+
+        // Advanced links ([packet_data] only): timers and the next data segment for the MCCH
+        if self.al.is_some() {
+            let main_carrier = self.main_carrier();
+            if let Some(al) = self.al.as_mut() {
+                had_activity |= al.tick_end(queue, main_carrier);
+            }
+        }
 
         had_activity
     }
