@@ -1089,6 +1089,57 @@ fn group_call_setup_is_not_held_behind_an_al_transfer() {
     assert!(al_segments_on_air(&after).len() >= 3, "the transfer goes on after it");
 }
 
+/// A group PDU queued while a basic-link datagram of 300 octets (about ten MCCH blocks) is being
+/// fragmented goes out within the next two MCCH blocks, ahead of the datagram's next fragment,
+/// and the datagram still completes.
+#[test]
+fn group_call_setup_is_not_held_behind_a_fragmented_datagram() {
+    debug::setup_logging_verbose();
+    let mut mac = MacAir::new();
+    let reporter = TxReporter::new_unacked();
+    mac.test
+        .submit_message(tl_unitdata_to(TetraAddress::issi(ISSI), 300, Some(reporter.clone())));
+    let before = mac.run(4 * 3);
+    assert!(
+        before.iter().any(|b| b.3.iter().any(|r| r.0 == ISSI && r.1 == 0b111111)),
+        "the datagram's fragmentation started"
+    );
+    let mut pdu = BitBuffer::new_autoexpand(128);
+    BlUdata { has_fcs: false }.to_bitbuf(&mut pdu);
+    pdu.write_bits(0b010, 3); // CMCE
+    pdu.write_bits(0x1234_5678_9abc_def0, 64);
+    pdu.write_bits(0x0fed_cba9_8765, 48);
+    pdu.seek(0);
+    mac.test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+            carrier_num: Some(MAIN_CARRIER),
+            req_handle: 0,
+            pdu,
+            main_address: TetraAddress::new(GSSI, SsiType::Gssi),
+            link_id: 0,
+            endpoint_id: 0,
+            stealing_permission: false,
+            subscriber_class: 0,
+            air_interface_encryption: None,
+            stealing_repeats_flag: None,
+            data_category: None,
+            chan_alloc: None,
+            tx_reporter: None,
+        }),
+    });
+    let after = mac.run(4 * 16);
+    let mcch: Vec<&AirBlock> = after.iter().filter(|b| b.1 == MAIN_CARRIER && b.2 == 1).collect();
+    let at = mcch
+        .iter()
+        .position(|b| b.3.iter().any(|r| r.0 == GSSI))
+        .expect("the group PDU went out");
+    assert!(at < 2, "the group PDU waited {} MCCH blocks: {:?}", at, &mcch[..=at]);
+    assert_eq!(reporter.get_state(), TxState::Transmitted, "the datagram completed");
+}
+
 /// With a call on timeslot 2, nothing of the advanced link is stolen from it: every AL PDU goes
 /// out on the MCCH.
 #[test]

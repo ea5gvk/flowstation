@@ -27,7 +27,10 @@ use tetra_pdus::{
 
 use crate::{
     lmac::components::scrambler,
-    umac::subcomp::{bs_frag::BsFragger, circuit_mgr::CircuitMgr},
+    umac::subcomp::{
+        bs_frag::{BsFragger, MIN_SLOT_CAP_FOR_FRAG},
+        circuit_mgr::CircuitMgr,
+    },
 };
 
 /// We submit this many TX timeslots ahead of the current time
@@ -917,6 +920,23 @@ impl BsChannelScheduler {
         self.dl_enqueue_tma_on_timeslots(timeslots, pdu, sdu, tx_reporter);
     }
 
+    /// A packet-data TM-SDU (`[packet_data]`): it waits in line like any resource, and once its
+    /// fragmentation has started it lets signalling that fits whole go before its fragments (see
+    /// `dl_take_next_sched_item`).
+    pub fn dl_enqueue_packet_data_for_link(&mut self, link_id: LinkId, pdu: MacResource, sdu: BitBuffer, tx_reporter: Option<TxReporter>) {
+        let ts = self.identify_timeslots_for_ssi(pdu.addr, link_id)[0];
+        let fragger = BsFragger::new(pdu, sdu, tx_reporter).for_packet_data();
+        if ts == 0 {
+            // Dropping the fragger reports the TM-SDU discarded.
+            tracing::debug!(
+                "dl_enqueue_packet_data: carrier={} dropping unschedulable packet data",
+                self.carrier_num
+            );
+            return;
+        }
+        self.dltx_queues[ts as usize - 1].push(DlSchedElem::FragBuf(fragger));
+    }
+
     /// Consumes and returns true if a pending random access ack exists for the given SSI on
     /// this timeslot. Used when building STCH blocks so the MAC-RESOURCE can carry
     /// random_access_flag=true per ETSI 21.4.3.1.
@@ -1251,7 +1271,8 @@ impl BsChannelScheduler {
         let mut buf_opt = None;
 
         while !self.dltx_queues[ts.t as usize - 1].is_empty() {
-            let opt = self.dl_take_prioritized_sched_item(ts);
+            let room = buf_opt.as_ref().map_or(SCH_F_CAP, |buf: &BitBuffer| buf.get_len_remaining());
+            let opt = self.dl_take_next_sched_item(ts, room);
 
             match opt {
                 Some(sched_elem) => {
@@ -1394,6 +1415,21 @@ impl BsChannelScheduler {
     /// If none; return first to-be-transmitted resource.
     /// If none, return None.
     pub fn dl_take_prioritized_sched_item(&mut self, ts: TdmaTime) -> Option<DlSchedElem> {
+        self.dl_take_next_sched_item(ts, SCH_F_CAP)
+    }
+
+    /// Whether `elem` goes whole in `room` bits and leaves room for a fragment after it.
+    fn fits_before_a_fragment(elem: &DlSchedElem, room: usize) -> bool {
+        let len = match elem {
+            DlSchedElem::Resource(pdu, sdu, _) => pdu.compute_header_len() + sdu.get_len(),
+            DlSchedElem::FragBuf(f) if !f.is_started() && !f.is_packet_data() => f.whole_len_bits(),
+            _ => return false,
+        };
+        len.div_ceil(8) * 8 + MIN_SLOT_CAP_FOR_FRAG <= room
+    }
+
+    /// `dl_take_prioritized_sched_item` for a block with `room` bits still free.
+    fn dl_take_next_sched_item(&mut self, ts: TdmaTime, room: usize) -> Option<DlSchedElem> {
         if ts.f == 18 {
             // No resources on frame 18
             return None;
@@ -1416,13 +1452,28 @@ impl BsChannelScheduler {
             return Some(q.remove(i));
         }
 
-        // Return FragBufs next
-        if let Some(i) = q.iter().position(|e| matches!(e, DlSchedElem::FragBuf(_))) {
+        // Return FragBufs next. A packet-data TM-SDU not started yet waits in line with the
+        // resources instead.
+        if let Some(i) = q
+            .iter()
+            .position(|e| matches!(e, DlSchedElem::FragBuf(f) if f.is_started() || !f.is_packet_data()))
+        {
+            // A packet-data TM-SDU being fragmented lets signalling go first that fits whole in this
+            // block and leaves room for its next fragment: the BS may interrupt a fragmented
+            // message with non-fragmented ones (EN 300 392-2 23.4.2.1.1), and a fragment still goes
+            // in every block.
+            if matches!(&q[i], DlSchedElem::FragBuf(f) if f.is_packet_data())
+                && let Some(j) = q.iter().position(|e| Self::fits_before_a_fragment(e, room))
+            {
+                return Some(q.remove(j));
+            }
             return Some(q.remove(i));
         }
 
         // Return Resources next
-        if let Some(i) = q.iter().position(|e| matches!(e, DlSchedElem::Resource(_, _, _))) {
+        if let Some(i) = q.iter().position(|e| {
+            matches!(e, DlSchedElem::Resource(_, _, _)) || matches!(e, DlSchedElem::FragBuf(f) if f.is_packet_data() && !f.is_started())
+        }) {
             return Some(q.remove(i));
         }
 

@@ -13,13 +13,15 @@ pub struct BsFragger {
     is_fully_transmitted: bool,
     sdu: BitBuffer,
     tx_reporter: Option<TxReporter>,
+    /// A packet-data TM-SDU (see `BsChannelScheduler::dl_enqueue_packet_data_for_link`).
+    packet_data: bool,
 }
 
 /// We won't start fragmentation if less than MIN_SLOT_CAP_FOR_FRAG_START bits are free in the slot
 const MIN_SLOT_CAP_FOR_RES_FRAG_START: usize = 32;
 
 /// We won't insert a fragment if less than MIN_SLOT_CAP_FOR_FRAG bits are free in the slot
-const MIN_SLOT_CAP_FOR_FRAG: usize = 16;
+pub(crate) const MIN_SLOT_CAP_FOR_FRAG: usize = 16;
 
 impl BsFragger {
     pub fn new(resource: MacResource, sdu: BitBuffer, tx_reporter: Option<TxReporter>) -> Self {
@@ -32,7 +34,28 @@ impl BsFragger {
             is_fully_transmitted: false,
             sdu,
             tx_reporter,
+            packet_data: false,
         }
+    }
+
+    /// Mark the TM-SDU as packet data.
+    pub fn for_packet_data(mut self) -> Self {
+        self.packet_data = true;
+        self
+    }
+
+    pub fn is_packet_data(&self) -> bool {
+        self.packet_data
+    }
+
+    /// Whether the MAC-RESOURCE (the first fragment) went out.
+    pub fn is_started(&self) -> bool {
+        self.mac_hdr_is_written
+    }
+
+    /// MAC-RESOURCE header and TM-SDU, in bits, before anything went out.
+    pub fn whole_len_bits(&self) -> usize {
+        self.resource.compute_header_len() + self.sdu.get_len_remaining()
     }
 
     /// SSI the PDU is addressed to.

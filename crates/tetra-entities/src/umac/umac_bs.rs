@@ -27,7 +27,7 @@ use tetra_saps::control::call_control::{CallControl, Circuit, CircuitDlMediaSour
 use tetra_saps::lcmc::enums::alloc_type::ChanAllocType;
 use tetra_saps::lcmc::enums::ul_dl_assignment::UlDlAssignment;
 use tetra_saps::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
-use tetra_saps::tma::{TmaReport, TmaReportInd, TmaUnitdataInd};
+use tetra_saps::tma::{DATA_CATEGORY_PACKET_DATA, TmaReport, TmaReportInd, TmaUnitdataInd};
 use tetra_saps::tmv::enums::logical_chans::LogicalChannel;
 use tetra_saps::tmv::{TmvConfigureReq, TmvUnitdataReqSlots};
 use tetra_saps::{SapMsg, SapMsgInner};
@@ -1789,7 +1789,12 @@ impl UmacBs {
         // BCCH carriers in `SecondaryBcchNoMcch` mode intentionally have no MCCH,
         // so enqueueing call-setup/control PDUs there makes them unschedulable
         // and drops D-CONNECT/D-SETUP for cross-carrier calls.
-        self.channel_scheduler.dl_enqueue_tma_for_link(link_id, pdu, sdu, prim.tx_reporter);
+        if prim.data_category == Some(DATA_CATEGORY_PACKET_DATA) {
+            self.channel_scheduler
+                .dl_enqueue_packet_data_for_link(link_id, pdu, sdu, prim.tx_reporter);
+        } else {
+            self.channel_scheduler.dl_enqueue_tma_for_link(link_id, pdu, sdu, prim.tx_reporter);
+        }
     }
 
     fn rx_tma_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {

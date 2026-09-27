@@ -45,6 +45,11 @@ pub struct TmaReportInd {
     pub report: TmaReport,
 }
 
+/// `TmaUnitdataReq::data_category` of a packet-data TM-SDU (an SNDCP datagram): the MAC lets
+/// signalling that fits whole go before its fragments (clause 20.2.4.13 leaves the values to the
+/// implementer).
+pub const DATA_CATEGORY_PACKET_DATA: Todo = 1;
+
 /// Clause 20.4.1.1.4
 /// TMA-UNITDATA request: this primitive shall be used to request the MAC to
 /// transmit a TM-SDU.

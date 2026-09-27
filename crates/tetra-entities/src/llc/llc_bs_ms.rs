@@ -8,7 +8,7 @@ use tetra_saps::lcmc::enums::alloc_type::ChanAllocType;
 use tetra_saps::lcmc::enums::ul_dl_assignment::UlDlAssignment;
 use tetra_saps::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
 use tetra_saps::tla::{TlaTlDataIndBl, TlaTlUnitdataIndBl};
-use tetra_saps::tma::TmaUnitdataReq;
+use tetra_saps::tma::{DATA_CATEGORY_PACKET_DATA, TmaUnitdataReq};
 use tetra_saps::{SapMsg, SapMsgInner};
 
 use crate::llc::advanced_link::AdvancedLinkEngine;
@@ -378,7 +378,11 @@ impl Llc {
                 subscriber_class: prim.subscriber_class,
                 air_interface_encryption: prim.air_interface_encryption,
                 stealing_repeats_flag: None, // fixme
-                data_category: prim.data_class_info,
+                data_category: if prim.packet_data_flag {
+                    Some(DATA_CATEGORY_PACKET_DATA)
+                } else {
+                    prim.data_class_info
+                },
                 chan_alloc: prim.chan_alloc,
                 tx_reporter: prim.tx_reporter.take(),
             }),
