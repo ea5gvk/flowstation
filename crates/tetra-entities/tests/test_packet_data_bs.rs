@@ -2702,10 +2702,11 @@ fn ready_expiry_on_the_pdch_sends_the_radio_back() {
     assert!(air.test.config.state_read().pdch_by_issi.is_empty());
 }
 
-/// Without data for `pdch_idle_release_secs` the PDCH goes back without any signalling (the AACH
-/// tells the radio); a radio with data going on keeps its PDCH.
+/// Without data for `pdch_idle_release_secs` a radio in READY is sent back to the MCCH with
+/// SN-END OF DATA (quit and go) on its PDCH, which goes once that went out (clause 28.2.6.2
+/// NOTE 1); a radio with data going on keeps its PDCH.
 #[test]
-fn an_idle_pdch_is_released_without_signalling() {
+fn an_idle_pdch_ends_with_end_of_data() {
     let mut cfg = pdch_config(true);
     cfg.packet_data.ready_timer_code = 11; // 60 s: READY stays out of the way
     cfg.packet_data.pdch_idle_release_secs = 2;
@@ -2722,7 +2723,9 @@ fn an_idle_pdch_is_released_without_signalling() {
         air.run(60);
     }
     let sent: Vec<Down> = air.take_sn().into_iter().filter(|d| d.issi == ISSI).collect();
-    assert!(sent.is_empty(), "no signalling to the idle radio: {sent:?}");
+    assert_eq!(sent.len(), 1, "one SN-END OF DATA to the idle radio: {sent:?}");
+    assert_eq!((sent[0].sn_type(), sent[0].link_id), (Some(8), 4), "on its PDCH");
+    assert_eq!(sent[0].alloc.as_ref().map(|a| a.alloc_type), Some(ChanAllocType::QuitAndGo));
     assert_eq!(pdch_slot_of(&air, ISSI), None, "idle PDCH released");
     assert_eq!(air.test.config.state_read().timeslot_alloc.owner(4), None);
     assert_eq!(pdch_slot_of(&air, ISSI2), Some(3), "the busy one is kept");
@@ -2757,6 +2760,33 @@ fn a_radio_back_on_the_mcch_is_assigned_its_pdch_again() {
         SndcpDataTransmitResponseResult::Accepted
     );
     assert_eq!((response.link_id, response.alloc.as_ref().map(ts_of)), (0, Some(vec![4])));
+}
+
+/// SN-RECONNECT without data to send from the MCCH, as a radio sends it after losing its PDCH or
+/// coming back from a call (clause 28.3.4.2 c, table 28.18): no answer, no PDCH, its old one given
+/// back. The context stays (STANDBY): its next request gets its answer.
+#[test]
+fn a_reconnect_without_data_gets_no_answer_and_no_pdch() {
+    let mut air = Air::new(pdch_config(false));
+    onto_pdch(&mut air, ISSI);
+    let reconnect = encode_reconnect(&SndcpReconnect {
+        nsapi: None,
+        resource_request: SndcpPacketDataResourceRequest::None,
+    })
+    .unwrap()
+    .to_bitstr();
+    air.send(ISSI, &reconnect);
+    air.run(80);
+    assert!(air.take_sn().is_empty(), "no SN-PDU back");
+    assert_eq!(pdch_slot_of(&air, ISSI), None, "no PDCH");
+    assert_eq!(air.test.config.state_read().timeslot_alloc.owner(4), None);
+    air.send(ISSI, &transmit_request(1, None));
+    let response = air.next_sn(8).expect("RESPONSE");
+    assert_eq!(
+        decode_data_transmit_response(&response.sn_buf()).unwrap().result,
+        SndcpDataTransmitResponseResult::Accepted
+    );
+    assert!(response.alloc.is_some(), "a PDCH again");
 }
 
 /// Voice takes the PDCH slot: the grant goes within a second and the radio's data goes on on

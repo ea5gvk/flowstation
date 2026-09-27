@@ -14,9 +14,10 @@
 //! `PacketData` and published in `StackState::pdch_by_issi` for the MAC (AACH) and the LLC
 //! (routing). Voice takes the slot when nothing else is free; the radio then sees the AACH change
 //! and returns to the MCCH by itself, where its data goes on. The channel is given back with
-//! SN-END OF DATA (quit and go back to the MCCH), without signalling after
-//! `pdch_idle_release_secs` without data, when the radio goes into a call, or when its contexts
-//! end. With no slot free the data stays on the MCCH.
+//! SN-END OF DATA (quit and go back to the MCCH, STANDBY) when READY ends or after
+//! `pdch_idle_release_secs` without data, and without signalling when the radio goes into a call,
+//! reconnects from the MCCH without data (it is in STANDBY already) or its contexts end. With no
+//! slot free the data stays on the MCCH.
 //!
 //! The SNDCP timers run on the TDMA clock (one tick per timeslot); the gateway keeps wall-clock
 //! time for WTP.
@@ -893,23 +894,52 @@ impl PacketDataRuntime {
         now: Instant,
     ) {
         let issi = ind.received_tetra_address.ssi;
+        // The NSAPI is there exactly when "data to send" is 1.
         let (nsapi, detail) = match decode_reconnect(&BitBuffer::from_bitstr(bits)) {
             Ok(r) => (r.nsapi, resources(&r.resource_request)),
-            Err(e) => match field(bits, 4, 1) {
-                Some(1) => (field(bits, 5, 4).filter(|n| valid_nsapi(*n)), format!("rest not decoded: {e:?}")),
-                Some(0) => (None, format!("rest not decoded: {e:?}")),
+            Err(e) => match (field(bits, 4, 1), field(bits, 5, 4).filter(|n| valid_nsapi(*n))) {
+                (Some(1), Some(nsapi)) => (Some(nsapi), format!("rest not decoded: {e:?}")),
+                (Some(0), _) => (None, format!("rest not decoded: {e:?}")),
                 _ => {
                     self.warn_malformed(issi, "SN-RECONNECT");
                     return;
                 }
             },
         };
-        // Without data to send the radio names no NSAPI: answer for its first context.
-        let nsapi = nsapi.or_else(|| self.ctxs.keys().filter(|k| k.0 == issi).map(|k| k.1).min());
         match nsapi {
             Some(nsapi) => self.respond_transmit(queue, ind, nsapi, "SN-RECONNECT", &detail, wap, config, now),
-            None => tracing::info!("SNDCP: SN-RECONNECT from ISSI {} without a PDP context, ignored", issi),
+            None => self.reconnect_without_data(issi, &detail, wap, config, now),
         }
+    }
+
+    /// SN-RECONNECT with "data to send" = 0 (clause 28.3.4.2 c, table 28.18): the radio is in
+    /// STANDBY and nothing goes back; its contexts enter STANDBY here too and its packet-data
+    /// channel, which it left, is given back. Datagrams waiting for it stay held (the station does
+    /// not send SN-DATA TRANSMIT REQUEST): they go down after its next request.
+    fn reconnect_without_data(&mut self, issi: u32, detail: &str, wap: Option<&mut WapService>, config: &SharedConfig, now: Instant) {
+        if !self.has_ctx(issi) {
+            tracing::info!("SNDCP: SN-RECONNECT from ISSI {} without a PDP context, ignored", issi);
+            return;
+        }
+        let (standby_slots, clock) = (self.standby_slots, self.clock);
+        let mut held = 0;
+        for (_, ctx) in self.ctxs.iter_mut().filter(|(k, _)| k.0 == issi) {
+            ctx.state = CtxState::Standby;
+            ctx.deadline = clock + standby_slots;
+            held += ctx.dl.len();
+        }
+        tracing::info!(
+            "SNDCP: SN-RECONNECT from ISSI {} without data to send ({}) -> STANDBY, no response{}",
+            issi,
+            detail,
+            if held > 0 {
+                format!(", {held} datagram(s) held until its next request")
+            } else {
+                String::new()
+            }
+        );
+        self.release_pdch(config, issi, "SN-RECONNECT without data, the radio is on the MCCH");
+        self.sync_pause(issi, wap, now);
     }
 
     fn on_end_of_data(
@@ -1152,21 +1182,30 @@ impl PacketDataRuntime {
             }
             self.release_issi(key.0, wap.as_deref_mut(), config);
         }
+        self.pdch_housekeeping(queue, config, &status, wap.as_deref());
         for issi in issis {
             self.sync_pause(issi, wap.as_deref_mut(), now);
         }
-        self.pdch_housekeeping(config, &status, wap.as_deref());
     }
 
     /// A packet-data channel goes when its radio went into a call (it listens to the call's
     /// channel), or after `pdch_idle_release_secs` without data and with no download running for
-    /// it: the AACH then shows the slot unallocated and the radio returns to the MCCH on its own.
-    fn pdch_housekeeping(&mut self, config: &SharedConfig, status: &HashMap<u32, (bool, bool)>, wap: Option<&WapService>) {
+    /// it: a radio in READY is sent back to the MCCH with SN-END OF DATA and enters STANDBY
+    /// (clause 28.2.6.2 NOTE 1: the SwMI releases the PDCH), else the slot just goes (the AACH
+    /// shows it unallocated).
+    fn pdch_housekeeping(
+        &mut self,
+        queue: &mut MessageQueue,
+        config: &SharedConfig,
+        status: &HashMap<u32, (bool, bool)>,
+        wap: Option<&WapService>,
+    ) {
         let Some(idle_slots) = self.pdch_cfg.as_ref().map(|p| p.idle_slots) else {
             return;
         };
         let clock = self.clock;
         let mut release: Vec<(u32, &str)> = Vec::new();
+        let mut end: Vec<(u32, u8)> = Vec::new();
         for (issi, p) in &self.pdch {
             if status.get(issi).is_some_and(|s| s.1) {
                 release.push((*issi, "the radio is in a call"));
@@ -1177,13 +1216,38 @@ impl PacketDataRuntime {
                 && clock.saturating_sub(p.last_activity) >= idle_slots
                 && !wap.is_some_and(|w| w.has_open_transactions(*issi))
                 && !self.ctxs.iter().any(|(k, c)| k.0 == *issi && !c.dl.is_empty());
-            if idle {
+            if !idle {
+                continue;
+            }
+            if self.ctxs.iter().any(|(k, c)| k.0 == *issi && c.state == CtxState::Ready) {
+                end.push((*issi, p.slot.ts));
+            } else {
                 release.push((*issi, "idle"));
             }
         }
         release.sort_unstable();
         for (issi, why) in release {
             self.release_pdch(config, issi, why);
+        }
+        end.sort_unstable();
+        let standby_slots = self.standby_slots;
+        for (issi, ts) in end {
+            let mut addr = None;
+            for (_, ctx) in self.ctxs.iter_mut().filter(|(k, _)| k.0 == issi) {
+                ctx.state = CtxState::Standby;
+                ctx.deadline = clock + standby_slots;
+                addr = Some(ctx.addr);
+            }
+            let Some(addr) = addr else { continue };
+            tracing::info!(
+                "SNDCP: PDCH ts {} of ISSI {} idle for {} s: SN-END OF DATA, STANDBY",
+                ts,
+                issi,
+                idle_slots * 85 / 6 / 1000
+            );
+            if let Some(msg) = self.end_of_data_msg(config, addr, 0, 0, "idle") {
+                queue.push_back(msg);
+            }
         }
     }
 
@@ -1483,5 +1547,26 @@ enabled = true
         rt.housekeeping(&mut queue, &config, Some(&mut wap), now);
         assert!(rt.ctxs.is_empty() && rt.by_ip.is_empty() && rt.paused.is_empty());
         assert_eq!(rt.allocate(), Some(Ipv4Addr::new(10, 0, 0, 2)), "address back in the pool");
+    }
+
+    /// SN-RECONNECT without data to send (table 28.18): no answer, the context enters STANDBY and
+    /// the gateway waits.
+    #[test]
+    fn a_reconnect_without_data_is_not_answered_and_enters_standby() {
+        use super::super::transfer::{SndcpReconnect, encode_reconnect};
+        let config = shared_config();
+        let mut wap = WapService::start(&config).unwrap();
+        let now = Instant::now();
+        let mut rt = ready_runtime(&config, &mut wap, now);
+        let pdu = encode_reconnect(&SndcpReconnect {
+            nsapi: None,
+            resource_request: SndcpPacketDataResourceRequest::None,
+        })
+        .unwrap();
+        let mut queue = MessageQueue::new();
+        rt.rx(&mut queue, &ind(&pdu.to_bitstr()), Some(&mut wap), &config, now);
+        assert!(queue.pop_front().is_none(), "no response");
+        assert_eq!(rt.ctxs[&(ISSI, 1)].state, CtxState::Standby);
+        assert!(rt.paused.contains(&ISSI));
     }
 }
