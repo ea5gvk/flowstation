@@ -15,8 +15,9 @@
 //!   AL-FINAL-AR every fourth segment, on the last one and on the last retransmitted one; T.252
 //!   re-asks with the last segment; missing segments go again up to N.274 times, then the whole
 //!   TL-SDU up to N.273 times; after that the link is closed with AL-DISC.
-//! - Voice first: the engine never steals (every PDU goes on the MCCH with link 0) and keeps at
-//!   most one data segment waiting in the MAC, so a call set-up waits behind one segment at most.
+//! - Voice first: the engine never steals (every PDU goes on the MCCH with link 0, or on the
+//!   radio's packet-data channel) and keeps at most one data segment waiting in the MAC, so a call
+//!   set-up waits behind one segment at most.
 //! - Uplink segments are reassembled within the TL-SDU window, checked against the FCS and
 //!   delivered in N(S) order as TL-DATA indications; AL-DATA-AR / AL-FINAL-AR get an AL-ACK
 //!   (complete, selective or "repeat").
@@ -299,6 +300,8 @@ pub struct AdvancedLinkEngine {
     disc_sent: HashMap<u32, u64>,
     /// Messages pushed since the last tick.
     activity: bool,
+    /// Radios on a packet-data channel (carrier, timeslot): their PDUs go there.
+    pdch_routes: HashMap<u32, (u16, u8)>,
 }
 
 impl Default for AdvancedLinkEngine {
@@ -323,12 +326,26 @@ impl AdvancedLinkEngine {
             order: 0,
             disc_sent: HashMap::new(),
             activity: false,
+            pdch_routes: HashMap::new(),
         }
     }
 
-    /// Carrier and link id the PDUs of `ssi` go on: the MCCH of the main carrier.
-    fn route(&self, _ssi: u32, main_carrier: u16) -> (u16, u32) {
-        (main_carrier, 0)
+    /// The radios now on a packet-data channel (`[packet_data] bearer = "pdch"`).
+    pub fn set_pdch_routes(&mut self, routes: HashMap<u32, (u16, u8)>) {
+        self.pdch_routes = routes;
+    }
+
+    /// Nothing to send and no link to look after.
+    pub fn is_idle(&self) -> bool {
+        self.links.is_empty() && self.pending.is_empty()
+    }
+
+    /// Carrier and link id the PDUs of `ssi` go on: its packet-data channel, else the MCCH of the
+    /// main carrier.
+    fn route(&self, ssi: u32, main_carrier: u16) -> (u16, u32) {
+        self.pdch_routes
+            .get(&ssi)
+            .map_or((main_carrier, 0), |&(carrier, ts)| (carrier, u32::from(ts)))
     }
 
     fn push_pdu(&mut self, queue: &mut MessageQueue, addr: TetraAddress, pdu: BitBuffer, reporter: Option<TxReporter>, main: u16) {

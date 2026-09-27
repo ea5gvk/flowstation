@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::{MessageQueue, TetraEntityTrait};
-use tetra_config::bluestation::{SharedConfig, StackMode};
+use tetra_config::bluestation::{PacketDataBearer, SharedConfig, StackMode};
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress, TxReporter, TxState, unimplemented_log};
 use tetra_saps::lcmc::enums::alloc_type::ChanAllocType;
@@ -94,16 +94,24 @@ pub struct Llc {
 
     /// Advanced links of the packet-data bearer: only with `[packet_data]` on (BS).
     al: Option<AdvancedLinkEngine>,
+
+    /// `[packet_data] bearer = "pdch"` (BS): a radio on its packet-data channel gets its PDUs there.
+    pdch_mode: bool,
 }
 
 impl Llc {
     pub fn new(config: SharedConfig) -> Self {
-        let al = {
+        let (al, pdch_mode) = {
             let cfg = config.config();
-            (cfg.packet_data.enabled && cfg.stack_mode == StackMode::Bs).then(AdvancedLinkEngine::new)
+            let on = cfg.packet_data.enabled && cfg.stack_mode == StackMode::Bs;
+            (
+                on.then(AdvancedLinkEngine::new),
+                on && cfg.packet_data.bearer == PacketDataBearer::Pdch,
+            )
         };
         Self {
             al,
+            pdch_mode,
             dltime: TdmaTime::default(),
             config,
             scheduled_out_acks: VecDeque::new(),
@@ -125,6 +133,31 @@ impl Llc {
         let on_mcch = carrier == self.main_carrier() && ts == 1;
         // A very old entry can wrap to a negative age, so both ends of the range are checked.
         (!on_mcch && (0..=UPLINK_CHANNEL_FRESH_SLOTS).contains(&t.age(self.dltime))).then_some((carrier, ts))
+    }
+
+    /// The packet-data channel (carrier, timeslot) of `ssi`, while voice has not taken its slot:
+    /// once the assignment went out (`on_air_only`), or as soon as it is granted (an uplink on
+    /// that slot shows the radio is there). Always None unless `bearer = "pdch"`.
+    fn pdch_slot(&self, ssi: u32, on_air_only: bool) -> Option<(u16, u8)> {
+        if !self.pdch_mode {
+            return None;
+        }
+        let state = self.config.state_read();
+        let grant = state.pdch_by_issi.get(&ssi)?;
+        let usable =
+            (grant.on_air || !on_air_only) && state.timeslot_alloc.slot_owner(grant.slot) == Some(tetra_core::TimeslotOwner::PacketData);
+        usable.then_some((grant.slot.carrier_num, grant.slot.ts))
+    }
+
+    /// Packet-data channels in use, by ISSI, for the advanced link engine.
+    fn pdch_routes(&self) -> HashMap<u32, (u16, u8)> {
+        let state = self.config.state_read();
+        state
+            .pdch_by_issi
+            .iter()
+            .filter(|(_, g)| g.on_air && state.timeslot_alloc.slot_owner(g.slot) == Some(tetra_core::TimeslotOwner::PacketData))
+            .map(|(issi, g)| (*issi, (g.slot.carrier_num, g.slot.ts)))
+            .collect()
     }
 
     /// A chan_alloc that only names the traffic slot to steal on. Sent with a non-zero link id, so
@@ -275,16 +308,22 @@ impl Llc {
             .as_ref()
             .and_then(|ca| ca.carrier)
             .unwrap_or_else(|| self.main_carrier());
+        // A radio on its packet-data channel gets it there.
+        let pdch = if prim.stealing_permission || prim.main_address.ssi_type == SsiType::Gssi {
+            None
+        } else {
+            self.pdch_slot(prim.main_address.ssi, true)
+        };
         let sapmsg = SapMsg {
             sap: Sap::TmaSap,
             src: self.entity(),
             dest: TetraEntity::Umac,
             msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
-                carrier_num: Some(preferred_carrier),
+                carrier_num: Some(pdch.map_or(preferred_carrier, |(carrier, _)| carrier)),
                 req_handle: prim.req_handle,
                 pdu: pdu_buf,
                 main_address: prim.main_address,
-                link_id: prim.link_id,
+                link_id: pdch.map_or(prim.link_id, |(_, ts)| ts as u32),
                 endpoint_id: prim.endpoint_id,
                 stealing_permission: prim.stealing_permission,
                 subscriber_class: prim.subscriber_class,
@@ -410,10 +449,24 @@ impl Llc {
         // A radio in a call listens to its traffic slot's ACCH, not to the MCCH: an MM message
         // follows it to the slot it just transmitted on. The UMAC steals there, or falls back to
         // the MCCH if that circuit is gone or the PDU does not fit in one slot.
-        let acch = prim
-            .follow_uplink_channel
-            .then(|| self.recent_uplink_traffic_slot(prim.main_address.ssi))
-            .flatten();
+        // A radio on its packet-data channel listens there, not to the MCCH: its PDUs go on that
+        // slot, never stolen, with the caller's channel allocation (if any) unchanged.
+        let pdch = self.pdch_slot(prim.main_address.ssi, true);
+        if let Some((carrier, ts)) = pdch {
+            tracing::debug!(
+                "SSI {}: sending on its packet-data channel, carrier {} ts {}",
+                prim.main_address.ssi,
+                carrier,
+                ts
+            );
+        }
+        let acch = if pdch.is_some() {
+            None
+        } else {
+            prim.follow_uplink_channel
+                .then(|| self.recent_uplink_traffic_slot(prim.main_address.ssi))
+                .flatten()
+        };
         if let Some((carrier, ts)) = acch {
             tracing::debug!(
                 "SSI {}: sending on the ACCH of carrier {} ts {}, where its last uplink came in",
@@ -422,7 +475,7 @@ impl Llc {
                 ts
             );
         }
-        let preferred_carrier = acch.map_or(preferred_carrier, |(carrier, _)| carrier);
+        let preferred_carrier = acch.or(pdch).map_or(preferred_carrier, |(carrier, _)| carrier);
 
         // If an ack still needs to be sent, get the relevant expected sequence number. A PDU on
         // the MCCH takes only an ACK for an uplink received there (22.3.1.1), and only if the link
@@ -435,8 +488,8 @@ impl Llc {
         let out_ack_n = if link_busy || acch.is_some() {
             None
         } else {
-            let main_carrier = self.main_carrier();
-            self.get_out_ack_seq_if_any(prim.main_address, main_carrier, 1)
+            let (carrier, ts) = pdch.unwrap_or((self.main_carrier(), 1));
+            self.get_out_ack_seq_if_any(prim.main_address, carrier, ts)
         };
 
         // Get per-link send sequence number N(S) = V(S), then toggle V(S)
@@ -475,7 +528,7 @@ impl Llc {
 
         // Derive the timeslot from chan_alloc (first set timeslot in [bool;4]), defaulting to 1.
         // Must be done before chan_alloc is moved into TmaUnitdataReq below.
-        let derived_ts: u8 = acch.map(|(_, ts)| ts).unwrap_or_else(|| {
+        let derived_ts: u8 = acch.or(pdch).map(|(_, ts)| ts).unwrap_or_else(|| {
             prim.chan_alloc
                 .as_ref()
                 .and_then(|ca| ca.timeslots.iter().enumerate().find(|&(_, &set)| set).map(|(i, _)| (i + 1) as u8))
@@ -494,7 +547,7 @@ impl Llc {
                 req_handle: prim.req_handle,
                 pdu: pdu_buf,
                 main_address: prim.main_address,
-                link_id: acch.map_or(0, |(_, ts)| ts as u32),
+                link_id: acch.or(pdch).map_or(0, |(_, ts)| ts as u32),
                 endpoint_id: prim.endpoint_id,
                 stealing_permission: prim.stealing_permission || acch.is_some(),
                 subscriber_class: prim.subscriber_class,
@@ -603,10 +656,14 @@ impl Llc {
                 if self.al.is_some() =>
             {
                 let main_carrier = self.main_carrier();
+                let routes = self.pdch_mode.then(|| self.pdch_routes());
                 if let SapMsgInner::TmaUnitdataInd(prim) = &mut message.msg
                     && let Some(pdu) = prim.pdu.take()
                     && let Some(al) = self.al.as_mut()
                 {
+                    if let Some(routes) = routes {
+                        al.set_pdch_routes(routes);
+                    }
                     al.rx(queue, prim, pdu, pdu_type, main_carrier);
                 }
             }
@@ -768,7 +825,8 @@ impl Llc {
             let m = TlaTlUnitdataIndBl {
                 // address_type: 0, // TODO FIXME
                 main_address: prim.main_address,
-                link_id: 0,
+                // The packet-data bearer needs the timeslot (MCCH or packet-data channel)
+                link_id: if self.al.is_some() { prim.link_id } else { 0 },
                 endpoint_id: prim.endpoint_id,
                 new_endpoint_id: prim.new_endpoint_id,
                 css_endpoint_id: prim.css_endpoint_id,
@@ -969,7 +1027,12 @@ impl Llc {
             // unless that is the main carrier's MCCH (TS1). On a secondary carrier TS1 is a
             // traffic slot too: deciding by slot number alone sent those ACKs to the main MCCH,
             // where the radio in the call never heard them.
-            let steal = (1..=4).contains(&ack.ts) && !(ack.carrier_num == self.main_carrier() && ack.ts == 1);
+            // An uplink on the radio's packet-data channel is acknowledged there, not stolen.
+            let on_pdch = self.pdch_mode
+                && (2..=4).contains(&ack.ts)
+                && ack.carrier_num == self.main_carrier()
+                && self.pdch_slot(ack.addr.ssi, false) == Some((ack.carrier_num, ack.ts));
+            let steal = !on_pdch && (1..=4).contains(&ack.ts) && !(ack.carrier_num == self.main_carrier() && ack.ts == 1);
             let mut pdu_buf = BitBuffer::new_autoexpand(5);
             let pdu = BlAck {
                 has_fcs: false,
@@ -992,7 +1055,7 @@ impl Llc {
                     req_handle: 0, // TODO FIXME
                     pdu: pdu_buf,
                     main_address: ack.addr,
-                    link_id: if steal { ack.ts as u32 } else { 0 },
+                    link_id: if steal || on_pdch { ack.ts as u32 } else { 0 },
                     endpoint_id: 0, // todo fixme
                     stealing_permission: steal,
                     subscriber_class: 0,            // TODO FIXME
@@ -1102,7 +1165,11 @@ impl TetraEntityTrait for Llc {
         // Advanced links ([packet_data] only): timers and the next data segment for the MCCH
         if self.al.is_some() {
             let main_carrier = self.main_carrier();
+            let routes = (self.pdch_mode && self.al.as_ref().is_some_and(|al| !al.is_idle())).then(|| self.pdch_routes());
             if let Some(al) = self.al.as_mut() {
+                if let Some(routes) = routes {
+                    al.set_pdch_routes(routes);
+                }
                 had_activity |= al.tick_end(queue, main_carrier);
             }
         }
