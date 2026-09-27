@@ -230,7 +230,7 @@ fn valid_nsapi(nsapi: u8) -> bool {
 
 /// Whether `issi` is on a traffic channel: in an individual call, or affiliated to a group with a
 /// call up (the same live map the SDS path uses).
-fn in_call(state: &StackState, issi: u32) -> bool {
+pub(crate) fn in_call(state: &StackState, issi: u32) -> bool {
     state.active_call_ts.contains_key(&issi)
         || state
             .subscribers

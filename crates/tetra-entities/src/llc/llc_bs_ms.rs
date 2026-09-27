@@ -13,6 +13,7 @@ use tetra_saps::{SapMsg, SapMsgInner};
 
 use crate::llc::advanced_link::AdvancedLinkEngine;
 use crate::llc::components::fcs;
+use crate::sndcp::packet_data::in_call;
 use tetra_pdus::llc::consts::consts::N252_BL_MAX_TLSDU_RETRANSMITS_ACKED;
 use tetra_pdus::llc::consts::timers::T251_SENDER_RETRY_TIMER;
 use tetra_pdus::llc::enums::llc_pdu_type::LlcPduType;
@@ -1286,10 +1287,19 @@ impl TetraEntityTrait for Llc {
         if self.al.is_some() {
             let main_carrier = self.main_carrier();
             let routes = (self.pdch_mode && self.al.as_ref().is_some_and(|al| !al.is_idle())).then(|| self.pdch_routes());
+            // Voice first: a radio in a call gets nothing on its advanced link meanwhile.
+            let busy = self.al.as_ref().map(AdvancedLinkEngine::busy_ssis).unwrap_or_default();
+            let in_call: HashSet<u32> = if busy.is_empty() {
+                HashSet::new()
+            } else {
+                let state = self.config.state_read();
+                busy.into_iter().filter(|ssi| in_call(&state, *ssi)).collect()
+            };
             if let Some(al) = self.al.as_mut() {
                 if let Some(routes) = routes {
                     al.set_pdch_routes(routes);
                 }
+                al.set_in_call(in_call);
                 had_activity |= al.tick_end(queue, main_carrier);
             }
         }

@@ -18,14 +18,15 @@
 //!   TL-SDU up to N.273 times; after that the link is closed with AL-DISC.
 //! - Voice first: the engine never steals (every PDU goes on the MCCH with link 0, or on the
 //!   radio's packet-data channel) and keeps at most one data segment waiting in the MAC, so a call
-//!   set-up waits behind one segment at most.
+//!   set-up waits behind one segment at most. While a radio is in a call its TL-SDU under way
+//!   waits: no segments, T.252 held.
 //! - Uplink segments are reassembled within the TL-SDU window, checked against the FCS and
 //!   delivered in N(S) order as TL-DATA indications; AL-DATA-AR / AL-FINAL-AR get an AL-ACK
 //!   (complete, selective or "repeat").
 //! - AL-RNR stops new TL-SDUs until AL-ACK or T.271; AL-RECONNECT is accepted for a link that
 //!   exists here; AL-DISC "close" is answered "success".
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Sap, TetraAddress, TxReporter, TxState, frames};
@@ -223,6 +224,8 @@ struct Link {
     queue: VecDeque<(BitBuffer, TxReporter)>,
     tx: Option<TxSdu>,
     rnr_since: Option<u64>,
+    /// The radio is in a call: sending waits.
+    held: bool,
     // Receiving side: V(R), the TL-SDUs in the window and the delivered ones not acknowledged yet.
     vr: u8,
     rx: HashMap<u8, RxSdu>,
@@ -244,6 +247,7 @@ impl Link {
             queue: VecDeque::new(),
             tx: None,
             rnr_since: None,
+            held: false,
             vr: 0,
             rx: HashMap::new(),
             acks_owed: Vec::new(),
@@ -294,6 +298,8 @@ pub struct AdvancedLinkEngine {
     activity: bool,
     /// Radios on a packet-data channel (carrier, timeslot): their PDUs go there.
     pdch_routes: HashMap<u32, (u16, u8)>,
+    /// Radios in a call (among those with something to send): their sending waits.
+    in_call: HashSet<u32>,
 }
 
 impl Default for AdvancedLinkEngine {
@@ -315,12 +321,27 @@ impl AdvancedLinkEngine {
             disc_sent: HashMap::new(),
             activity: false,
             pdch_routes: HashMap::new(),
+            in_call: HashSet::new(),
         }
     }
 
     /// The radios now on a packet-data channel (`[packet_data] bearer = "pdch"`).
     pub fn set_pdch_routes(&mut self, routes: HashMap<u32, (u16, u8)>) {
         self.pdch_routes = routes;
+    }
+
+    /// Radios with a TL-SDU to send or under way.
+    pub fn busy_ssis(&self) -> Vec<u32> {
+        self.links
+            .iter()
+            .filter(|(_, l)| l.tx.is_some() || !l.queue.is_empty())
+            .map(|(ssi, _)| *ssi)
+            .collect()
+    }
+
+    /// The radios of `busy_ssis` now in a call.
+    pub fn set_in_call(&mut self, ssis: HashSet<u32>) {
+        self.in_call = ssis;
     }
 
     /// Nothing to send and no link to look after.
@@ -965,6 +986,19 @@ impl AdvancedLinkEngine {
             self.send_disc(queue, addr, disc, main);
             return;
         }
+        let held = self.in_call.contains(&ssi);
+        if held != link.held {
+            link.held = held;
+            tracing::info!(
+                "LLC: ISSI {} {}",
+                ssi,
+                if held {
+                    "in a call: its advanced link waits"
+                } else {
+                    "out of the call: its advanced link goes on"
+                }
+            );
+        }
         if link.rnr_since.is_some_and(|t| clock.saturating_sub(t) >= T271_SLOTS) {
             tracing::info!("LLC: ISSI {} AL-RNR expired (T.271), sending again", ssi);
             link.rnr_since = None;
@@ -998,6 +1032,13 @@ impl AdvancedLinkEngine {
         }
         if tx.segments.iter().all(|s| s.sends > 0 && !s.need_tx && s.in_mac.is_none()) {
             report_transmitted(&tx.service);
+        }
+        // In a call: T.252 holds (the radio cannot answer).
+        if held {
+            if let Some(t) = tx.ack_wait.as_mut() {
+                *t += 1;
+            }
+            return;
         }
         // T.252: no acknowledgement came. Ask again with the last segment sent, unless others are
         // still to go (the last of those asks).
@@ -1039,8 +1080,9 @@ impl AdvancedLinkEngine {
         let mut ssis: Vec<u32> = self
             .links
             .iter()
-            .filter(|(_, l)| {
+            .filter(|(ssi, l)| {
                 l.connected()
+                    && !self.in_call.contains(ssi)
                     && match &l.tx {
                         Some(tx) => tx.segments.iter().all(|s| s.in_mac.is_none()) && tx.segments.iter().any(|s| s.need_tx),
                         None => !l.queue.is_empty() && l.rnr_since.is_none(),
@@ -1689,6 +1731,29 @@ mod tests {
         }
         assert_eq!(more, N263_AL_MAX_DISCONNECTION_RETRIES as usize);
         assert!(engine.links.is_empty());
+    }
+
+    /// While its radio is in a call a link sends nothing (no T.252 re-ask, no new TL-SDU) and
+    /// T.252 holds; after the call it goes on.
+    #[test]
+    fn a_radio_in_a_call_holds_its_link() {
+        let mut engine = AdvancedLinkEngine::new();
+        let mut queue = MessageQueue::new();
+        setup_link(&mut engine, &mut queue, 3, 3);
+        let first = request(&mut engine, 10);
+        assert_eq!(run(&mut engine, &mut queue, 2).len(), 1, "one segment, asking for an ack");
+        assert_eq!(engine.busy_ssis(), vec![ISSI]);
+        engine.set_in_call(HashSet::from([ISSI]));
+        let _second = request(&mut engine, 10);
+        for _ in 0..3 * T252_SLOTS as usize {
+            engine.tick_end(&mut queue, MAIN);
+            assert!(queue.pop_front().is_none(), "nothing during the call");
+        }
+        engine.set_in_call(HashSet::new());
+        ack(&mut engine, &mut queue, AlAck::complete(0));
+        assert_eq!(first.get_state(), TxState::Acknowledged);
+        let sent = run(&mut engine, &mut queue, 2);
+        assert_eq!(sent.first().map(|h| h.ns), Some(1), "the next TL-SDU after the call");
     }
 
     #[test]
