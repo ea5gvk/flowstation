@@ -3346,3 +3346,38 @@ fn no_pdch_telemetry_with_the_bearer_on_the_mcch() {
     v.run(12);
     assert!(pdch_telemetry(&source).is_empty());
 }
+
+// ---------------------------------------------------------------------------------------------
+// One slot per radio: what goes on the air does not change with multislot packet data
+// ---------------------------------------------------------------------------------------------
+
+/// Fingerprint of every slot `scenario` put on the air and every PDU passed between its MAC and
+/// its LLC. The constants below were recorded on the single-slot code (ec79c9c): a different
+/// value is a change on the air with one slot per radio, never a reason to update the constant.
+fn fingerprint(scenario: fn()) -> u64 {
+    common::component_test::trace_arm();
+    scenario();
+    let hash = common::component_test::trace_hash();
+    println!("fingerprint {hash:#018x}");
+    hash
+}
+
+#[test]
+fn width1_identity_al_on_pdch() {
+    assert_eq!(fingerprint(the_advanced_link_of_a_radio_on_its_pdch_runs_there), 0x89e2_df3c_2913_2053);
+}
+
+#[test]
+fn width1_identity_voice_preemption() {
+    assert_eq!(fingerprint(voice_taking_the_pdch_slot_shows_traffic_and_drops_its_data), 0x0d8a_dbaf_c854_c83b);
+}
+
+#[test]
+fn width1_identity_group_copy() {
+    assert_eq!(fingerprint(a_group_call_set_up_reaches_a_member_on_its_pdch), 0x0b94_4fef_6471_959e);
+}
+
+#[test]
+fn width1_identity_fragmented_datagram() {
+    assert_eq!(fingerprint(group_call_setup_is_not_held_behind_a_fragmented_datagram), 0x78ea_b90d_1e52_1b2d);
+}

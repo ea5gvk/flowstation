@@ -1,8 +1,12 @@
+use std::cell::RefCell;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
 use tetra_config::bluestation::{SharedConfig, StackConfig, StackMode};
 use tetra_core::TdmaTime;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_entities::{MessageRouter, TetraEntityTrait};
-use tetra_saps::sapmsg::SapMsg;
+use tetra_saps::sapmsg::{SapMsg, SapMsgInner};
 
 // BS imports
 use tetra_entities::cmce::cmce_bs::CmceBs;
@@ -21,6 +25,43 @@ use tetra_entities::umac::umac_ms::UmacMs;
 use crate::common::default_stack;
 
 use super::sink::Sink;
+
+thread_local! {
+    /// Fingerprint of what `dump_sinks` returned on this thread since `trace_arm`.
+    static TRACE: RefCell<Option<DefaultHasher>> = const { RefCell::new(None) };
+}
+
+/// Start a fingerprint, on this thread, of every slot the MAC puts on the air and every PDU
+/// passed between the MAC and the LLC that `dump_sinks` returns from now on.
+pub fn trace_arm() {
+    TRACE.with(|t| *t.borrow_mut() = Some(DefaultHasher::new()));
+}
+
+/// The fingerprint so far (0 when not armed).
+pub fn trace_hash() -> u64 {
+    TRACE.with(|t| t.borrow().as_ref().map_or(0, |h| h.finish()))
+}
+
+/// Feed the fingerprint, when armed, with the Debug form of `msgs` (sorted: entities keep some
+/// state in hash maps, so the order within one tick changes from run to run).
+fn trace(msgs: &[SapMsg]) {
+    TRACE.with(|t| {
+        if let Some(h) = t.borrow_mut().as_mut() {
+            let mut lines: Vec<String> = msgs
+                .iter()
+                .filter(|m| {
+                    matches!(
+                        m.msg,
+                        SapMsgInner::TmvUnitdataReqSlots(_) | SapMsgInner::TmaUnitdataInd(_) | SapMsgInner::TmaUnitdataReq(_)
+                    )
+                })
+                .map(|m| format!("{:?}", m.msg))
+                .collect();
+            lines.sort();
+            lines.hash(h);
+        }
+    });
+}
 
 /// Infrastructure for testing TETRA components
 /// Quick setup of all components for end-to-end testing
@@ -207,6 +248,7 @@ impl ComponentTest {
                 msgs.append(&mut sink_msgs);
             }
         }
+        trace(&msgs);
         msgs
     }
 }
