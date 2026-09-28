@@ -55,6 +55,15 @@ pub struct EmergencyState {
     pub started_secs_ago: u64,
 }
 
+/// A timeslot that is a radio's packet-data channel right now (wire form of a `pdch` entry).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct PdchState {
+    pub carrier_num: u16,
+    pub ts: u8,
+    pub issi: u32,
+    pub since_secs: u64,
+}
+
 /// Log entry
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LogEntry {
@@ -120,6 +129,9 @@ pub struct DashboardStateInner {
     /// Active emergencies keyed by originating ISSI. Non-empty drives the dashboard emergency
     /// banner. Populated from the EmergencyAlarm / EmergencyCancel telemetry (emergency status).
     pub emergencies: HashMap<u32, EmergencyEntry>,
+    /// Packet-data channels right now: (carrier, timeslot) -> (ISSI, since). From the UMAC's
+    /// PdchChanged telemetry; empty unless `[packet_data] bearer = "pdch"`.
+    pub pdch: HashMap<(u16, u8), (u32, Instant)>,
     pub log_ring: std::collections::VecDeque<LogEntry>,
     pub last_heard: std::collections::VecDeque<LastHeardEntry>,
     /// SDS Log ring (chronological, oldest at the front). Backed by an on-disk JSON file.
@@ -283,6 +295,7 @@ impl DashboardStateInner {
             ms_map: HashMap::new(),
             calls: HashMap::new(),
             emergencies: HashMap::new(),
+            pdch: HashMap::new(),
             log_ring: std::collections::VecDeque::with_capacity(500),
             last_heard: std::collections::VecDeque::with_capacity(LAST_HEARD_MAX + 1),
             sds_log,
@@ -490,6 +503,22 @@ impl DashboardStateInner {
                 started_secs_ago: e.started_at.elapsed().as_secs(),
             })
             .collect()
+    }
+
+    /// The packet-data channels right now, by carrier and timeslot.
+    pub fn snapshot_pdch(&self) -> Vec<PdchState> {
+        let mut out: Vec<PdchState> = self
+            .pdch
+            .iter()
+            .map(|(&(carrier_num, ts), &(issi, since))| PdchState {
+                carrier_num,
+                ts,
+                issi,
+                since_secs: since.elapsed().as_secs(),
+            })
+            .collect();
+        out.sort_by_key(|p| (p.carrier_num, p.ts));
+        out
     }
 
     /// Raise (or refresh) an emergency for `issi`. Returns true only on the idle→emergency

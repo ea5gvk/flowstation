@@ -1841,6 +1841,11 @@ fn voice_config(bearer: Option<PacketDataBearer>, secondary: bool) -> StackConfi
 
 impl Voice {
     fn new(cfg: StackConfig, real_umac: bool) -> Self {
+        Self::with_telemetry(cfg, real_umac, None)
+    }
+
+    /// With the real MAC, `telemetry` is the UMAC's telemetry sink.
+    fn with_telemetry(cfg: StackConfig, real_umac: bool, telemetry: Option<tetra_entities::net_telemetry::TelemetrySink>) -> Self {
         let mut test = ComponentTest::from_config(cfg, Some(TdmaTime::default()));
         test.populate_entities(
             vec![TetraEntity::Llc, TetraEntity::Mle, TetraEntity::Cmce, TetraEntity::Sndcp],
@@ -1851,7 +1856,7 @@ impl Voice {
             },
         );
         if real_umac {
-            let inner = tetra_entities::umac::umac_bs::UmacBs::new(test.get_shared_config(), None);
+            let inner = tetra_entities::umac::umac_bs::UmacBs::new(test.get_shared_config(), telemetry);
             test.register_entity(TapUmac { inner, seen: Vec::new() });
         }
         let (dgna, endpoint) = tetra_entities::net_control::make_control_link();
@@ -2437,6 +2442,11 @@ fn a_pdch_grant_makes_the_slot_an_assigned_channel() {
 }
 
 fn mac_u_blck(event_label: u16, reservation_req: u8) -> SapMsg {
+    mac_u_blck_with(event_label, reservation_req, &BitBuffer::from_bitstr("10101100"))
+}
+
+/// MAC-U-BLCK carrying the TM-SDU `sdu`.
+fn mac_u_blck_with(event_label: u16, reservation_req: u8, sdu: &BitBuffer) -> SapMsg {
     let mut pdu = BitBuffer::new(268);
     tetra_pdus::umac::pdus::mac_u_blck::MacUBlck {
         fill_bits: true,
@@ -2445,7 +2455,10 @@ fn mac_u_blck(event_label: u16, reservation_req: u8) -> SapMsg {
         reservation_req,
     }
     .to_bitbuf(&mut pdu);
-    pdu.write_bits(0b1010_1100, 8);
+    let mut sdu = sdu.clone();
+    sdu.seek(0);
+    let len = sdu.get_len();
+    pdu.copy_bits(&mut sdu, len);
     pdu.write_bits(1, 1); // fill bits: a one, then zeros
     pdu.seek(0);
     SapMsg {
@@ -3177,4 +3190,159 @@ fn an_emergency_call_takes_the_pdch_before_cutting_a_call() {
     assert_eq!(opens.last(), Some(&(MAIN_CARRIER, 4)));
     assert_eq!(count(&v.log, "CallEnded"), 0, "no call pre-empted");
     assert!(v.test.config.state_read().pdch_by_issi.is_empty());
+}
+
+// The dashboard -------------------------------------------------------------------------------
+
+/// An LLC PDU from `DATA_RADIO` on its PDCH (ts4) through the real MAC, as a MAC-U-BLCK.
+fn uplink_on_the_pdch(v: &mut Voice, llc: BitBuffer) {
+    // Received in the tick whose downlink slot is ts2: sent on ts4 two slots before.
+    while v.ticks % 4 != 1 {
+        v.run(1);
+    }
+    v.test.submit_message(mac_u_blck_with(5, 15, &llc));
+    v.run(1);
+}
+
+/// SN-PDU `sn` from `DATA_RADIO` in a BL-DATA (acknowledged) or BL-UDATA.
+fn sn_in_bl(v: &mut Voice, sn: &str, ack: bool) -> BitBuffer {
+    let mut pdu = BitBuffer::new_autoexpand(64);
+    if ack {
+        let ns = v.ns.entry(DATA_RADIO).or_insert(0);
+        BlData { has_fcs: false, ns: *ns }.to_bitbuf(&mut pdu);
+        *ns ^= 1;
+    } else {
+        BlUdata { has_fcs: false }.to_bitbuf(&mut pdu);
+    }
+    append_bits(&mut pdu, &format!("100{sn}"));
+    pdu
+}
+
+fn pdch_telemetry(source: &tetra_entities::net_telemetry::TelemetrySource) -> Vec<tetra_entities::net_telemetry::TelemetryEvent> {
+    use tetra_entities::net_telemetry::TelemetryEvent;
+    std::iter::from_fn(|| source.try_recv())
+        .filter(|e| matches!(e, TelemetryEvent::PdchChanged { .. } | TelemetryEvent::TsDataActivity { .. }))
+        .collect()
+}
+
+/// The PDCH on the dashboard: the MAC reports the slot becoming the radio's PDCH, every PDU of the
+/// radio there (both ways) and the slot being released; the dashboard turns that into `pdch`
+/// active/inactive, `ts_data` at most every 250 ms per slot, and the `pdch` list of its snapshot.
+#[test]
+fn the_dashboard_shows_the_pdch_and_its_traffic() {
+    use tetra_entities::net_telemetry::{TelemetryEvent, telemetry_channel};
+    debug::setup_logging_verbose();
+    let (sink, source) = telemetry_channel();
+    let mut v = Voice::with_telemetry(voice_config(Some(PacketDataBearer::Pdch), false), true, Some(sink));
+
+    voice_onto_pdch(&mut v);
+    let onto = pdch_telemetry(&source);
+    let active = TelemetryEvent::PdchChanged {
+        carrier_num: MAIN_CARRIER,
+        ts: 4,
+        issi: DATA_RADIO,
+        active: true,
+    };
+    assert_eq!(
+        format!("{onto:?}"),
+        format!("{:?}", [active.clone()]),
+        "only the PDCH: signalling on the MCCH is no data"
+    );
+
+    // Traffic on the PDCH: a datagram up, three down, then END OF DATA up and its answer down.
+    let up = sn_in_bl(&mut v, &unitdata(1, &[0u8; 8]), false);
+    uplink_on_the_pdch(&mut v, up);
+    for _ in 0..3 {
+        v.test.submit_message(tl_unitdata_to(TetraAddress::issi(DATA_RADIO), 16, None));
+    }
+    v.run(4);
+    let traffic = pdch_telemetry(&source);
+    let eod = sn_in_bl(&mut v, &end_of_data(), true);
+    uplink_on_the_pdch(&mut v, eod);
+    v.run(40);
+    assert!(v.test.config.state_read().pdch_by_issi.is_empty(), "END OF DATA frees the PDCH");
+    let release = pdch_telemetry(&source);
+
+    let data = |events: &[TelemetryEvent], uplink: bool| {
+        events
+            .iter()
+            .filter(|e| {
+                matches!(e, TelemetryEvent::TsDataActivity { carrier_num: MAIN_CARRIER, ts: 4, issi: DATA_RADIO, uplink: u } if *u == uplink)
+            })
+            .count()
+    };
+    assert_eq!((data(&traffic, true), data(&traffic, false)), (1, 3), "{traffic:?}");
+    assert_eq!(traffic.len(), 4, "{traffic:?}");
+    assert!(data(&release, true) == 1 && data(&release, false) >= 1, "{release:?}");
+    let inactive = TelemetryEvent::PdchChanged {
+        carrier_num: MAIN_CARRIER,
+        ts: 4,
+        issi: DATA_RADIO,
+        active: false,
+    };
+    assert_eq!(format!("{:?}", release.last()), format!("{:?}", Some(&inactive)), "{release:?}");
+    assert_eq!(
+        release.len(),
+        data(&release, true) + data(&release, false) + 1,
+        "nothing after the release: {release:?}"
+    );
+
+    // The dashboard.
+    let dir = std::env::temp_dir().join(format!("pdch_dashboard_{}", std::process::id()));
+    let server = tetra_entities::net_dashboard::DashboardServer::new(dir.join("config.toml").to_string_lossy().into_owned());
+    let ws = server.subscribe();
+    let json = |s: String| serde_json::from_str::<serde_json::Value>(&s).unwrap();
+    let snapshot_pdch = |server: &tetra_entities::net_dashboard::DashboardServer| json(server.snapshot_json().unwrap())["pdch"].clone();
+    assert_eq!(snapshot_pdch(&server), serde_json::json!([]));
+    for e in onto {
+        server.handle_telemetry(e);
+    }
+    let snapshot = server.snapshot_json().unwrap();
+    println!("snapshot pdch: {}", json(snapshot.clone())["pdch"]);
+    assert_eq!(
+        json(snapshot)["pdch"],
+        serde_json::json!([{"carrier_num": MAIN_CARRIER, "ts": 4, "issi": DATA_RADIO, "since_secs": 0}])
+    );
+    for e in traffic.into_iter().chain(release) {
+        server.handle_telemetry(e);
+    }
+    let sent: Vec<String> = std::iter::from_fn(|| ws.try_recv().ok()).collect();
+    for m in &sent {
+        println!("ws: {m}");
+    }
+    assert_eq!(
+        sent,
+        vec![
+            format!(r#"{{"active":true,"carrier_num":{MAIN_CARRIER},"issi":{DATA_RADIO},"ts":4,"type":"pdch"}}"#),
+            format!(r#"{{"carrier_num":{MAIN_CARRIER},"dir":"ul","issi":{DATA_RADIO},"ts":4,"type":"ts_data"}}"#),
+            format!(r#"{{"active":false,"carrier_num":{MAIN_CARRIER},"issi":{DATA_RADIO},"ts":4,"type":"pdch"}}"#),
+        ],
+        "one ts_data for the whole burst (4 Hz per slot)"
+    );
+    assert_eq!(snapshot_pdch(&server), serde_json::json!([]));
+}
+
+/// With the bearer on the MCCH there is no PDCH: the MAC reports neither PDCH nor data activity.
+#[test]
+fn no_pdch_telemetry_with_the_bearer_on_the_mcch() {
+    use tetra_entities::net_telemetry::telemetry_channel;
+    let (sink, source) = telemetry_channel();
+    let mut v = Voice::with_telemetry(voice_config(Some(PacketDataBearer::Mcch), false), true, Some(sink));
+    v.uplink(
+        DATA_RADIO,
+        MleProtocolDiscriminator::Sndcp,
+        BitBuffer::from_bitstr(&demand(1, None, false)),
+    );
+    v.run(8);
+    v.uplink(
+        DATA_RADIO,
+        MleProtocolDiscriminator::Sndcp,
+        BitBuffer::from_bitstr(&transmit_request(1, Some((1, false)))),
+    );
+    v.run(8);
+    let up = sn_in_bl(&mut v, &unitdata(1, &[0u8; 8]), false);
+    uplink_on_the_pdch(&mut v, up);
+    v.test.submit_message(tl_unitdata_to(TetraAddress::issi(DATA_RADIO), 16, None));
+    v.run(12);
+    assert!(pdch_telemetry(&source).is_empty());
 }

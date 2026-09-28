@@ -143,7 +143,39 @@ impl UmacBs {
             }
         }
         for ts in 2..=4u8 {
-            self.channel_scheduler.set_pdch(ts, owners[ts as usize - 1]);
+            let (old, new) = (self.channel_scheduler.pdch_owner(ts), owners[ts as usize - 1]);
+            self.channel_scheduler.set_pdch(ts, new);
+            if old != new
+                && let Some(sink) = &self.telemetry
+            {
+                for (issi, active) in [(old, false), (new, true)] {
+                    if let Some(issi) = issi {
+                        sink.send(TelemetryEvent::PdchChanged {
+                            carrier_num: main,
+                            ts,
+                            issi,
+                            active,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// Packet-data activity of `ssi` on its PDCH (`ts` of `carrier_num`), for the dashboard.
+    /// Nothing for any other slot or radio, or with the bearer on the MCCH.
+    fn note_pdch_traffic(&self, carrier_num: u16, ts: u8, ssi: u32, uplink: bool) {
+        if self.pdch_mode
+            && carrier_num == self.main_carrier()
+            && self.channel_scheduler.is_pdch_of(ts, ssi)
+            && let Some(sink) = &self.telemetry
+        {
+            sink.send(TelemetryEvent::TsDataActivity {
+                carrier_num,
+                ts,
+                issi: ssi,
+                uplink,
+            });
         }
     }
 
@@ -767,6 +799,7 @@ impl UmacBs {
                         chan_info: None,
                     }),
                 };
+                self.note_pdch_traffic(prim.carrier_num, msg_dltime.t, addr.ssi, true);
                 queue.push_back(m);
             } else {
                 // Either this is a null pdu or we are at the end of the block
@@ -969,6 +1002,7 @@ impl UmacBs {
                         chan_info: None,
                     }),
                 };
+                self.note_pdch_traffic(prim.carrier_num, msg_dltime.t, addr.ssi, true);
                 queue.push_back(m);
             } else {
                 // Either this is a null pdu or we are at the end of the block
@@ -1126,6 +1160,7 @@ impl UmacBs {
 
         // Pass completed block to LLC
         tracing::debug!("rx_mac_end_ul: sdu: {:?}", defragbuf.buffer.dump_bin());
+        self.note_pdch_traffic(prim.carrier_num, msg_dltime.t, defragbuf.addr.ssi, true);
 
         let m = SapMsg {
             sap: Sap::TmaSap,
@@ -1254,6 +1289,7 @@ impl UmacBs {
 
         // Pass completed block to LLC
         tracing::debug!("rx_mac_end_hu: sdu: {:?}", defragbuf.buffer.dump_bin());
+        self.note_pdch_traffic(prim.carrier_num, msg_dltime.t, defragbuf.addr.ssi, true);
 
         let m = SapMsg {
             sap: Sap::TmaSap,
@@ -1450,6 +1486,7 @@ impl UmacBs {
             ssi,
             msg_dltime.t
         );
+        self.note_pdch_traffic(prim.carrier_num, msg_dltime.t, ssi, true);
         queue.push_back(SapMsg {
             sap: Sap::TmaSap,
             src: TetraEntity::Umac,
@@ -1769,6 +1806,9 @@ impl UmacBs {
         let on_its_pdch =
             self.pdch_mode && u8::try_from(link_id).is_ok_and(|ts| self.channel_scheduler.is_pdch_of(ts, prim.main_address.ssi));
         let is_random_access_response = prim.main_address.ssi_type != SsiType::Gssi && link_id != 0 && !on_its_pdch;
+        if on_its_pdch {
+            self.note_pdch_traffic(preferred_carrier, link_id as u8, prim.main_address.ssi, false);
+        }
         let mut pdu = MacResource {
             fill_bits: false,
             pos_of_grant: 0,

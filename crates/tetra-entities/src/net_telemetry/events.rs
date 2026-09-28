@@ -225,6 +225,16 @@ pub enum TelemetryEvent {
         priority: Option<u8>,
         paths: Vec<String>,
     },
+    /// `[packet_data] bearer = "pdch"`: timeslot `ts` of `carrier_num` became (`active`) or stopped
+    /// being (`!active`) the packet-data channel of `issi`. Emitted by the UMAC exactly when its
+    /// scheduler's PDCH owner of the slot changes, whatever the reason (idle release, END OF DATA,
+    /// READY expiry, voice taking the slot, the radio leaving). Appended last for bitcode
+    /// wire-stability.
+    PdchChanged { carrier_num: u16, ts: u8, issi: u32, active: bool },
+    /// A PDU of `issi` on its packet-data channel: received from it (`uplink`) or handed to the
+    /// scheduler for it (downlink). One event per PDU; the dashboard rate-limits the broadcast per
+    /// slot, like `TsVoiceActivity`.
+    TsDataActivity { carrier_num: u16, ts: u8, issi: u32, uplink: bool },
 }
 
 /// A single host-system sensor reading. Kept flat for easy JSON serialisation

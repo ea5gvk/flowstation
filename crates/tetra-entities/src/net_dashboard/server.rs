@@ -904,6 +904,8 @@ pub struct DashboardServer {
     login_throttle: SharedLoginThrottle,
     /// Last time a ts_voice WS message was broadcast per carrier/timeslot.
     ts_last_broadcast: std::sync::Mutex<HashMap<(u16, u8), std::time::Instant>>,
+    /// Last time a ts_data WS message was broadcast per carrier/timeslot.
+    ts_data_last_broadcast: std::sync::Mutex<HashMap<(u16, u8), std::time::Instant>>,
     /// On-demand RadioID callsign resolver (ISSI → indicativ), cached locally.
     radioid: crate::net_dashboard::radioid::RadioIdCache,
 }
@@ -928,6 +930,7 @@ impl DashboardServer {
             sessions: Arc::new(Mutex::new(SessionStore::new())),
             login_throttle: Arc::new(Mutex::new(LoginThrottle::new())),
             ts_last_broadcast: std::sync::Mutex::new(HashMap::new()),
+            ts_data_last_broadcast: std::sync::Mutex::new(HashMap::new()),
             radioid: crate::net_dashboard::radioid::RadioIdCache::new(radioid_path),
         }
     }
@@ -1440,6 +1443,23 @@ impl DashboardServer {
                         paths.clone(),
                     );
                 }
+                TelemetryEvent::PdchChanged {
+                    carrier_num,
+                    ts,
+                    issi,
+                    active,
+                } => {
+                    let key = (*carrier_num, *ts);
+                    if *active {
+                        s.pdch.insert(key, (*issi, Instant::now()));
+                    } else if s.pdch.get(&key).is_some_and(|p| p.0 == *issi) {
+                        s.pdch.remove(&key);
+                    }
+                }
+                TelemetryEvent::TsDataActivity { .. } => {
+                    // Broadcast below, rate-limited.
+                    msg = None;
+                }
             }
         }
         if let Some(json) = msg {
@@ -1463,6 +1483,36 @@ impl DashboardServer {
                 }
             }
         }
+        // TsDataActivity: at most 4 broadcasts per second per carrier/timeslot (250 ms cooldown).
+        if let TelemetryEvent::TsDataActivity { carrier_num, ts, .. } = &event {
+            let now = Instant::now();
+            let due = {
+                let mut last = self.ts_data_last_broadcast.lock().unwrap();
+                match last.get(&(*carrier_num, *ts)) {
+                    Some(t) if now.duration_since(*t) < std::time::Duration::from_millis(250) => false,
+                    _ => {
+                        last.insert((*carrier_num, *ts), now);
+                        true
+                    }
+                }
+            };
+            if due && let Some(json) = event_to_ws_msg(&event) {
+                self.broadcast(&json);
+            }
+        }
+    }
+
+    /// Registers an in-process receiver of the WebSocket broadcasts: what a browser gets after
+    /// its snapshot.
+    pub fn subscribe(&self) -> crossbeam_channel::Receiver<String> {
+        let (tx, rx) = crossbeam_channel::bounded::<String>(WS_CLIENT_QUEUE);
+        self.clients.lock().unwrap().push(tx);
+        rx
+    }
+
+    /// The `snapshot` message a WebSocket client gets when it connects.
+    pub fn snapshot_json(&self) -> Option<String> {
+        ws_snapshot_json(&self.state, &self.shared_config)
     }
 
     pub fn push_log(&self, level: &str, msg: String) {
@@ -1635,6 +1685,20 @@ fn event_to_ws_msg(event: &TelemetryEvent) -> Option<String> {
             paths,
         } => {
             serde_json::json!({"type":"dapnet_log","direction":direction,"id":id,"callsign":callsign,"recipient":recipient,"text":text,"priority":priority,"paths":paths})
+        }
+        TelemetryEvent::PdchChanged {
+            carrier_num,
+            ts,
+            issi,
+            active,
+        } => serde_json::json!({"type":"pdch","carrier_num":carrier_num,"ts":ts,"issi":issi,"active":active}),
+        TelemetryEvent::TsDataActivity {
+            carrier_num,
+            ts,
+            issi,
+            uplink,
+        } => {
+            serde_json::json!({"type":"ts_data","carrier_num":carrier_num,"ts":ts,"issi":issi,"dir":if *uplink { "ul" } else { "dl" }})
         }
     };
     serde_json::to_string(&v).ok()
@@ -2646,6 +2710,56 @@ fn handle_connection(
     }
 }
 
+/// The `snapshot` message a WebSocket client gets when it connects.
+fn ws_snapshot_json(state: &DashboardState, shared_config: &Option<tetra_config::bluestation::SharedConfig>) -> Option<String> {
+    let s = state.read().unwrap();
+    let ms = s.snapshot_ms();
+    let calls = s.snapshot_calls();
+    let emergencies = s.snapshot_emergencies();
+    let pdch = s.snapshot_pdch();
+    let logs: Vec<_> = s.log_ring.iter().cloned().collect();
+    let last_heard: Vec<_> = s.last_heard.iter().cloned().collect();
+    let brew_online = s.brew_online;
+    let brew_version = s.brew_version;
+    let fallback_active = s.fallback_config_active;
+    let fallback_reason = s.fallback_config_reason.clone();
+    let last_tx_visual = s.last_tx_visual.clone();
+    let last_tx_quality = s.last_tx_quality.clone();
+    let last_sdr_health = s.last_sdr_health.clone();
+    let last_sys_health = s.last_sys_health.clone();
+    let last_health = s.last_health.clone();
+    let dgna_log: Vec<_> = s.dgna_log.iter().rev().cloned().collect();
+    drop(s);
+    let (dgna_default_attachment_mode, dgna_attachment_mode_picker_enabled) = shared_config
+        .as_ref()
+        .map(|cfg| {
+            (
+                cfg.config().cell.dgna_attachment_mode,
+                cfg.config()
+                    .dashboard
+                    .as_ref()
+                    .map(|d| d.show_dgna_attachment_mode_picker)
+                    .unwrap_or(false),
+            )
+        })
+        .unwrap_or((0, false));
+    serde_json::to_string(&serde_json::json!({
+        "type": "snapshot", "ms": ms, "calls": calls, "emergencies": emergencies, "log": logs,
+        "brew_online": brew_online, "brew_version": brew_version, "last_heard": last_heard,
+        "fallback_config_active": fallback_active, "fallback_config_reason": fallback_reason,
+        "last_tx_visual": last_tx_visual,
+        "last_tx_quality": last_tx_quality,
+        "last_sdr_health": last_sdr_health,
+        "last_sys_health": last_sys_health,
+        "health": last_health,
+        "dgna_log": dgna_log,
+        "dgna_default_attachment_mode": dgna_default_attachment_mode,
+        "dgna_attachment_mode_picker_enabled": dgna_attachment_mode_picker_enabled,
+        "pdch": pdch,
+    }))
+    .ok()
+}
+
 fn handle_ws(
     stream: TcpStream,
     state: DashboardState,
@@ -2683,52 +2797,8 @@ fn handle_ws(
     }
 
     // Send initial snapshot
-    {
-        let s = state.read().unwrap();
-        let ms = s.snapshot_ms();
-        let calls = s.snapshot_calls();
-        let emergencies = s.snapshot_emergencies();
-        let logs: Vec<_> = s.log_ring.iter().cloned().collect();
-        let last_heard: Vec<_> = s.last_heard.iter().cloned().collect();
-        let brew_online = s.brew_online;
-        let brew_version = s.brew_version;
-        let fallback_active = s.fallback_config_active;
-        let fallback_reason = s.fallback_config_reason.clone();
-        let last_tx_visual = s.last_tx_visual.clone();
-        let last_tx_quality = s.last_tx_quality.clone();
-        let last_sdr_health = s.last_sdr_health.clone();
-        let last_sys_health = s.last_sys_health.clone();
-        let last_health = s.last_health.clone();
-        let dgna_log: Vec<_> = s.dgna_log.iter().rev().cloned().collect();
-        drop(s);
-        let (dgna_default_attachment_mode, dgna_attachment_mode_picker_enabled) = shared_config
-            .as_ref()
-            .map(|cfg| {
-                (
-                    cfg.config().cell.dgna_attachment_mode,
-                    cfg.config()
-                        .dashboard
-                        .as_ref()
-                        .map(|d| d.show_dgna_attachment_mode_picker)
-                        .unwrap_or(false),
-                )
-            })
-            .unwrap_or((0, false));
-        if let Ok(json) = serde_json::to_string(&serde_json::json!({
-            "type": "snapshot", "ms": ms, "calls": calls, "emergencies": emergencies, "log": logs,
-            "brew_online": brew_online, "brew_version": brew_version, "last_heard": last_heard,
-            "fallback_config_active": fallback_active, "fallback_config_reason": fallback_reason,
-            "last_tx_visual": last_tx_visual,
-            "last_tx_quality": last_tx_quality,
-            "last_sdr_health": last_sdr_health,
-            "last_sys_health": last_sys_health,
-            "health": last_health,
-            "dgna_log": dgna_log,
-            "dgna_default_attachment_mode": dgna_default_attachment_mode,
-            "dgna_attachment_mode_picker_enabled": dgna_attachment_mode_picker_enabled,
-        })) {
-            let _ = ws.send(Message::Text(json));
-        }
+    if let Some(json) = ws_snapshot_json(&state, &shared_config) {
+        let _ = ws.send(Message::Text(json));
     }
 
     let _ = ws.get_ref().set_read_timeout(Some(std::time::Duration::from_millis(20)));
@@ -6217,6 +6287,74 @@ dest_issi = 2632585
             server_version: 0,
         });
         assert_eq!(v(), 1, "reconnect reporting v0 must not downgrade a confirmed v1");
+    }
+
+    /// PDCH telemetry on the WebSocket: `pdch` active/inactive as they come, `ts_data` at most every
+    /// 250 ms per slot (either direction), and the snapshot's `pdch` list.
+    #[test]
+    fn pdch_and_ts_data_messages() {
+        let server = DashboardServer::new("/tmp/fs_pdch_test_config.toml".to_string());
+        let ws = server.subscribe();
+        let sent = || std::iter::from_fn(|| ws.try_recv().ok()).collect::<Vec<String>>();
+        let data = |ts: u8, uplink: bool| TelemetryEvent::TsDataActivity {
+            carrier_num: 1521,
+            ts,
+            issi: 2260618,
+            uplink,
+        };
+        let pdch = |ts: u8, issi: u32, active: bool| TelemetryEvent::PdchChanged {
+            carrier_num: 1521,
+            ts,
+            issi,
+            active,
+        };
+        let snapshot = || serde_json::from_str::<serde_json::Value>(&server.snapshot_json().unwrap()).unwrap()["pdch"].clone();
+        assert_eq!(snapshot(), serde_json::json!([]));
+
+        server.handle_telemetry(pdch(4, 2260618, true));
+        server.handle_telemetry(pdch(3, 2260619, true));
+        assert_eq!(
+            sent(),
+            [
+                r#"{"active":true,"carrier_num":1521,"issi":2260618,"ts":4,"type":"pdch"}"#,
+                r#"{"active":true,"carrier_num":1521,"issi":2260619,"ts":3,"type":"pdch"}"#,
+            ]
+        );
+        assert_eq!(
+            snapshot(),
+            serde_json::json!([
+                {"carrier_num":1521,"ts":3,"issi":2260619,"since_secs":0},
+                {"carrier_num":1521,"ts":4,"issi":2260618,"since_secs":0},
+            ])
+        );
+
+        server.handle_telemetry(data(4, false));
+        server.handle_telemetry(data(4, true));
+        server.handle_telemetry(data(4, false));
+        server.handle_telemetry(data(3, true));
+        assert_eq!(
+            sent(),
+            [
+                r#"{"carrier_num":1521,"dir":"dl","issi":2260618,"ts":4,"type":"ts_data"}"#,
+                r#"{"carrier_num":1521,"dir":"ul","issi":2260618,"ts":3,"type":"ts_data"}"#,
+            ],
+            "one per slot within 250 ms"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(260));
+        server.handle_telemetry(data(4, true));
+        assert_eq!(
+            sent(),
+            [r#"{"carrier_num":1521,"dir":"ul","issi":2260618,"ts":4,"type":"ts_data"}"#]
+        );
+
+        // A stale release (another radio's) keeps the entry; the owner's own release drops it.
+        server.handle_telemetry(pdch(4, 1, false));
+        server.handle_telemetry(pdch(4, 2260618, false));
+        assert_eq!(sent().len(), 2);
+        assert_eq!(
+            snapshot(),
+            serde_json::json!([{"carrier_num":1521,"ts":3,"issi":2260619,"since_secs":0}])
+        );
     }
 
     #[test]
