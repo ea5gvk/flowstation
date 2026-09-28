@@ -349,12 +349,25 @@ impl Worker {
                             Err(_) => (notice(status::NOT_FOUND, "No encontrado", "Enlace no válido.", req), None),
                         },
                         Some(None) => (notice(status::NOT_FOUND, "No encontrado", "Ese enlace no existe.", req), None),
-                        None => (expired(req), None),
+                        None => self.reload_back(req),
                     }
                 }
                 Some(DocPath::Weather { query }) => (self.weather(req, query), None),
                 None => (notice(status::NOT_FOUND, "No encontrado", "Esa página no existe.", req), None),
             },
+        }
+    }
+
+    /// A document nothing is known of any more (the radio showed its own old copy of a page):
+    /// fetch again the page the link was on, so its links are new.
+    fn reload_back(&mut self, req: &FetchRequest) -> (Page, Option<String>) {
+        match &req.back {
+            Some(back) => self.handle(&FetchRequest {
+                target: back.clone(),
+                back: None,
+                ..req.clone()
+            }),
+            None => (expired(req), None),
         }
     }
 
@@ -370,7 +383,7 @@ impl Worker {
             let source = docs.recall(req.issi, doc).and_then(|i| Url::parse(&i.source).ok());
             drop(docs);
             let Some(source) = source else {
-                return expired(req);
+                return self.reload_back(req).0;
             };
             let (first, _) = self.browse(req, source);
             if n <= 1 {
@@ -801,6 +814,7 @@ mod tests {
             target,
             budget,
             home: "http://10.0.0.1/".to_string(),
+            back: None,
         }
     }
 
@@ -865,6 +879,12 @@ mod tests {
         assert!(body(&foreign).contains("Caducada"), "{}", body(&foreign));
         let (unknown, _) = get(&mut w, FetchTarget::Doc("/p/99/1".to_string()));
         assert!(body(&unknown).contains("Caducada"), "{}", body(&unknown));
+
+        // A link in the radio's own old copy of a page: that page, fetched again.
+        let mut stale = request(FetchTarget::Doc("/l/99/0".to_string()), 4000);
+        stale.back = Some(FetchTarget::Url(format!("http://127.0.0.1:{port}/article")));
+        let (reloaded, _) = w.handle(&stale);
+        assert!(body(&reloaded).contains("Titular"), "{}", body(&reloaded));
     }
 
     #[test]

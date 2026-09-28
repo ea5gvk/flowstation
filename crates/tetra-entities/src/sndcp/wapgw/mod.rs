@@ -725,20 +725,29 @@ impl WapGateway {
                 self.respond(key, peer, server_port, class, wsp::empty_reply(status::OK), now);
             }
             WspRequest::Suspend => self.respond(key, peer, server_port, class, wsp::empty_reply(status::OK), now),
-            WspRequest::Get { uri } => {
+            WspRequest::Get { uri, referer } => {
                 let budget = self.body_budget(key, peer.issi);
-                let route = router::route(
-                    &uri,
-                    &RouteCtx {
-                        cfg: &self.cfg,
-                        issi: peer.issi,
-                        budget,
-                        snapshot: &*self.status,
-                    },
-                );
-                match route {
+                let ctx = RouteCtx {
+                    cfg: &self.cfg,
+                    issi: peer.issi,
+                    budget,
+                    snapshot: &*self.status,
+                };
+                match router::route(&uri, &ctx) {
                     Route::Page(page) => self.respond_page(key, peer, server_port, class, page, now),
-                    Route::Fetch(target) => self.start_fetch(key, peer, server_port, class, target, budget, now),
+                    Route::Fetch(target) => {
+                        // A document link or page: the page it was on, in case the document is gone.
+                        let back = match (&target, referer) {
+                            (FetchTarget::Doc(path), Some(referer)) if path.starts_with("/l/") || path.starts_with("/p/") => {
+                                match router::route(referer, &ctx) {
+                                    Route::Fetch(back @ (FetchTarget::Url(_) | FetchTarget::Search(_))) => Some(back),
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        };
+                        self.start_fetch(key, peer, server_port, class, target, back, budget, now)
+                    }
                 }
             }
             WspRequest::Unsupported { pdu_type } => {
@@ -772,7 +781,17 @@ impl WapGateway {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn start_fetch(&mut self, key: TxKey, peer: WapPeer, server_port: u16, class: u8, target: FetchTarget, budget: usize, now: Instant) {
+    fn start_fetch(
+        &mut self,
+        key: TxKey,
+        peer: WapPeer,
+        server_port: u16,
+        class: u8,
+        target: FetchTarget,
+        back: Option<FetchTarget>,
+        budget: usize,
+        now: Instant,
+    ) {
         if class != 2 {
             return; // nowhere to put the result
         }
@@ -785,6 +804,7 @@ impl WapGateway {
             target,
             budget,
             home: home::home_url(self.cfg.gateway_ipv4),
+            back,
         };
         if self.fetcher.submit(req).is_err() {
             let page = self.notice(

@@ -80,6 +80,13 @@ impl DocCache {
         {
             cache.next_id = saved.next_id.clamp(1, 99_999);
             cache.index = saved.index.into();
+        } else {
+            // No index (first start, or /tmp emptied by a reboot): ids that do not start at 1, so
+            // the links in pages a radio kept do not land on new documents.
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            cache.next_id = 1 + (secs % 9_000) as u32;
         }
         cache.path = Some(path);
         cache

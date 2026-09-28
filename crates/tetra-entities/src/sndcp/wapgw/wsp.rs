@@ -40,9 +40,13 @@ pub const ABORT_PROTOERR: u8 = 0xe0;
 /// Client-SDU and Server-SDU of a session that did not negotiate them (WAP-230-WSP default).
 pub const DEFAULT_SDU: usize = 1400;
 
-/// Largest header a Reply built here can carry: PDU type, status, HeadersLen and the text-form
-/// Content-Type with its charset (1F 20 + 30 octets of media type + 81 EA).
-pub const REPLY_OVERHEAD_MAX: usize = 3 + 34;
+/// Cache-Control: no-cache (well-known field 0x08, value 0x80). Without it the radio shows its
+/// own copy of a page, whose links may point to documents the gateway no longer has.
+const NO_CACHE: [u8; 2] = [0x88, 0x80];
+
+/// Largest header a Reply built here can carry: PDU type, status, HeadersLen, the text-form
+/// Content-Type with its charset (1F 20 + 30 octets of media type + 81 EA) and Cache-Control.
+pub const REPLY_OVERHEAD_MAX: usize = 3 + 34 + NO_CACHE.len();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WspRequest<'a> {
@@ -53,9 +57,10 @@ pub(crate) enum WspRequest<'a> {
     Disconnect,
     Suspend,
     /// A URI that is not UTF-8 (Latin-1 typed in the address bar) comes with its non-ASCII
-    /// octets percent-encoded.
+    /// octets percent-encoded. `referer` is the page the link was on.
     Get {
         uri: Cow<'a, str>,
+        referer: Option<&'a str>,
     },
     /// A method this gateway does not serve (Post, Put, Options, Head, ...): answer 405.
     Unsupported {
@@ -99,11 +104,45 @@ pub(crate) fn parse_request(wsp: &[u8]) -> WspRequest<'_> {
                         .collect(),
                 ),
             };
-            WspRequest::Get { uri }
+            let referer = referer(&wsp[1 + octets + len..]);
+            WspRequest::Get { uri, referer }
         }
         0x41..=0x4f | 0x60..=0x7f => WspRequest::Unsupported { pdu_type },
         _ => WspRequest::Malformed,
     }
+}
+
+/// The Referer header (well-known field 0x24, a text-string) among the headers of a Get.
+fn referer(mut headers: &[u8]) -> Option<&str> {
+    while let Some((&name, rest)) = headers.split_first() {
+        headers = rest;
+        match name {
+            // Code-page shifts: not parsed.
+            0x00..=0x1f | 0x7f => return None,
+            // Field name as text: the rest of it up to its NUL.
+            0x20..=0x7e => headers = headers.get(headers.iter().position(|&b| b == 0)? + 1..)?,
+            _ => {}
+        }
+        let &first = headers.first()?;
+        let (value, rest) = match first {
+            0..=30 => (headers.get(1..1 + first as usize)?, headers.get(1 + first as usize..)?),
+            31 => {
+                let (len, octets) = read_uintvar(&headers[1..])?;
+                (headers.get(1 + octets..1 + octets + len)?, headers.get(1 + octets + len..)?)
+            }
+            0x80..=0xff => headers.split_at(1),
+            _ => {
+                let end = headers.iter().position(|&b| b == 0)?;
+                (&headers[..end], &headers[end + 1..])
+            }
+        };
+        if name == 0x80 | 0x24 {
+            // A text-string that starts with an octet above 127 comes after a Quote (0x7F).
+            return std::str::from_utf8(value.strip_prefix(&[0x7f]).unwrap_or(value)).ok();
+        }
+        headers = rest;
+    }
+    None
 }
 
 /// Connect Reply: echo only the SDU sizes the terminal asked about, clamped to our limits.
@@ -172,7 +211,8 @@ fn content_type(kind: ContentKind, form: WapContentTypeForm) -> Vec<u8> {
 }
 
 pub fn reply(status: u8, kind: ContentKind, form: WapContentTypeForm, body: &[u8]) -> Vec<u8> {
-    let headers = content_type(kind, form);
+    let mut headers = content_type(kind, form);
+    headers.extend_from_slice(&NO_CACHE);
     let mut out = vec![PDU_REPLY, status];
     write_uintvar(headers.len(), &mut out);
     out.extend_from_slice(&headers);
@@ -227,31 +267,34 @@ mod tests {
     #[test]
     fn reply_content_type_general_form_utf8() {
         let reply = reply(status::OK, ContentKind::Xhtml, WapContentTypeForm::Short, b"<p/>");
-        assert_eq!(reply, [&[0x04, 0x20, 0x04, 0x03, 0xc5, 0x81, 0xea][..], b"<p/>"].concat());
+        assert_eq!(
+            reply,
+            [&[0x04, 0x20, 0x06, 0x03, 0xc5, 0x81, 0xea, 0x88, 0x80][..], b"<p/>"].concat()
+        );
         let wml = super::reply(status::NOT_FOUND, ContentKind::Wml, WapContentTypeForm::Short, b"");
-        assert_eq!(wml, vec![0x04, 0x44, 0x04, 0x03, 0x88, 0x81, 0xea]);
+        assert_eq!(wml, vec![0x04, 0x44, 0x06, 0x03, 0x88, 0x81, 0xea, 0x88, 0x80]);
     }
 
     #[test]
     fn reply_content_type_text() {
         let reply = reply(status::OK, ContentKind::Xhtml, WapContentTypeForm::Text, b"x");
-        let mut expected = vec![0x04, 0x20, 34, 0x1f, 32];
+        let mut expected = vec![0x04, 0x20, 36, 0x1f, 32];
         expected.extend_from_slice(b"application/vnd.wap.xhtml+xml\0");
-        expected.extend_from_slice(&[0x81, 0xea, b'x']);
+        expected.extend_from_slice(&[0x81, 0xea, 0x88, 0x80, b'x']);
         assert_eq!(reply, expected);
         assert_eq!(reply.len() - 1, REPLY_OVERHEAD_MAX);
         let wml = super::reply(status::OK, ContentKind::Wml, WapContentTypeForm::Text, b"");
-        assert_eq!(&wml[..4], &[0x04, 0x20, 20, 19]);
-        assert_eq!(&wml[4..], &[&b"text/vnd.wap.wml\0"[..], &[0x81, 0xea]].concat()[..]);
+        assert_eq!(&wml[..4], &[0x04, 0x20, 22, 19]);
+        assert_eq!(&wml[4..], &[&b"text/vnd.wap.wml\0"[..], &[0x81, 0xea, 0x88, 0x80]].concat()[..]);
     }
 
     #[test]
     fn reply_content_type_bare_like_nexus() {
-        // Nexus-BS vectors (Docs/wap-port-spec.md 7.4): HeadersLen 1 and the well-known value.
+        // Nexus-BS vectors (Docs/wap-port-spec.md 7.4): the well-known value, then Cache-Control.
         let xhtml = reply(status::OK, ContentKind::Xhtml, WapContentTypeForm::Bare, b"<p/>");
-        assert_eq!(xhtml, [&[0x04, 0x20, 0x01, 0xc5][..], b"<p/>"].concat());
+        assert_eq!(xhtml, [&[0x04, 0x20, 0x03, 0xc5, 0x88, 0x80][..], b"<p/>"].concat());
         let wml = reply(status::OK, ContentKind::Wml, WapContentTypeForm::Bare, b"");
-        assert_eq!(wml, vec![0x04, 0x20, 0x01, 0x88]);
+        assert_eq!(wml, vec![0x04, 0x20, 0x03, 0x88, 0x88, 0x80]);
     }
 
     #[test]
@@ -262,7 +305,8 @@ mod tests {
         assert_eq!(
             parse_request(&get),
             WspRequest::Get {
-                uri: "/status.xhtml".into()
+                uri: "/status.xhtml".into(),
+                referer: None,
             }
         );
         // Latin-1 in the address bar is not UTF-8: its octets come percent-encoded.
@@ -270,7 +314,33 @@ mod tests {
         assert_eq!(
             parse_request(&latin1),
             WspRequest::Get {
-                uri: "/go?u=Espa%F1a".into()
+                uri: "/go?u=Espa%F1a".into(),
+                referer: None,
+            }
+        );
+        // What the MXP600 sends for a link: Cache-Control: no-cache (v1.3 code), then Referer.
+        let link = [
+            &[0x40, 0x15][..],
+            b"http://10.0.0.1/l/1/5",
+            &[0xbd, 0x80, 0xa4],
+            b"http://10.0.0.1/go?u=http%3A%2F%2Ftext.npr.org%2F\0",
+        ]
+        .concat();
+        assert_eq!(
+            parse_request(&link),
+            WspRequest::Get {
+                uri: "http://10.0.0.1/l/1/5".into(),
+                referer: Some("http://10.0.0.1/go?u=http%3A%2F%2Ftext.npr.org%2F"),
+            }
+        );
+        // Other headers before it, one with a length-prefixed value and one with a text name.
+        let mut headers = vec![0x40, 0x01, b'/', 0x83, 0x02, 0x81, 0x82];
+        headers.extend_from_slice(b"X-Foo\0bar\0\xa4/go?u=a\0");
+        assert_eq!(
+            parse_request(&headers),
+            WspRequest::Get {
+                uri: "/".into(),
+                referer: Some("/go?u=a"),
             }
         );
         assert_eq!(parse_request(&[0x40, 0x05, b'/']), WspRequest::Malformed);

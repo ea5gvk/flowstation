@@ -210,9 +210,10 @@ fn get_small_single_packet() {
     let mut gw = gateway();
     let out = send(&mut gw, get(0x1234, "/status.wml"), t0);
     assert_eq!(out.len(), 1);
-    assert_eq!(&out[0][..7], &[0x12, 0x92, 0x34, 0x04, 0x20, 0x04, 0x03]);
+    assert_eq!(&out[0][..7], &[0x12, 0x92, 0x34, 0x04, 0x20, 0x06, 0x03]);
     assert_eq!(&out[0][7..10], &[0x88, 0x81, 0xea], "WML with UTF-8 charset");
-    assert!(String::from_utf8_lossy(&out[0][10..]).starts_with("<wml>"));
+    assert_eq!(&out[0][10..12], &[0x88, 0x80], "Cache-Control: no-cache");
+    assert!(String::from_utf8_lossy(&out[0][12..]).starts_with("<wml>"));
     assert!(send(&mut gw, initiator::ack(0x1234, None), t0).is_empty());
     // A late copy of the Invoke is ignored while the transaction is remembered...
     assert!(send(&mut gw, initiator::invoke(0x1234, 2, TTR, true, false, &get_pdu("/")), t0).is_empty());
@@ -228,8 +229,8 @@ fn home_page_over_two_packets() {
     let mut gw = gateway();
     let first = send(&mut gw, get(7, "http://10.0.0.1/"), t0);
     let message = receive_all(&mut gw, 7, first, t0);
-    assert_eq!(&message[..7], &[0x04, 0x20, 0x04, 0x03, 0xc5, 0x81, 0xea]);
-    let body = String::from_utf8(message[7..].to_vec()).unwrap();
+    assert_eq!(&message[..9], &[0x04, 0x20, 0x06, 0x03, 0xc5, 0x81, 0xea, 0x88, 0x80]);
+    let body = String::from_utf8(message[9..].to_vec()).unwrap();
     assert!(body.contains("action=\"/go\""), "browsing ISSI gets the forms: {body}");
     assert!(body.len() <= home::HOME_MAX_BYTES);
 }
@@ -245,9 +246,9 @@ fn get_5kb_segments_and_groups() {
     assert_eq!(heads, vec![(2, 0, 0), (6, 1, 0), (6, 2, GTR)], "first group of 3");
     assert!(first.iter().all(|p| p.len() <= 576 - 28));
     let message = receive_all(&mut gw, 0x1234, first, t0);
-    // 4 header octets of Reply + Content-Type, then the page.
-    assert_eq!(message.len(), 7 + 5000);
-    assert!(message[7..].starts_with(b"0123456789"));
+    // Reply header, Content-Type and Cache-Control, then the page.
+    assert_eq!(message.len(), 9 + 5000);
+    assert!(message[9..].starts_with(b"0123456789"));
     assert!(matches!(gw.txs.values().next().map(|t| &t.state), Some(TxState::Done { .. })));
 }
 

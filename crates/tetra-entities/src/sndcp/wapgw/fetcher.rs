@@ -31,6 +31,9 @@ pub struct FetchRequest {
     pub budget: usize,
     /// Absolute URL of the gateway home page, for the links back home.
     pub home: String,
+    /// The page the link was on (its Referer), fetched again when the link's document is no
+    /// longer known.
+    pub back: Option<FetchTarget>,
 }
 
 /// A page ready to send.
