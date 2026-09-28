@@ -242,6 +242,9 @@ fn host_of(url: &Url) -> String {
     url.host_str().unwrap_or("?").to_string()
 }
 
+/// File, in the temporary directory, that keeps the document index across restarts.
+const DOC_INDEX_FILE: &str = "flowstation-wap-docs.json";
+
 /// One download thread's state. The document cache is shared by the pool.
 struct Worker {
     cfg: CfgWapBrowse,
@@ -326,10 +329,14 @@ impl Worker {
             FetchTarget::Doc(path) => match parse_doc_path(path) {
                 Some(DocPath::Page { doc, page }) => (self.page(req, doc, page), None),
                 Some(DocPath::Link { doc, link, query }) => {
-                    let target = self
-                        .docs()
-                        .get(req.issi, doc, Instant::now())
-                        .map(|d| d.doc.links.get(link).cloned());
+                    let target = {
+                        let mut docs = self.docs();
+                        match docs.get(req.issi, doc, Instant::now()) {
+                            Some(d) => Some(d.doc.links.get(link).cloned()),
+                            // Expired or from before a restart: the index still knows the links.
+                            None => docs.recall(req.issi, doc).map(|i| i.links.get(link).cloned()),
+                        }
+                    };
                     match target {
                         Some(Some(url)) => match Url::parse(&url) {
                             Ok(mut url) => {
@@ -355,12 +362,34 @@ impl Worker {
         self.cfg.page_bytes.min(req.budget)
     }
 
-    fn page(&self, req: &FetchRequest, doc: u32, n: usize) -> Page {
+    fn page(&mut self, req: &FetchRequest, doc: u32, n: usize) -> Page {
         let page_bytes = self.page_bytes(req);
         let mut docs = self.docs();
-        let Some(stored) = docs.get(req.issi, doc, Instant::now()) else {
-            return expired(req);
-        };
+        if docs.get(req.issi, doc, Instant::now()).is_none() {
+            // Expired or from before a restart: fetch its source again and show the same page.
+            let source = docs.recall(req.issi, doc).and_then(|i| Url::parse(&i.source).ok());
+            drop(docs);
+            let Some(source) = source else {
+                return expired(req);
+            };
+            let (first, _) = self.browse(req, source);
+            if n <= 1 {
+                return first;
+            }
+            let docs = self.docs();
+            let again = docs
+                .latest(req.issi)
+                .and_then(|d| render_page(&d.doc, d.id, n, page_bytes, self.cfg.max_pages_per_doc, &req.home));
+            return match again {
+                Some((body, _)) => Page {
+                    status: status::OK,
+                    kind: ContentKind::Xhtml,
+                    body: body.into_bytes(),
+                },
+                None => first,
+            };
+        }
+        let stored = docs.get(req.issi, doc, Instant::now()).expect("checked above");
         match render_page(&stored.doc, doc, n, page_bytes, self.cfg.max_pages_per_doc, &req.home) {
             Some((body, _)) => Page {
                 status: status::OK,
@@ -466,6 +495,7 @@ impl Worker {
 
     /// Turn a download into the page for the radio (or a meta refresh to follow).
     fn present(&mut self, req: &FetchRequest, dl: Downloaded) -> Presented {
+        let source = dl.url.to_string();
         if !(200..300).contains(&dl.status) {
             return Presented::Page(notice(
                 wsp_status_for_http(dl.status),
@@ -513,10 +543,10 @@ impl Worker {
         {
             return Presented::Refresh(target);
         }
-        self.store_and_render(req, doc, dl.truncated)
+        self.store_and_render(req, doc, dl.truncated, &source)
     }
 
-    fn store_and_render(&mut self, req: &FetchRequest, mut doc: Document, truncated: bool) -> Presented {
+    fn store_and_render(&mut self, req: &FetchRequest, mut doc: Document, truncated: bool, source: &str) -> Presented {
         if doc.blocks.is_empty() {
             return Presented::Page(notice(
                 status::OK,
@@ -530,7 +560,7 @@ impl Worker {
                 .push(Block::Para(vec![Inline::Text("(Página recortada: demasiado grande.)".to_string())]));
         }
         let page_bytes = self.page_bytes(req);
-        let id = self.docs().insert(req.issi, doc, Instant::now());
+        let id = self.docs().insert(req.issi, doc, source, Instant::now());
         let mut docs = self.docs();
         let rendered = docs
             .get(req.issi, id, Instant::now())
@@ -588,9 +618,11 @@ impl Worker {
     }
 }
 
+/// Sent as 200: an Openwave browser (MXP600) shows only "HTTP error 410" for a 410 and never
+/// this page with its way back to the home page.
 fn expired(req: &FetchRequest) -> Page {
     notice(
-        status::GONE,
+        status::OK,
         "Caducada",
         "Esta página ya no está guardada. Vuelve a abrirla desde el inicio.",
         req,
@@ -621,7 +653,14 @@ impl PoolFetcher {
     pub fn spawn(cfg: &CfgWap, policy: NetPolicy) -> std::io::Result<Self> {
         let (jobs_tx, jobs_rx) = bounded(QUEUE_LEN);
         let (replies_tx, replies_rx) = unbounded();
-        let docs = Arc::new(Mutex::new(DocCache::default()));
+        // The document index outlives a restart of the station in a file (on the Pi /tmp is in
+        // RAM: nothing is written to the SD card). Unit tests keep theirs in memory.
+        let docs = if cfg!(test) {
+            DocCache::default()
+        } else {
+            DocCache::persistent(std::env::temp_dir().join(DOC_INDEX_FILE))
+        };
+        let docs = Arc::new(Mutex::new(docs));
         for i in 0..cfg.browse.max_concurrent_fetches.max(1) {
             let worker = Worker::new(cfg.browse.clone(), policy.clone(), Arc::clone(&docs));
             let (jobs, replies) = (jobs_rx.clone(), replies_tx.clone());
@@ -821,8 +860,11 @@ mod tests {
         // Another radio cannot read this radio's documents; unknown documents have expired.
         let mut other = request(FetchTarget::Doc("/p/1/1".to_string()), 4000);
         other.issi = 1234;
-        assert_eq!(w.handle(&other).0.status, status::GONE);
-        assert_eq!(get(&mut w, FetchTarget::Doc("/p/99/1".to_string())).0.status, status::GONE);
+        let (foreign, _) = w.handle(&other);
+        assert_eq!(foreign.status, status::OK);
+        assert!(body(&foreign).contains("Caducada"), "{}", body(&foreign));
+        let (unknown, _) = get(&mut w, FetchTarget::Doc("/p/99/1".to_string()));
+        assert!(body(&unknown).contains("Caducada"), "{}", body(&unknown));
     }
 
     #[test]
@@ -1062,7 +1104,7 @@ mod tests {
         }
         assert_eq!(replies.get(&4), Some(&status::SERVICE_UNAVAILABLE), "{replies:?}");
         assert_eq!(replies.get(&1), Some(&status::FORBIDDEN));
-        assert_eq!(replies.get(&3), Some(&status::GONE));
+        assert_eq!(replies.get(&3), Some(&status::OK), "an expired document is a page, not an error");
     }
 
     #[cfg(target_os = "linux")]
