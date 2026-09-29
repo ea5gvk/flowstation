@@ -3386,3 +3386,244 @@ fn width1_identity_group_copy() {
 fn width1_identity_fragmented_datagram() {
     assert_eq!(fingerprint(group_call_setup_is_not_held_behind_a_fragmented_datagram), 0x7fbb_8cd1_36e0_d68f);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Multislot PDCH (`pdch_max_slots` > 1): a packet-data channel of several main-carrier slots
+// ---------------------------------------------------------------------------------------------
+
+/// `pdch_config` with up to `n` slots per radio.
+fn multislot_config(wap: bool, n: u8) -> StackConfig {
+    let mut cfg = pdch_config(wap);
+    cfg.packet_data.pdch_max_slots = n;
+    cfg
+}
+
+/// Give `issi` the packet-data channel of `slots` (the first one its grant's) in the shared
+/// state, as the SNDCP runtime does.
+fn grant_pdch_slots(config: &SharedConfig, issi: u32, slots: &[u8], on_air: bool) -> Vec<CarrierSlot> {
+    let mut state = config.state_write();
+    let reserved = state.timeslot_alloc.reserve_packet_data_slots(slots, slots.len());
+    assert_eq!(reserved.len(), slots.len(), "slots free");
+    state.pdch_by_issi.insert(issi, PdchGrant { slot: reserved[0], on_air });
+    if reserved.len() > 1 {
+        let mut bits = [false; 4];
+        for s in &reserved {
+            bits[usize::from(s.ts) - 1] = true;
+        }
+        state.pdch_timeslots_by_issi.insert(issi, bits);
+    }
+    reserved
+}
+
+/// The MS's reading of a slot grant received in downlink slot `grant_dl` on a channel of the
+/// slots `channel` (EN 300 392-2 23.5.2.2.2, 23.5.2.2.4): the same-numbered uplink slot is
+/// opportunity 0; `delay` more slots of the channel, frame 18 included; then `slots` successive
+/// slots of the channel, jumping the common linearization ones of frame 18.
+fn ms_granted_labels(grant_dl: TdmaTime, delay: usize, slots: usize, channel: &[u8]) -> Vec<TdmaTime> {
+    let next = |mut t: TdmaTime| loop {
+        t = t.add_timeslots(1);
+        if channel.contains(&t.t) {
+            return t;
+        }
+    };
+    let mut t = grant_dl;
+    for _ in 0..delay {
+        t = next(t);
+    }
+    let mut out = Vec::new();
+    while out.len() < slots {
+        if !t.is_mandatory_clch() {
+            out.push(t);
+        }
+        t = next(t);
+    }
+    out
+}
+
+/// The MAC-RESOURCEs of the SCH/F block of a downlink slot.
+fn mac_resources(slot: &tetra_saps::tmv::TmvUnitdataReqSlot) -> Vec<tetra_pdus::umac::pdus::mac_resource::MacResource> {
+    use tetra_pdus::umac::pdus::mac_resource::MacResource;
+    let Some(blk) = slot
+        .blk1
+        .as_ref()
+        .filter(|b| b.logical_channel == tetra_saps::tmv::enums::logical_chans::LogicalChannel::SchF)
+    else {
+        return Vec::new();
+    };
+    let mut block = blk.mac_block.clone();
+    block.seek(0);
+    let bits = block.to_bitstr();
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos + 16 <= bits.len() {
+        let mut b = BitBuffer::from_bitstr(&bits[pos..]);
+        b.seek(0);
+        if b.peek_bits(2) != Some(0) {
+            break;
+        }
+        let Ok(res) = MacResource::from_bitbuf(&mut b) else { break };
+        if res.addr.is_none() {
+            break;
+        }
+        let li = res.length_ind;
+        out.push(res);
+        if li == 0b111111 || li == 0 {
+            break;
+        }
+        pos += usize::from(li) * 8;
+    }
+    out
+}
+
+/// The slot grant a downlink slot carries for `ssi`: (slots, delay).
+fn grant_for(slot: &tetra_saps::tmv::TmvUnitdataReqSlot, ssi: u32) -> Option<(usize, usize)> {
+    use tetra_pdus::umac::enums::basic_slotgrant_granting_delay::BasicSlotgrantGrantingDelay;
+    let g = mac_resources(slot)
+        .into_iter()
+        .find(|r| r.addr.is_some_and(|a| a.ssi == ssi))?
+        .slot_granting_element?;
+    let delay = match g.granting_delay {
+        BasicSlotgrantGrantingDelay::CapAllocAtNextOpportunity => 0,
+        BasicSlotgrantGrantingDelay::DelayNOpportunities(n) => usize::from(n),
+        other => panic!("unexpected granting delay {other:?}"),
+    };
+    Some((g.capacity_allocation.to_req_slotcount(), delay))
+}
+
+/// The UMAC alone, the LLC and the LMAC as sinks, ticking from 0/1/1/1 (tick k has downlink
+/// time 0/1/1/1 + k and receives the uplink of two slots earlier).
+struct UmacAir {
+    test: ComponentTest,
+    ticks: i32,
+    slots: Vec<tetra_saps::tmv::TmvUnitdataReqSlot>,
+    up: Vec<TmaUnitdataInd>,
+}
+
+impl UmacAir {
+    fn new(cfg: StackConfig) -> Self {
+        let mut test = ComponentTest::from_config(cfg, Some(TdmaTime::default()));
+        test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Llc, TetraEntity::Lmac]);
+        Self {
+            test,
+            ticks: 0,
+            slots: Vec::new(),
+            up: Vec::new(),
+        }
+    }
+
+    /// Downlink time of the next tick.
+    fn next_time(&self) -> TdmaTime {
+        TdmaTime::default().add_timeslots(self.ticks)
+    }
+
+    fn tick(&mut self) {
+        self.test.run_stack(Some(1));
+        self.ticks += 1;
+        for m in self.test.dump_sinks() {
+            match m.msg {
+                SapMsgInner::TmaUnitdataInd(ind) => self.up.push(ind),
+                SapMsgInner::TmvUnitdataReqSlots(slots) => self.slots.extend(slots.slots),
+                _ => {}
+            }
+        }
+    }
+
+    /// `msg` as received in uplink slot `label` (in the tick whose downlink time is two later).
+    fn uplink_at(&mut self, label: TdmaTime, msg: SapMsg) {
+        let at = label.add_timeslots(2);
+        while self.next_time() != at {
+            assert!(self.next_time().diff(at) < 0, "uplink slot {label} is past");
+            self.tick();
+        }
+        self.test.submit_message(msg);
+        self.tick();
+    }
+
+    /// Run until a downlink slot carries a slot grant for `ssi`: that slot's time and the grant
+    /// (slots, delay).
+    fn next_grant(&mut self, ssi: u32, ticks: usize) -> (TdmaTime, usize, usize) {
+        let from = self.slots.len();
+        for _ in 0..ticks {
+            self.tick();
+            if let Some((t, g)) = self.slots[from..].iter().find_map(|s| grant_for(s, ssi).map(|g| (s.ts, g))) {
+                return (t, g.0, g.1);
+            }
+        }
+        panic!("no grant for {ssi}");
+    }
+}
+
+/// `pdu` as the LMAC hands a full uplink slot (SCH/F, CRC passed) of the main carrier to the UMAC.
+fn from_lmac(pdu: BitBuffer) -> SapMsg {
+    SapMsg {
+        sap: Sap::TmvSap,
+        src: TetraEntity::Lmac,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmvUnitdataInd(tetra_saps::tmv::TmvUnitdataInd {
+            carrier_num: MAIN_CARRIER,
+            pdu,
+            block_num: tetra_core::PhyBlockNum::Both,
+            logical_channel: tetra_saps::tmv::enums::logical_chans::LogicalChannel::SchF,
+            crc_pass: true,
+            scrambling_code: 0,
+            rssi_dbfs: f32::NEG_INFINITY,
+        }),
+    }
+}
+
+/// An uplink slot as the radio sends it: `header`, then the TM-SDU part `sdu`, then fill bits (a
+/// one, then zeros) to the end of the slot.
+fn uplink_block(header: &str, sdu: &str) -> BitBuffer {
+    let mut bits = format!("{header}{sdu}1");
+    while bits.len() < 268 {
+        bits.push('0');
+    }
+    let mut b = BitBuffer::from_bitstr(&bits);
+    b.seek(0);
+    b
+}
+
+/// A TM-SDU of 400 bits sent up on the channel {3, 4} of the radio: MAC-DATA opening a
+/// fragmentation and asking for 2 slots in ts3, then MAC-FRAG and MAC-END in the two slots the
+/// grant it gets gives (read from the downlink as the MS does). Returns what reached the LLC, the
+/// slots used and the TM-SDU.
+fn uplink_across_the_channel(cfg: StackConfig) -> (Vec<TmaUnitdataInd>, Vec<TdmaTime>, String) {
+    use tetra_pdus::umac::enums::reservation_requirement::ReservationRequirement;
+    let mut air = UmacAir::new(cfg);
+    grant_pdch_slots(&air.test.config, ISSI, &[4, 3], true);
+    let sdu: String = (0..400).map(|i| if (i * 7) % 3 == 0 { '1' } else { '0' }).collect();
+    let (first, frag, end) = (&sdu[..150], &sdu[150..300], &sdu[300..]);
+    // MAC-DATA: type 00, fill, not encrypted, address type 00 and address, capacity request with
+    // the fragmentation flag and 2 slots, reserved bit.
+    let start = TdmaTime { t: 3, f: 3, m: 1, h: 0 };
+    let header = format!("001000{ISSI:024b}11{:04b}0", ReservationRequirement::Req2Slots as u64);
+    air.uplink_at(start, from_lmac(uplink_block(&header, first)));
+    let (at, slots, delay) = air.next_grant(ISSI, 16);
+    assert_eq!(slots, 2, "the 2 slots asked for");
+    let labels = ms_granted_labels(at, delay, slots, &[3, 4]);
+    // MAC-FRAG: type 01, subtype 0, fill; MAC-END: type 01, subtype 1, fill, length in octets.
+    air.uplink_at(labels[0], from_lmac(uplink_block("0101", frag)));
+    let end_octets = (10 + end.len() + 1).div_ceil(8);
+    let end_header = format!("0111{end_octets:06b}");
+    air.uplink_at(labels[1], from_lmac(uplink_block(&end_header, end)));
+    for _ in 0..4 {
+        air.tick();
+    }
+    (air.up, labels, sdu)
+}
+
+/// An uplink fragmentation continues on any slot of a channel of several slots (EN 300 392-2
+/// 23.3.5): the MAC-FRAG and MAC-END in the slots the grant gives, on ts3 and ts4, are
+/// reassembled with the MAC-DATA that opened it, and the whole TM-SDU goes up once, with the
+/// slot it ended on.
+#[test]
+fn uplink_grant_and_reassembly_across_the_channel() {
+    debug::setup_logging_verbose();
+    let (up, labels, sdu) = uplink_across_the_channel(multislot_config(false, 2));
+    assert_eq!(labels.iter().map(|l| l.t).collect::<Vec<_>>(), vec![3, 4], "{labels:?}");
+    assert_eq!(up.len(), 1, "{up:?}");
+    assert_eq!(
+        (up[0].main_address.ssi, up[0].link_id, up[0].pdu.as_ref().unwrap().to_bitstr()),
+        (ISSI, 4, sdu)
+    );
+}

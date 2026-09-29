@@ -212,6 +212,20 @@ impl UmacBs {
         self.config.config().cell.main_carrier
     }
 
+    /// Time an uplink fragment of `ssi` received at `t` on `carrier_num` is filed under in the
+    /// defragmenter: on a packet-data channel of several slots its slot is replaced by the
+    /// channel's lowest one, since a burst continues on any slot of the channel (EN 300 392-2
+    /// 23.3.5).
+    fn defrag_time(&self, carrier_num: u16, t: TdmaTime, ssi: u32) -> TdmaTime {
+        match (carrier_num == self.main_carrier())
+            .then(|| self.channel_scheduler.pdch_anchor(t.t, ssi))
+            .flatten()
+        {
+            Some(anchor) => TdmaTime { t: anchor, ..t },
+            None => t,
+        }
+    }
+
     fn configured_carriers(&self) -> Vec<u16> {
         let cfg = self.config.config();
         [Some(cfg.cell.main_carrier), cfg.cell.secondary_carrier]
@@ -807,7 +821,8 @@ impl UmacBs {
         tracing::debug!("rx_mac_data: {}", prim.pdu.dump_bin_full(true));
         if is_frag_start {
             // Fragmentation start, add to defragmenter
-            self.defrag.insert_first(&mut prim.pdu, msg_dltime, addr, None);
+            let key = self.defrag_time(prim.carrier_num, msg_dltime, addr.ssi);
+            self.defrag.insert_first(&mut prim.pdu, key, addr, None);
         } else {
             // Pass directly to LLC
             let sdu = {
@@ -1018,7 +1033,8 @@ impl UmacBs {
         // tracing::debug!("rx_mac_access: {}", prim.pdu.dump_bin_full(true));
         if pdu.is_frag_start() {
             // Fragmentation start, add to defragmenter
-            self.defrag.insert_first(&mut prim.pdu, msg_dltime, addr, None);
+            let key = self.defrag_time(prim.carrier_num, msg_dltime, addr.ssi);
+            self.defrag.insert_first(&mut prim.pdu, key, addr, None);
         } else {
             // Pass directly to LLC
             if prim.pdu.get_len_remaining() == 0 {
@@ -1120,13 +1136,14 @@ impl UmacBs {
             return;
         };
 
-        if let Some(_aie_info) = self.defrag.get_aie_info(slot_owner, msg_dltime) {
+        let key = self.defrag_time(prim.carrier_num, msg_dltime, slot_owner);
+        if let Some(_aie_info) = self.defrag.get_aie_info(slot_owner, key) {
             unimplemented_log!("rx_mac_frag_ul: Encryption not supported");
             return;
         }
 
         // Insert into defragmenter
-        self.defrag.insert_next(&mut prim.pdu, slot_owner, msg_dltime);
+        self.defrag.insert_next(&mut prim.pdu, slot_owner, key);
     }
 
     fn rx_mac_end_ul(&mut self, queue: &mut MessageQueue, message: &mut SapMsg) {
@@ -1194,13 +1211,14 @@ impl UmacBs {
         if on_main && pdu.reservation_req.is_none() {
             self.channel_scheduler.ul_release_after(msg_dltime, slot_owner);
         }
-        if let Some(_aie_info) = self.defrag.get_aie_info(slot_owner, msg_dltime) {
+        let key = self.defrag_time(prim.carrier_num, msg_dltime, slot_owner);
+        if let Some(_aie_info) = self.defrag.get_aie_info(slot_owner, key) {
             unimplemented_log!("rx_mac_end_ul: Encryption not supported");
             return;
         }
 
         // Insert last fragment and retrieve finalized block
-        let defragbuf = self.defrag.insert_last(&mut prim.pdu, slot_owner, msg_dltime);
+        let defragbuf = self.defrag.insert_last(&mut prim.pdu, slot_owner, key);
         let Some(defragbuf) = defragbuf else {
             tracing::debug!("rx_mac_end_ul: could not obtain defragged buf (start not seen — normal on RF loss)");
             return;
@@ -1333,13 +1351,14 @@ impl UmacBs {
         if on_main && pdu.reservation_req.is_none() {
             self.channel_scheduler.ul_release_after(msg_dltime, slot_owner);
         }
-        if let Some(_aie_info) = self.defrag.get_aie_info(slot_owner, msg_dltime) {
+        let key = self.defrag_time(prim.carrier_num, msg_dltime, slot_owner);
+        if let Some(_aie_info) = self.defrag.get_aie_info(slot_owner, key) {
             unimplemented_log!("rx_mac_end_hu: Encryption not supported");
             return;
         }
 
         // Insert last fragment and retrieve finalized block
-        let defragbuf = self.defrag.insert_last(&mut prim.pdu, slot_owner, msg_dltime);
+        let defragbuf = self.defrag.insert_last(&mut prim.pdu, slot_owner, key);
         let Some(defragbuf) = defragbuf else {
             tracing::debug!("rx_mac_end_hu: could not obtain defragged buf (start not seen — normal on RF loss)");
             return;
