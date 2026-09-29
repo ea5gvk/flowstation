@@ -374,6 +374,48 @@ impl BsChannelScheduler {
         self.pdch_owner(ts) == Some(ssi)
     }
 
+    /// Timeslots (2..=4) of the packet-data channel of `ssi` on this carrier.
+    fn pdch_timeslots_of(&self, ssi: u32) -> [bool; 4] {
+        [1u8, 2, 3, 4].map(|ts| self.is_pdch_of(ts, ssi))
+    }
+
+    /// The owner of `ts` when its packet-data channel has more than one slot.
+    fn multislot_owner(&self, ts: u8) -> Option<u32> {
+        let owner = self.pdch_owner(ts)?;
+        (self.pdch.iter().filter(|o| **o == Some(owner)).count() > 1).then_some(owner)
+    }
+
+    /// Lowest-numbered slot of the packet-data channel `ts` belongs to for `ssi` (the key of its
+    /// uplink reassembly and of its downlink queue); None when `ts` is not a slot of it.
+    pub fn pdch_anchor(&self, ts: u8, ssi: u32) -> Option<u8> {
+        if !self.is_pdch_of(ts, ssi) {
+            return None;
+        }
+        (2..=4u8).find(|t| self.is_pdch_of(*t, ssi))
+    }
+
+    /// Index of the downlink queue slot `ts` takes from and fills: its channel's lowest slot on a
+    /// packet-data channel of several slots, whose slots all carry the same downlink (EN 300 392-2
+    /// 23.3.5, 23.4.2.1.1 NOTE 3), else its own.
+    fn queue_index(&self, ts: u8) -> usize {
+        match self.multislot_owner(ts).and_then(|owner| self.pdch_anchor(ts, owner)) {
+            Some(anchor) => anchor as usize - 1,
+            None => ts as usize - 1,
+        }
+    }
+
+    /// Before a slot of a packet-data channel of several slots is built: PDUs queued outside a
+    /// build for the next slot (`dl_enqueue_tma_next_frame`, the MCCH channel-allocation deferral)
+    /// are meant for ts1, where the radios they are for listen, not for this channel.
+    fn pdch_route_out_of_build_items(&mut self, ts: TdmaTime) {
+        if self.dltx_next_slot_queue.is_empty() || self.multislot_owner(ts.t).is_none() {
+            return;
+        }
+        let mut merged = std::mem::take(&mut self.dltx_next_slot_queue);
+        merged.append(&mut self.dltx_queues[0]);
+        self.dltx_queues[0] = merged;
+    }
+
     /// Drop the resources, fragments, grants and random-access acknowledgements queued on `ts`
     /// for `ssi`, and the group PDUs copied there for it (others stay). Returns how many were
     /// dropped.
@@ -826,7 +868,8 @@ impl BsChannelScheduler {
             usage_marker
         );
         let elem = DlSchedElem::Grant(addr, grant, usage_marker);
-        self.dltx_queues[ts as usize - 1].push(elem);
+        let q = self.queue_index(ts);
+        self.dltx_queues[q].push(elem);
     }
 
     pub fn dl_enqueue_random_access_ack(&mut self, ts: u8, addr: TetraAddress) {
@@ -845,7 +888,8 @@ impl BsChannelScheduler {
             addr
         );
         let elem = DlSchedElem::RandomAccessAck(addr);
-        self.dltx_queues[ts as usize - 1].push(elem);
+        let q = self.queue_index(ts);
+        self.dltx_queues[q].push(elem);
     }
 
     fn identify_timeslots_for_ssi(&self, addr: Option<TetraAddress>, link_id: LinkId) -> [u8; NUM_TIMESLOTS] {
@@ -990,11 +1034,13 @@ impl BsChannelScheduler {
                 // There is another ts for which we need to transmit this message.
                 // Clone the message now and push it to the current ts.
                 let elem = DlSchedElem::Resource(pdu.clone(), sdu.clone(), tx_reporter.clone());
-                self.dltx_queues[ts as usize - 1].push(elem);
+                let q = self.queue_index(ts);
+                self.dltx_queues[q].push(elem);
             } else {
                 // This is the last ts on which we need to transmit this message
                 let elem = DlSchedElem::Resource(pdu, sdu, tx_reporter);
-                self.dltx_queues[ts as usize - 1].push(elem);
+                let q = self.queue_index(ts);
+                self.dltx_queues[q].push(elem);
                 break;
             }
         }
@@ -1024,7 +1070,8 @@ impl BsChannelScheduler {
             );
             return;
         }
-        self.dltx_queues[ts as usize - 1].push(DlSchedElem::FragBuf(fragger));
+        let q = self.queue_index(ts);
+        self.dltx_queues[q].push(DlSchedElem::FragBuf(fragger));
     }
 
     /// Consumes and returns true if a pending random access ack exists for the given SSI on
@@ -1176,7 +1223,8 @@ impl BsChannelScheduler {
 
     /// Returns a mutable reference to the first scheduled resource for the given timeslot and address
     pub fn dl_get_scheduled_resource_for_ssi(&mut self, ts: TdmaTime, addr: &TetraAddress) -> Option<&mut DlSchedElem> {
-        let queue = &mut self.dltx_queues[ts.t as usize - 1];
+        let q = self.queue_index(ts.t);
+        let queue = &mut self.dltx_queues[q];
 
         for index in 0..queue.len() {
             let elem = &mut queue[index];
@@ -1214,7 +1262,8 @@ impl BsChannelScheduler {
 
     /// Takes and removes all grants and random access acknowledgements from the given timeslot's queue, returning them as a vec.
     pub fn dl_take_all_grants_and_acks(&mut self, timeslot: u8) -> Vec<DlSchedElem> {
-        let queue = &mut self.dltx_queues[timeslot as usize - 1];
+        let q = self.queue_index(timeslot);
+        let queue = &mut self.dltx_queues[q];
         let mut taken = Vec::new();
 
         let mut i = 0;
@@ -1350,7 +1399,8 @@ impl BsChannelScheduler {
 
                     // Push new resource into the queue. These do not need a tx_reporter
                     let dlsched_res = DlSchedElem::Resource(pdu, BitBuffer::new(0), None);
-                    self.dltx_queues[ts.t as usize - 1].push(dlsched_res);
+                    let q = self.queue_index(ts.t);
+                    self.dltx_queues[q].push(dlsched_res);
                 }
                 _ => unreachable!("BUG: unhandled match variant -- should never be reached"),
             }
@@ -1359,8 +1409,9 @@ impl BsChannelScheduler {
 
     fn dl_build_block_from_signalling_schedule(&mut self, ts: TdmaTime) -> Option<BitBuffer> {
         let mut buf_opt = None;
+        let q = self.queue_index(ts.t);
 
-        while !self.dltx_queues[ts.t as usize - 1].is_empty() {
+        while !self.dltx_queues[q].is_empty() {
             let room = buf_opt.as_ref().map_or(SCH_F_CAP, |buf: &BitBuffer| buf.get_len_remaining());
             let opt = self.dl_take_next_sched_item(ts, room);
 
@@ -1424,7 +1475,7 @@ impl BsChannelScheduler {
         // avoids a panic when the current queue already contains items (e.g. two back-to-back
         // P2P calls each deferring a chan_alloc PDU within the same tick).
         if !self.dltx_next_slot_queue.is_empty() {
-            let current = &mut self.dltx_queues[ts.t as usize - 1];
+            let current = &mut self.dltx_queues[q];
             // Prepend: move deferred items to front, then re-append any items already queued.
             let mut merged = std::mem::take(&mut self.dltx_next_slot_queue);
             merged.extend(current.drain(..));
@@ -1532,7 +1583,11 @@ impl BsChannelScheduler {
             tracing::warn!("dl_take_prioritized_sched_item: ts.t={} out of range, no item", ts.t);
             return None;
         }
-        let slot = ts.t as usize - 1;
+        let slot = self.queue_index(ts.t);
+        // On a packet-data channel of several slots frame 18 already leaves three channel slots
+        // without a fragment, and N.203 is only ">= 4" (EN 300 392-2 annex B.2): next to it, in
+        // frames 17 and 1, a started fragment opens the block and signalling waits behind it.
+        let let_in = self.multislot_owner(ts.t).is_none() || !matches!(ts.f, 1 | 17);
         let Some(q) = self.dltx_queues.get_mut(slot) else {
             return None;
         };
@@ -1553,6 +1608,7 @@ impl BsChannelScheduler {
             // message with non-fragmented ones (EN 300 392-2 23.4.2.1.1), and a fragment still goes
             // in every block.
             if matches!(&q[i], DlSchedElem::FragBuf(f) if f.is_packet_data())
+                && let_in
                 && let Some(j) = q.iter().position(|e| Self::fits_before_a_fragment(e, room))
             {
                 return Some(q.remove(j));
@@ -1694,6 +1750,7 @@ impl BsChannelScheduler {
                 }
             }
         } else {
+            self.pdch_route_out_of_build_items(ts);
             self.dl_integrate_sched_elems_for_timeslot(ts);
 
             let buf = self.dl_build_block_from_signalling_schedule(ts);
@@ -2887,5 +2944,194 @@ mod tests {
         sched.dump_dl_queue();
 
         assert!(sched.dltx_queues[ts.t as usize - 1].len() == 1);
+    }
+
+    /// A scheduler whose packet-data channel of `owner` is `slots` of the main carrier.
+    pub(super) fn multislot_slotter(owner: u32, slots: &[u8]) -> BsChannelScheduler {
+        let mut sched = get_testing_slotter();
+        for ts in slots {
+            sched.set_pdch(*ts, Some(owner));
+        }
+        sched
+    }
+
+    /// The next `n` slots the scheduler builds.
+    pub(super) fn finalize_slots(sched: &mut BsChannelScheduler, n: usize) -> Vec<TmvUnitdataReqSlot> {
+        (0..n)
+            .map(|_| {
+                let next = sched.cur_dltime.add_timeslots(1);
+                sched.tick_start(next);
+                sched.finalize_ts_for_tick()
+            })
+            .collect()
+    }
+
+    /// The MAC PDUs of a downlink SCH/F block, in order: (MAC PDU kind, SSI, length indication)
+    /// with kind 0 a MAC-RESOURCE, 2 a MAC-FRAG and 3 a MAC-END (no SSI).
+    pub(super) fn dl_pdus(slot: &TmvUnitdataReqSlot) -> Vec<(u8, Option<u32>, u8)> {
+        use tetra_pdus::umac::pdus::mac_end_dl::MacEndDl;
+        let Some(blk) = slot.blk1.as_ref().filter(|b| b.logical_channel == LogicalChannel::SchF) else {
+            return Vec::new();
+        };
+        let mut block = blk.mac_block.clone();
+        block.seek(0);
+        let bits = block.to_bitstr();
+        let mut out = Vec::new();
+        let mut pos = 0;
+        while pos + 16 <= bits.len() {
+            let mut b = BitBuffer::from_bitstr(&bits[pos..]);
+            b.seek(0);
+            match b.peek_bits(3) {
+                Some(0..=1) => {
+                    let Ok(res) = MacResource::from_bitbuf(&mut b) else { break };
+                    let Some(addr) = res.addr else { break };
+                    out.push((0, Some(addr.ssi), res.length_ind));
+                    if res.length_ind == 0b111111 {
+                        break;
+                    }
+                    pos += res.length_ind as usize * 8;
+                }
+                Some(2) => {
+                    out.push((2, None, 0));
+                    break;
+                }
+                Some(3) => {
+                    let Ok(end) = MacEndDl::from_bitbuf(&mut b) else { break };
+                    out.push((3, None, end.length_ind));
+                    pos += end.length_ind as usize * 8;
+                }
+                _ => break,
+            }
+        }
+        out
+    }
+
+    /// The first octet of the TM-SDU of the first MAC-RESOURCE of a slot, and its SSI.
+    fn first_resource_tag(slot: &TmvUnitdataReqSlot) -> Option<(u32, u64)> {
+        let blk = slot.blk1.as_ref().filter(|b| b.logical_channel == LogicalChannel::SchF)?;
+        let mut b = blk.mac_block.clone();
+        b.seek(0);
+        let res = MacResource::from_bitbuf(&mut b).ok()?;
+        Some((res.addr?.ssi, b.read_bits(8)?))
+    }
+
+    /// A MAC-RESOURCE for `addr` whose TM-SDU starts with the octet `tag`, `bits` long.
+    fn tagged_resource(addr: &TetraAddress, tag: u8, bits: usize) -> (MacResource, BitBuffer) {
+        let mut sdu = format!("{tag:08b}");
+        while sdu.len() < bits {
+            sdu.push(if sdu.len() % 2 == 0 { '1' } else { '0' });
+        }
+        (BsChannelScheduler::dl_make_minimal_resource(addr, None, false), BitBuffer::from_bitstr(&sdu))
+    }
+
+    /// Every slot of a packet-data channel of several slots takes its downlink from one queue,
+    /// the one of its lowest slot, in order (EN 300 392-2 23.3.5).
+    #[test]
+    fn test_multislot_dl_takes_the_channel_queue_in_order() {
+        let x = TetraAddress::issi(2_145_007);
+        let mut sched = multislot_slotter(x.ssi, &[2, 3, 4]);
+        for tag in 0..6u8 {
+            let (pdu, sdu) = tagged_resource(&x, tag, 200);
+            sched.dl_enqueue_tma_for_link(4, pdu, sdu, None);
+        }
+        assert_eq!(sched.dltx_queues[1].len(), 6, "all in the queue of ts2");
+        let sent: Vec<(u8, u64)> = finalize_slots(&mut sched, 12)
+            .iter()
+            .filter_map(|s| first_resource_tag(s).filter(|r| r.0 == x.ssi).map(|r| (s.ts.t, r.1)))
+            .collect();
+        assert_eq!(sent, vec![(2, 0), (3, 1), (4, 2), (2, 3), (3, 4), (4, 5)]);
+    }
+
+    /// One fragmented message at a time on the channel: the second starts only after the MAC-END
+    /// of the first (23.4.2.1.1, 23.4.3.1.1 i), however many slots the channel has.
+    #[test]
+    fn test_one_fragmented_message_at_a_time_on_the_channel() {
+        let x = TetraAddress::issi(2_145_007);
+        let mut sched = multislot_slotter(x.ssi, &[3, 4]);
+        for tag in [0xa1u8, 0xb2] {
+            let (pdu, sdu) = tagged_resource(&x, tag, 600);
+            sched.dl_enqueue_tma_for_link(3, pdu, sdu, None);
+        }
+        let kinds: Vec<(u8, u8)> = finalize_slots(&mut sched, 24)
+            .iter()
+            .filter(|s| (3..=4).contains(&s.ts.t))
+            .flat_map(dl_pdus)
+            .map(|(kind, _, li)| (kind, if kind == 0 { li } else { 0 }))
+            .collect();
+        assert_eq!(
+            kinds.iter().map(|k| k.0).collect::<Vec<_>>(),
+            vec![0, 2, 3, 0, 2, 3],
+            "{kinds:?}"
+        );
+        assert!(kinds.iter().filter(|k| k.0 == 0).all(|k| k.1 == 0b111111));
+    }
+
+    /// A group PDU copied to the channel of a member goes out once, on one of its slots.
+    #[test]
+    fn test_a_group_copy_goes_once_on_a_multislot_channel() {
+        let x = TetraAddress::issi(2_145_007);
+        let group = TetraAddress::new(91, SsiType::Gssi);
+        let mut sched = multislot_slotter(x.ssi, &[3, 4]);
+        let (pdu, sdu) = tagged_resource(&group, 0x5a, 64);
+        sched.dl_enqueue_tma_for_link(4, pdu, sdu, None);
+        let slots = finalize_slots(&mut sched, 16);
+        let copies: Vec<u8> = slots
+            .iter()
+            .filter(|s| dl_pdus(s).iter().any(|p| p.1 == Some(group.ssi)))
+            .map(|s| s.ts.t)
+            .collect();
+        assert_eq!(copies.len(), 1, "{copies:?}");
+        assert!((3..=4).contains(&copies[0]));
+    }
+
+    /// A PDU queued outside a build for "the next slot" (meant for ts1) is not taken by a slot of
+    /// a packet-data channel of several slots built next: it goes on ts1.
+    #[test]
+    fn test_out_of_build_items_go_to_ts1() {
+        let x = TetraAddress::issi(2_145_007);
+        let other = TetraAddress::issi(2_260_619);
+        let mut sched = multislot_slotter(x.ssi, &[2, 3]);
+        // The slot built next is (3,2).
+        sched.set_dl_time(TdmaTime { t: 4, f: 2, m: 1, h: 0 });
+        let (pdu, sdu) = tagged_resource(&other, 0x77, 32);
+        sched.dl_enqueue_tma_next_frame(pdu, sdu, None);
+        let slots = finalize_slots(&mut sched, 8);
+        assert_eq!(slots[0].ts.t, 2, "a channel slot is built next");
+        let on: Vec<u8> = slots
+            .iter()
+            .filter(|s| dl_pdus(s).iter().any(|p| p.1 == Some(other.ssi)))
+            .map(|s| s.ts.t)
+            .collect();
+        assert_eq!(on, vec![1]);
+    }
+
+    /// Frame 18 already leaves a channel of three slots three slots without a fragment, and N.203
+    /// is only ">= 4" (annex B.2): next to it (frames 17 and 1) signalling for the radio does not go
+    /// ahead of the fragment under way on its channel, the fragment opens the block.
+    #[test]
+    fn test_a_fragment_is_not_delayed_next_to_frame_18() {
+        let x = TetraAddress::issi(2_145_007);
+        let mut sched = multislot_slotter(x.ssi, &[2, 3, 4]);
+        // The slot built next is (16,2).
+        sched.set_dl_time(TdmaTime { t: 4, f: 15, m: 1, h: 0 });
+
+        let reporter = TxReporter::new();
+        let (pdu, sdu) = tagged_resource(&x, 0xd0, 3200);
+        sched.dl_enqueue_packet_data_for_link(4, pdu, sdu, Some(reporter.clone()));
+        let mut slots = finalize_slots(&mut sched, 3);
+        assert_eq!(dl_pdus(&slots[0]).first().map(|p| p.0), Some(0), "the datagram starts on (16,2)");
+        let (sig, sdu) = tagged_resource(&x, 0x51, 40);
+        sched.dl_enqueue_tma_for_link(4, sig, sdu, None);
+        slots.extend(finalize_slots(&mut sched, 4 * 5));
+        for s in slots.iter().filter(|s| s.ts.t >= 2 && matches!(s.ts.f, 17 | 1)) {
+            let first = dl_pdus(s).first().map(|p| p.0);
+            assert!(matches!(first, Some(2 | 3)), "a fragment opens ({},{}): {:?}", s.ts.f, s.ts.t, dl_pdus(s));
+        }
+        assert!(reporter.is_transmitted(), "the datagram completed");
+        let signalling = slots
+            .iter()
+            .filter(|s| dl_pdus(s).iter().any(|p| p.0 == 0 && p.2 != 0b111111))
+            .count();
+        assert!(signalling >= 1, "and the signalling went after it");
     }
 }

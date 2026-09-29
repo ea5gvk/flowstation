@@ -76,6 +76,9 @@ pub struct UmacBs {
     telemetry: Option<TelemetrySink>,
     /// `[packet_data] bearer = "pdch"`: packet-data channels on main-carrier ts 2..=4.
     pdch_mode: bool,
+    /// Last slot two radios' packet-data channels both claimed (timeslot, ISSI kept, ISSI
+    /// refused), warned once.
+    pdch_conflict: Option<(u8, u32, u32)>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -123,24 +126,42 @@ impl UmacBs {
             pending_circuit_closes: HashMap::new(),
             telemetry,
             pdch_mode,
+            pdch_conflict: None,
         }
     }
 
-    /// Packet-data channels from the shared state: a main-carrier slot is one radio's PDCH while
-    /// the SNDCP bearer holds a grant on it and voice has not taken it.
+    /// Packet-data channels from the shared state: main-carrier slots are one radio's PDCH while
+    /// the SNDCP bearer holds a grant on them and voice has taken none of them (a channel voice
+    /// took one slot of goes as a whole, see `StackState::pdch_channel`).
     fn sync_pdch(&mut self) {
         let main = self.main_carrier();
-        let mut owners = [None; 4];
+        let mut owners: [Option<u32>; 4] = [None; 4];
+        let mut conflict = None;
         {
             let state = self.config.state_read();
-            for (issi, grant) in state.pdch_by_issi.iter() {
-                if grant.slot.carrier_num == main
-                    && (2..=4).contains(&grant.slot.ts)
-                    && state.timeslot_alloc.slot_owner(grant.slot) == Some(tetra_core::TimeslotOwner::PacketData)
-                {
-                    owners[grant.slot.ts as usize - 1] = Some(*issi);
+            let mut issis: Vec<u32> = state.pdch_by_issi.keys().copied().collect();
+            issis.sort_unstable();
+            for issi in issis {
+                let Some((grant, timeslots)) = state.pdch_channel(issi) else { continue };
+                if grant.slot.carrier_num != main {
+                    continue;
+                }
+                for ts in 2..=4u8 {
+                    if !timeslots[ts as usize - 1] {
+                        continue;
+                    }
+                    match owners[ts as usize - 1] {
+                        None => owners[ts as usize - 1] = Some(issi),
+                        Some(first) => conflict = Some((ts, first, issi)),
+                    }
                 }
             }
+        }
+        if conflict != self.pdch_conflict {
+            if let Some((ts, first, second)) = conflict {
+                tracing::warn!("UMAC: PDCH ts {} claimed by ISSI {} and ISSI {}, kept for the first", ts, first, second);
+            }
+            self.pdch_conflict = conflict;
         }
         for ts in 2..=4u8 {
             let (old, new) = (self.channel_scheduler.pdch_owner(ts), owners[ts as usize - 1]);
@@ -162,20 +183,28 @@ impl UmacBs {
         }
     }
 
-    /// Packet-data activity of `ssi` on its PDCH (`ts` of `carrier_num`), for the dashboard.
-    /// Nothing for any other slot or radio, or with the bearer on the MCCH.
+    /// Packet-data activity of `ssi` on its PDCH (`ts` of `carrier_num`), for the dashboard: the
+    /// uplink on the slot it came in, the downlink on every slot of the channel (they all carry
+    /// it). Nothing for any other slot or radio, or with the bearer on the MCCH.
     fn note_pdch_traffic(&self, carrier_num: u16, ts: u8, ssi: u32, uplink: bool) {
         if self.pdch_mode
             && carrier_num == self.main_carrier()
             && self.channel_scheduler.is_pdch_of(ts, ssi)
             && let Some(sink) = &self.telemetry
         {
-            sink.send(TelemetryEvent::TsDataActivity {
-                carrier_num,
-                ts,
-                issi: ssi,
-                uplink,
-            });
+            let slots = if uplink {
+                vec![ts]
+            } else {
+                (2..=4u8).filter(|t| self.channel_scheduler.is_pdch_of(*t, ssi)).collect()
+            };
+            for ts in slots {
+                sink.send(TelemetryEvent::TsDataActivity {
+                    carrier_num,
+                    ts,
+                    issi: ssi,
+                    uplink,
+                });
+            }
         }
     }
 
