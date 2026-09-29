@@ -4007,3 +4007,169 @@ fn voice_taking_one_slot_releases_the_whole_multislot_pdch() {
     let slots = response.alloc.as_ref().map(ts_of).expect("a PDCH again");
     assert!(!slots.is_empty() && !slots.contains(&2), "{slots:?}");
 }
+
+/// Every slot of a channel of several slots is an assigned control channel of its radio (AACH
+/// assigned control / assigned only, SCH/F Null while idle); a slot outside it is not. Voice
+/// taking one slot takes them all back at once.
+#[test]
+fn a_multislot_pdch_is_assigned_control_on_every_slot() {
+    use tetra_pdus::umac::enums::access_assign_dl_usage::AccessAssignDlUsage;
+    use tetra_pdus::umac::enums::access_assign_ul_usage::AccessAssignUlUsage;
+    debug::setup_logging_verbose();
+    let mut mac = MacAir::with(multislot_config(false, 2));
+    grant_pdch_slots(&mac.test.config, ISSI, &[4, 3], true);
+    for ts in [3u8, 4] {
+        let slots = mac.run_slots(8, ts);
+        for s in &slots[1..] {
+            let (header, aach) = aach_of(s);
+            assert_eq!(
+                (header, aach.dl_usage, aach.ul_usage),
+                (2, AccessAssignDlUsage::AssignedControl, AccessAssignUlUsage::AssignedOnly),
+                "ts {ts}"
+            );
+            assert_eq!(
+                s.blk1.as_ref().unwrap().logical_channel,
+                tetra_saps::tmv::enums::logical_chans::LogicalChannel::SchF
+            );
+        }
+    }
+    let ts2 = mac.run_slots(8, 2);
+    assert!(ts2.iter().all(|s| aach_of(s).1.dl_usage == AccessAssignDlUsage::Unallocated));
+
+    {
+        let mut state = mac.test.config.state_write();
+        state.timeslot_alloc.reserve(TimeslotOwner::Cmce, 2).unwrap();
+        assert_eq!(state.timeslot_alloc.allocate_any_slot(TimeslotOwner::Cmce).map(|s| s.ts), Some(3));
+    }
+    let ts4 = mac.run_slots(4, 4);
+    assert!(
+        ts4.iter().all(|s| aach_of(s).1.dl_usage == AccessAssignDlUsage::Unallocated),
+        "the whole channel goes with the slot voice took"
+    );
+}
+
+/// A group PDU reaches a member on its channel of several slots once, on one slot of it, and
+/// once on the MCCH.
+#[test]
+fn a_group_call_setup_reaches_a_multislot_member_once() {
+    debug::setup_logging_verbose();
+    let mut mac = MacAir::with(multislot_config(false, 2));
+    {
+        let mut state = mac.test.config.state_write();
+        state.subscribers.register(ISSI);
+        state.subscribers.affiliate(ISSI, GSSI);
+    }
+    grant_pdch_slots(&mac.test.config, ISSI, &[4, 3], true);
+    mac.run(4);
+    mac.test.submit_message(tl_data_to(TetraAddress::new(GSSI, SsiType::Gssi), false));
+    let blocks = mac.run(4 * 6);
+    let mut on: Vec<u8> = blocks
+        .iter()
+        .filter(|b| b.1 == MAIN_CARRIER && b.3.iter().any(|r| r.0 == GSSI))
+        .map(|b| b.2)
+        .collect();
+    on.sort_unstable();
+    assert_eq!(on.len(), 2, "{on:?}");
+    assert_eq!(on[0], 1, "on the MCCH");
+    assert!((3..=4).contains(&on[1]), "and once on the channel: {on:?}");
+}
+
+/// The dashboard sees every slot of the channel: PDCH active and inactive on each, and the
+/// downlink to the radio on each (they all carry it).
+#[test]
+fn the_dashboard_shows_every_slot_of_a_multislot_pdch() {
+    use tetra_entities::net_telemetry::{TelemetryEvent, telemetry_channel};
+    let (sink, source) = telemetry_channel();
+    let mut test = ComponentTest::from_config(multislot_config(false, 2), Some(TdmaTime::default()));
+    test.populate_entities(vec![], vec![TetraEntity::Llc, TetraEntity::Lmac]);
+    test.register_entity(tetra_entities::umac::umac_bs::UmacBs::new(test.get_shared_config(), Some(sink)));
+    let slots = grant_pdch_slots(&test.config, ISSI, &[4, 3], true);
+    test.run_stack(Some(2));
+    let changed = |events: &[TelemetryEvent], active: bool| -> Vec<u8> {
+        let mut ts: Vec<u8> = events
+            .iter()
+            .filter_map(|e| match e {
+                TelemetryEvent::PdchChanged { ts, issi: ISSI, active: a, .. } if *a == active => Some(*ts),
+                _ => None,
+            })
+            .collect();
+        ts.sort_unstable();
+        ts
+    };
+    let onto = pdch_telemetry(&source);
+    assert_eq!(changed(&onto, true), vec![3, 4]);
+
+    let mut pdu = BitBuffer::new_autoexpand(32);
+    BlUdata { has_fcs: false }.to_bitbuf(&mut pdu);
+    append_bits(&mut pdu, "0101010101");
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+            carrier_num: Some(MAIN_CARRIER),
+            req_handle: 0,
+            pdu,
+            main_address: TetraAddress::issi(ISSI),
+            link_id: 4,
+            endpoint_id: 0,
+            stealing_permission: false,
+            subscriber_class: 0,
+            air_interface_encryption: None,
+            stealing_repeats_flag: None,
+            data_category: None,
+            chan_alloc: None,
+            tx_reporter: None,
+        }),
+    });
+    test.run_stack(Some(1));
+    let mut down: Vec<u8> = pdch_telemetry(&source)
+        .iter()
+        .filter_map(|e| match e {
+            TelemetryEvent::TsDataActivity { ts, issi: ISSI, uplink: false, .. } => Some(*ts),
+            _ => None,
+        })
+        .collect();
+    down.sort_unstable();
+    assert_eq!(down, vec![3, 4]);
+
+    {
+        let mut state = test.config.state_write();
+        state.pdch_by_issi.remove(&ISSI);
+        state.pdch_timeslots_by_issi.remove(&ISSI);
+        for s in slots {
+            state.timeslot_alloc.release_slot(TimeslotOwner::PacketData, s).unwrap();
+        }
+    }
+    test.run_stack(Some(1));
+    assert_eq!(changed(&pdch_telemetry(&source), false), vec![3, 4]);
+}
+
+/// Two radios never share a slot: the second gets what the first left, and a slot two channels
+/// claim in the shared state (a stale entry) stays with the first ISSI.
+#[test]
+fn two_radios_never_share_a_slot() {
+    let mut cfg = multislot_config(false, 2);
+    cfg.cell.secondary_carrier = Some(SECONDARY_CARRIER);
+    let mut air = Air::new(cfg);
+    assert_eq!(onto_channel(&mut air, ISSI, &transmit_request_full(1, 4, 4)), vec![3, 4]);
+    assert_eq!(onto_channel(&mut air, ISSI2, &transmit_request_full(1, 4, 4)), vec![2]);
+
+    let mut test = ComponentTest::from_config(multislot_config(false, 2), Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Llc, TetraEntity::Lmac]);
+    grant_pdch_slots(&test.config, ISSI, &[4, 3], true);
+    {
+        let mut state = test.config.state_write();
+        let slot = state.timeslot_alloc.reserve_packet_data_slot(&[2]).unwrap();
+        state.pdch_by_issi.insert(ISSI2, PdchGrant { slot, on_air: true });
+        state.pdch_timeslots_by_issi.insert(ISSI2, [false, true, true, false]);
+    }
+    test.run_stack(Some(2));
+    let umac = test
+        .router
+        .get_entity(TetraEntity::Umac)
+        .and_then(|e| e.as_any_mut().downcast_mut::<tetra_entities::umac::umac_bs::UmacBs>())
+        .expect("the UMAC");
+    let owners: Vec<Option<u32>> = (2..=4).map(|ts| umac.channel_scheduler.pdch_owner(ts)).collect();
+    assert_eq!(owners, vec![Some(ISSI2), Some(ISSI), Some(ISSI)]);
+}
