@@ -153,6 +153,20 @@ impl TimeslotAllocator {
         })
     }
 
+    /// A packet-data channel of up to `n` main-carrier timeslots: the first free ones of `prefs`
+    /// (2..=4), in that order.
+    pub fn reserve_packet_data_slots(&mut self, prefs: &[u8], n: usize) -> Vec<CarrierSlot> {
+        (0..n).map_while(|_| self.reserve_packet_data_slot(prefs)).collect()
+    }
+
+    /// Traffic slots without an owner: (main carrier ts2..=4, every other carrier ts1..=4). For
+    /// the voice headroom of a packet-data channel of several slots.
+    pub fn free_traffic_slots(&self) -> (usize, usize) {
+        let main = self.owners[0][1..].iter().filter(|owner| owner.is_none()).count();
+        let others = self.owners[1..].iter().flatten().filter(|owner| owner.is_none()).count();
+        (main, others)
+    }
+
     /// Packet-data slots taken by another owner since the last call.
     pub fn drain_preempted_packet_data(&mut self) -> Vec<CarrierSlot> {
         std::mem::take(&mut self.preempted)
@@ -344,6 +358,47 @@ mod tests {
             "main carrier full, secondary never used"
         );
         assert_eq!(alloc.free_slot_count(), 6, "two packet-data slots and the four secondary ones");
+    }
+
+    #[test]
+    fn packet_data_slots_follow_the_preferences() {
+        let mut alloc = TimeslotAllocator::default();
+        alloc.configure_carriers(&[1584]);
+        let slots = alloc.reserve_packet_data_slots(&[4, 3, 2], 2);
+        assert_eq!(slots.iter().map(|s| s.ts).collect::<Vec<_>>(), vec![4, 3]);
+        assert!(slots.iter().all(|s| s.carrier_num == 1584));
+
+        let mut alloc = TimeslotAllocator::default();
+        alloc.configure_carriers(&[1584]);
+        alloc.reserve(TimeslotOwner::Cmce, 3).unwrap();
+        let slots = alloc.reserve_packet_data_slots(&[4, 3, 2], 2);
+        assert_eq!(slots.iter().map(|s| s.ts).collect::<Vec<_>>(), vec![4, 2], "not contiguous");
+        assert!(alloc.reserve_packet_data_slots(&[4, 3, 2], 3).is_empty(), "nothing left");
+
+        let mut alloc = TimeslotAllocator::default();
+        alloc.configure_carriers(&[1584]);
+        alloc.reserve(TimeslotOwner::Cmce, 2).unwrap();
+        alloc.reserve(TimeslotOwner::Cmce, 3).unwrap();
+        assert_eq!(alloc.reserve_packet_data_slots(&[4, 3, 2], 3).len(), 1, "what is free");
+
+        let (mut a, mut b) = (TimeslotAllocator::default(), TimeslotAllocator::default());
+        a.configure_carriers(&[1584]);
+        b.configure_carriers(&[1584]);
+        assert_eq!(a.reserve_packet_data_slots(&[3, 4], 1), vec![b.reserve_packet_data_slot(&[3, 4]).unwrap()]);
+    }
+
+    #[test]
+    fn free_traffic_slots_counts_main_and_others() {
+        let mut alloc = TimeslotAllocator::default();
+        alloc.configure_carriers(&[1584]);
+        alloc.reserve(TimeslotOwner::Cmce, 2).unwrap();
+        assert_eq!(alloc.free_traffic_slots(), (2, 0));
+        alloc.reserve_packet_data_slot(&[4]).unwrap();
+        assert_eq!(alloc.free_traffic_slots(), (1, 0), "a packet-data slot has an owner");
+
+        let mut alloc = TimeslotAllocator::default();
+        alloc.configure_carriers(&[1584, 1585]);
+        assert_eq!(alloc.free_traffic_slots(), (3, 4));
     }
 
     #[test]

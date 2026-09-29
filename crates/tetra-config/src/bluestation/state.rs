@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use tetra_core::{CarrierSlot, TimeslotAllocator};
+use tetra_core::{CarrierSlot, TimeslotAllocator, TimeslotOwner};
 
 /// A one-shot or repeating SDS broadcast message injected at runtime via the dashboard.
 ///
@@ -592,10 +592,41 @@ pub struct StackState {
     /// SNDCP runtime writes it; the UMAC and the LLC use a grant only while the slot's owner is
     /// still `TimeslotOwner::PacketData` (voice may have taken it). Empty otherwise.
     pub pdch_by_issi: HashMap<u32, PdchGrant>,
+    /// Timeslots ("timeslot assigned") of the packet-data channels of more than one slot, on the
+    /// carrier of their `PdchGrant` (whose slot is one of them). A channel of one slot has no
+    /// entry here. Written only together with `pdch_by_issi`, and never changed while its grant
+    /// lives; read through `pdch_channel`.
+    pub pdch_timeslots_by_issi: HashMap<u32, [bool; 4]>,
 }
 
-/// One packet-data channel: its slot on the main carrier, and whether the radio was sent there
-/// (the SN-DATA TRANSMIT RESPONSE carrying the assignment went out).
+impl StackState {
+    /// The packet-data channel of `issi`: its grant and its timeslots, while every one of them is
+    /// still the SNDCP bearer's. Once voice took one of them the whole channel is gone for the MAC
+    /// and the LLC. A bitmap without the grant's slot can only be stale and is ignored.
+    pub fn pdch_channel(&self, issi: u32) -> Option<(PdchGrant, [bool; 4])> {
+        let grant = *self.pdch_by_issi.get(&issi)?;
+        let own = usize::from(grant.slot.ts).checked_sub(1).filter(|i| *i < 4)?;
+        let timeslots = match self.pdch_timeslots_by_issi.get(&issi) {
+            Some(bits) if bits[own] => *bits,
+            _ => {
+                let mut bits = [false; 4];
+                bits[own] = true;
+                bits
+            }
+        };
+        let all_ours = (1..=4u8).filter(|ts| timeslots[usize::from(*ts) - 1]).all(|ts| {
+            self.timeslot_alloc.slot_owner(CarrierSlot {
+                carrier_num: grant.slot.carrier_num,
+                ts,
+            }) == Some(TimeslotOwner::PacketData)
+        });
+        all_ours.then_some((grant, timeslots))
+    }
+}
+
+/// One packet-data channel: its slot on the main carrier (the first of its slots when it has
+/// more, see `StackState::pdch_timeslots_by_issi`), and whether the radio was sent there (the
+/// SN-DATA TRANSMIT RESPONSE carrying the assignment went out).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PdchGrant {
     pub slot: CarrierSlot,
@@ -709,6 +740,40 @@ mod tests {
         assert!(reg.dgna_groups_of(1001).iter().any(|group| group.gssi == 91));
     }
 
+    /// A packet-data channel is a radio's only while every one of its slots is the SNDCP's; a
+    /// bitmap that does not hold the grant's slot is stale and ignored.
+    #[test]
+    fn pdch_channel_needs_every_slot() {
+        let mut state = StackState::default();
+        state.timeslot_alloc.configure_carriers(&[1584]);
+        assert_eq!(state.pdch_channel(1001), None, "no grant");
+        let slots = state.timeslot_alloc.reserve_packet_data_slots(&[4, 3], 2);
+        let grant = PdchGrant {
+            slot: slots[0],
+            on_air: true,
+        };
+        state.pdch_by_issi.insert(1001, grant);
+        assert_eq!(state.pdch_channel(1001), Some((grant, [false, false, false, true])));
+        state.pdch_timeslots_by_issi.insert(1001, [false, false, true, true]);
+        assert_eq!(state.pdch_channel(1001), Some((grant, [false, false, true, true])));
+        state.pdch_timeslots_by_issi.insert(1001, [false, true, true, false]);
+        assert_eq!(
+            state.pdch_channel(1001),
+            Some((grant, [false, false, false, true])),
+            "a stale bitmap without ts4"
+        );
+        state.pdch_timeslots_by_issi.insert(1001, [false, false, true, true]);
+        state.timeslot_alloc.reserve(TimeslotOwner::Cmce, 2).unwrap();
+        assert_eq!(
+            state.timeslot_alloc.allocate_any_slot(TimeslotOwner::Cmce),
+            Some(slots[1]),
+            "voice takes ts3"
+        );
+        assert_eq!(state.pdch_channel(1001), None, "the whole channel goes");
+        state.pdch_by_issi.clear();
+        assert_eq!(state.pdch_channel(1001), None);
+    }
+
     #[test]
     fn test_device_groups_merge_static_and_dynamic() {
         let mut reg = SubscriberRegistry::new();
@@ -770,6 +835,7 @@ impl Default for StackState {
             active_call_ts: std::collections::HashMap::new(),
             ee_monitoring_windows: std::collections::HashMap::new(),
             pdch_by_issi: HashMap::new(),
+            pdch_timeslots_by_issi: HashMap::new(),
         }
     }
 }
