@@ -72,6 +72,11 @@ impl TxReporter {
         ret
     }
 
+    /// Whether `other` reports on the same PDU (a clone of this reporter).
+    pub fn same(&self, other: &TxReporter) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
     /// Returns the current state.
     pub fn get_state(&self) -> TxState {
         TxState::from_raw(self.state.load(Ordering::Relaxed))

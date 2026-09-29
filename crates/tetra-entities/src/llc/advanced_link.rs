@@ -30,7 +30,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, Sap, TetraAddress, TxReporter, TxState, frames};
+use tetra_core::{BitBuffer, Sap, TetraAddress, Todo, TxReporter, TxState, frames};
 use tetra_pdus::llc::consts::consts::{N262_AL_MAX_CONNECTION_SETUP_RETRIES, N263_AL_MAX_DISCONNECTION_RETRIES};
 use tetra_pdus::llc::consts::timers::{T252_ACK_WAITING_TIMER, T271_RECEIVER_NOT_READY_FOR_TX_TIMER};
 use tetra_pdus::llc::enums::llc_pdu_type::LlcPduType;
@@ -40,7 +40,7 @@ use tetra_pdus::llc::pdus::al_disc::{AlDisc, AlDiscReport};
 use tetra_pdus::llc::pdus::al_reconnect::{AlReconnect, AlReconnectReport};
 use tetra_pdus::llc::pdus::al_setup::AlSetup;
 use tetra_saps::tla::{TlDataIndAl, TlDataReqAl};
-use tetra_saps::tma::{TmaUnitdataInd, TmaUnitdataReq};
+use tetra_saps::tma::{DATA_CATEGORY_AL_REPLY, TmaUnitdataInd, TmaUnitdataReq};
 use tetra_saps::{SapMsg, SapMsgInner};
 
 use crate::MessageQueue;
@@ -385,6 +385,19 @@ impl AdvancedLinkEngine {
     }
 
     fn push_pdu(&mut self, queue: &mut MessageQueue, addr: TetraAddress, pdu: BitBuffer, reporter: Option<TxReporter>, main: u16) {
+        self.push_pdu_as(queue, addr, pdu, reporter, main, None);
+    }
+
+    /// `push_pdu` with the TMA data category `data_category`.
+    fn push_pdu_as(
+        &mut self,
+        queue: &mut MessageQueue,
+        addr: TetraAddress,
+        pdu: BitBuffer,
+        reporter: Option<TxReporter>,
+        main: u16,
+        data_category: Option<Todo>,
+    ) {
         let (carrier, link_id) = self.route(addr.ssi, main);
         queue.push_back(SapMsg {
             sap: Sap::TmaSap,
@@ -402,7 +415,7 @@ impl AdvancedLinkEngine {
                 subscriber_class: 0,
                 air_interface_encryption: None,
                 stealing_repeats_flag: None,
-                data_category: None,
+                data_category,
                 chan_alloc: None,
                 tx_reporter: reporter,
             }),
@@ -1277,7 +1290,9 @@ impl AdvancedLinkEngine {
         pdu.copy_bits(&mut bits, len);
         pdu.seek(0);
         tracing::debug!("LLC: -> ISSI {} {} ({} bits)", ssi, header, len);
-        self.push_pdu(queue, addr, pdu, Some(reporter.clone()), main);
+        // On a channel of several slots the MAC grants the radio a slot for its answer with it.
+        let category = (ar && width > 1).then_some(DATA_CATEGORY_AL_REPLY);
+        self.push_pdu_as(queue, addr, pdu, Some(reporter.clone()), main, category);
         Some(reporter)
     }
 }
@@ -2128,6 +2143,36 @@ mod tests {
         engine.tick_end(&mut queue, MAIN);
         let restart = pushed(&mut queue);
         assert_eq!(restart.iter().map(|p| p.1.ss).collect::<Vec<_>>(), vec![0, 1], "each once");
+    }
+
+    /// On a channel of several slots a segment that asks for an acknowledgement is tagged for a
+    /// reply slot; no other segment is, and nothing of a link on the MCCH or a one-slot channel.
+    #[test]
+    fn ar_segments_of_a_multislot_link_ask_for_a_reply_slot() {
+        for (width, tagged) in [(2usize, true), (1, false), (0, false)] {
+            let mut engine = AdvancedLinkEngine::new();
+            let mut queue = MessageQueue::new();
+            setup_link(&mut engine, &mut queue, 3, 3);
+            if width > 0 {
+                engine.set_pdch_routes(HashMap::from([(ISSI, (MAIN, 4, width))]));
+            }
+            let _service = request(&mut engine, 100);
+            let mut seen = Vec::new();
+            for _ in 0..8 {
+                engine.tick_end(&mut queue, MAIN);
+                while let Some(msg) = queue.pop_front() {
+                    let SapMsgInner::TmaUnitdataReq(req) = msg.msg else { continue };
+                    let header = AlData::from_bitbuf(&mut req.pdu.clone()).unwrap();
+                    seen.push((header.acknowledgement_requested, req.data_category));
+                    req.tx_reporter.unwrap().mark_transmitted();
+                }
+            }
+            assert_eq!(seen.len(), 5);
+            for (ar, category) in seen {
+                let expected = (ar && tagged).then_some(DATA_CATEGORY_AL_REPLY);
+                assert_eq!(category, expected, "width {width}");
+            }
+        }
     }
 
     /// A one-slot channel is one segment at a time, as the MCCH.

@@ -3693,3 +3693,115 @@ fn al_setup_answers_the_multislot_cap() {
     assert_eq!(answer(mcch, 4), (AlSetup::SETUP_REPORT_SERVICE_CHANGE, Some(1)));
     assert_eq!(answer(pdch_config(false), 4), (AlSetup::SETUP_REPORT_SERVICE_CHANGE, Some(1)));
 }
+
+/// The AL-DATA / AL-FINAL for `ssi` in a downlink slot: the AL header and the slot grant of its
+/// MAC-RESOURCE (slots, delay).
+fn al_data_in(slot: &tetra_saps::tmv::TmvUnitdataReqSlot, ssi: u32) -> Vec<(AlData, Option<(usize, usize)>)> {
+    use tetra_pdus::umac::enums::basic_slotgrant_granting_delay::BasicSlotgrantGrantingDelay;
+    use tetra_pdus::umac::pdus::mac_resource::MacResource;
+    let Some(blk) = slot
+        .blk1
+        .as_ref()
+        .filter(|b| b.logical_channel == tetra_saps::tmv::enums::logical_chans::LogicalChannel::SchF)
+    else {
+        return Vec::new();
+    };
+    let mut block = blk.mac_block.clone();
+    block.seek(0);
+    let bits = block.to_bitstr();
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos + 16 <= bits.len() {
+        let mut b = BitBuffer::from_bitstr(&bits[pos..]);
+        b.seek(0);
+        if b.peek_bits(2) != Some(0) {
+            break;
+        }
+        let Ok(res) = MacResource::from_bitbuf(&mut b) else { break };
+        let Some(addr) = res.addr else { break };
+        if addr.ssi == ssi && b.peek_bits(4) == Some(9) {
+            let grant = res.slot_granting_element.as_ref().map(|g| {
+                let delay = match g.granting_delay {
+                    BasicSlotgrantGrantingDelay::CapAllocAtNextOpportunity => 0,
+                    BasicSlotgrantGrantingDelay::DelayNOpportunities(n) => usize::from(n),
+                    other => panic!("unexpected granting delay {other:?}"),
+                };
+                (g.capacity_allocation.to_req_slotcount(), delay)
+            });
+            out.push((AlData::from_bitbuf(&mut b).unwrap(), grant));
+        }
+        if res.length_ind == 0b111111 || res.length_ind == 0 {
+            break;
+        }
+        pos += usize::from(res.length_ind) * 8;
+    }
+    out
+}
+
+/// AL segments of a transfer of `octets` to the radio on its PDCH `slots`, through the real MAC:
+/// (tick, slot, AL header, grant) in air order, and the tick its TL-SDU was all out.
+fn al_transfer_on(cfg: StackConfig, slots: &[u8], octets: usize) -> (Vec<(usize, TdmaTime, AlData, Option<(usize, usize)>)>, usize) {
+    let mut mac = MacAir::with(cfg);
+    grant_pdch_slots(&mac.test.config, ISSI, slots, true);
+    let reporter = mac.transfer(octets);
+    let mut segments = Vec::new();
+    let mut done = None;
+    for tick in 0..4 * 40 {
+        mac.test.run_stack(Some(1));
+        for msg in mac.test.dump_sinks() {
+            let slots = match msg.msg {
+                SapMsgInner::TmvUnitdataReq(slot) => vec![slot],
+                SapMsgInner::TmvUnitdataReqSlots(slots) => slots.slots,
+                _ => continue,
+            };
+            for slot in slots.iter().filter(|s| s.carrier_num == MAIN_CARRIER) {
+                for (header, grant) in al_data_in(slot, ISSI) {
+                    segments.push((tick, slot.ts, header, grant));
+                }
+            }
+        }
+        if done.is_none() && reporter.get_state() == TxState::Transmitted {
+            done = Some(tick);
+        }
+    }
+    (segments, done.expect("the TL-SDU went out"))
+}
+
+/// The advanced link of a radio on a channel of two slots: its segments go on both slots, in
+/// S(S) order, whole, and the TL-SDU is out in well under the time one slot takes.
+#[test]
+fn al_segments_spread_over_the_multislot_pdch() {
+    debug::setup_logging_verbose();
+    let (one, one_done) = al_transfer_on(pdch_config(false), &[4], 300);
+    let (two, two_done) = al_transfer_on(multislot_config(false, 2), &[4, 3], 300);
+    assert!(one.len() >= 13, "{one:?}");
+    let first: Vec<u8> = two.iter().take(13).map(|s| s.2.ss).collect();
+    assert_eq!(first, (0..13).collect::<Vec<u8>>(), "in S(S) order");
+    assert!(two.iter().all(|s| (3..=4).contains(&s.1.t)), "on the channel");
+    assert!(two.iter().any(|s| s.1.t == 3) && two.iter().any(|s| s.1.t == 4), "on both slots");
+    assert!(
+        two_done * 3 <= one_done * 2,
+        "two slots {two_done} ticks, one slot {one_done} ticks"
+    );
+}
+
+/// On a channel of several slots the segment that asks for an acknowledgement leaves with a
+/// grant of one full slot for the answer (EN 300 392-2 23.5.2.2.1 b), a few opportunities on;
+/// the other segments with none.
+#[test]
+fn the_al_ack_comes_in_the_reply_slot() {
+    debug::setup_logging_verbose();
+    let (segments, _) = al_transfer_on(multislot_config(false, 2), &[4, 3], 100);
+    let first: Vec<(u8, bool, Option<(usize, usize)>)> = segments
+        .iter()
+        .take(5)
+        .map(|s| (s.2.ss, s.2.acknowledgement_requested, s.3))
+        .collect();
+    assert_eq!(first.len(), 5, "{segments:?}");
+    for (ss, ar, grant) in first {
+        match grant {
+            Some((slots, delay)) => assert!(ar && slots == 1 && delay >= 2, "segment {ss}: {grant:?}"),
+            None => assert!(!ar, "segment {ss} asks for an answer without a slot for it"),
+        }
+    }
+}

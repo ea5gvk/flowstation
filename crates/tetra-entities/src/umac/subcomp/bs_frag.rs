@@ -18,7 +18,7 @@ pub struct BsFragger {
 }
 
 /// We won't start fragmentation if less than MIN_SLOT_CAP_FOR_FRAG_START bits are free in the slot
-const MIN_SLOT_CAP_FOR_RES_FRAG_START: usize = 32;
+pub(crate) const MIN_SLOT_CAP_FOR_RES_FRAG_START: usize = 32;
 
 /// We won't insert a fragment if less than MIN_SLOT_CAP_FOR_FRAG bits are free in the slot
 pub(crate) const MIN_SLOT_CAP_FOR_FRAG: usize = 16;

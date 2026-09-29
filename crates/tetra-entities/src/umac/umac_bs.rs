@@ -27,7 +27,7 @@ use tetra_saps::control::call_control::{CallControl, Circuit, CircuitDlMediaSour
 use tetra_saps::lcmc::enums::alloc_type::ChanAllocType;
 use tetra_saps::lcmc::enums::ul_dl_assignment::UlDlAssignment;
 use tetra_saps::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
-use tetra_saps::tma::{DATA_CATEGORY_PACKET_DATA, TmaReport, TmaReportInd, TmaUnitdataInd};
+use tetra_saps::tma::{DATA_CATEGORY_AL_REPLY, DATA_CATEGORY_PACKET_DATA, TmaReport, TmaReportInd, TmaUnitdataInd};
 use tetra_saps::tmv::enums::logical_chans::LogicalChannel;
 use tetra_saps::tmv::{TmvConfigureReq, TmvUnitdataReqSlots};
 use tetra_saps::{SapMsg, SapMsgInner};
@@ -1935,6 +1935,13 @@ impl UmacBs {
             self.channel_scheduler
                 .dl_enqueue_packet_data_for_link(link_id, pdu, sdu, prim.tx_reporter);
         } else {
+            // An advanced link segment asking for an acknowledgement, to the radio of a
+            // packet-data channel of several slots: it gets a slot for the answer with it.
+            if prim.data_category == Some(DATA_CATEGORY_AL_REPLY)
+                && let Some(reporter) = &prim.tx_reporter
+            {
+                self.channel_scheduler.pdch_want_reply(prim.main_address.ssi, reporter.clone());
+            }
             self.channel_scheduler.dl_enqueue_tma_for_link(link_id, pdu, sdu, prim.tx_reporter);
         }
     }

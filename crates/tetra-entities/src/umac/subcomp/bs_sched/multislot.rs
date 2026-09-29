@@ -33,9 +33,17 @@
 //! break it), and at a message boundary the debt goes first. Once the radio says it has nothing
 //! more to send, the slots it still holds are freed (23.5.2.3.1).
 //!
+//! An advanced link segment that asks for an acknowledgement is granted, with it, a full slot
+//! for the answer (23.5.1.3.3, 23.5.2.2.1 b): an AL-ACK sent by random access would be known only
+//! once the downlink slots around it went out, a reserved one is covered by G1.
+//!
 //! With one slot per radio none of this applies.
 
 use super::*;
+
+/// Opportunities before a reply slot at the earliest: the MS decodes the segment and builds its
+/// AL-ACK meanwhile (on {3,4}, a segment in (f,4) is answered in (f+1,4) at the earliest).
+const PDCH_REPLY_MIN_OPPORTUNITIES: usize = 2;
 
 /// Uplink capacity owed to the radio of a packet-data channel of several slots.
 #[derive(Debug, Clone, Copy)]
@@ -294,6 +302,28 @@ impl BsChannelScheduler {
         }
     }
 
+    /// An advanced link segment asking for an acknowledgement is queued to `ssi`, the radio of a
+    /// channel of several slots (the LLC tags it `DATA_CATEGORY_AL_REPLY`): its reporter.
+    pub fn pdch_want_reply(&mut self, ssi: u32, reporter: TxReporter) {
+        if self.pdch.iter().filter(|o| **o == Some(ssi)).count() > 1 {
+            self.pdch_reply_wanted.push((ssi, reporter));
+        }
+    }
+
+    /// Whether the first PDU in the queue `q` for `ssi` is a segment that asks for an answer.
+    fn pdch_first_pdu_wants_a_reply(&self, q: usize, ssi: u32) -> bool {
+        self.dltx_queues[q]
+            .iter()
+            .find_map(|e| match e {
+                DlSchedElem::Resource(pdu, _, reporter) if pdu.addr.is_some_and(|a| a.ssi == ssi && a.ssi_type != SsiType::Gssi) => {
+                    Some(reporter.as_ref())
+                }
+                _ => None,
+            })
+            .flatten()
+            .is_some_and(|r| self.pdch_reply_wanted.iter().any(|(s, w)| *s == ssi && w.same(r)))
+    }
+
     /// Whether a resource with a slot grant and a usage marker added goes whole in one SCH/F.
     fn fits_with_a_grant(pdu: &MacResource, sdu: &BitBuffer) -> bool {
         let mut with = pdu.clone();
@@ -317,6 +347,17 @@ impl BsChannelScheduler {
             return;
         };
         let q = self.queue_index(d.t);
+        // A segment asking for an acknowledgement first in line: a slot for the answer, unless
+        // the radio is owed some already (it answers in any granted slot, 23.5.2.3.1).
+        self.pdch_reply_wanted.retain(|(_, r)| r.get_state() == tetra_core::TxState::Pending);
+        if self.pdch_channel_debt[q].is_none() && self.pdch_first_pdu_wants_a_reply(q, ssi) {
+            self.pdch_channel_debt[q] = Some(ChannelDebt {
+                addr: TetraAddress::issi(ssi),
+                slots: 1,
+                not_before: d.add_timeslots(-1),
+                min_pos: PDCH_REPLY_MIN_OPPORTUNITIES,
+            });
+        }
         let Some(debt) = self.pdch_channel_debt[q] else {
             return;
         };
@@ -978,11 +1019,49 @@ mod tests {
         sched.dl_enqueue_tma_for_link(4, pdu, sdu, Some(reporter.clone()));
         sched.ul_reserve_grant(RADIO, vec![at(5, 3)], false, None);
         assert!(sched.ul_defer_to_channel(at(3, 3), radio(), &ReservationRequirement::Req4Slots));
+        sched.pdch_want_reply(RADIO, reporter.clone());
         sched.set_pdch(3, None);
         sched.set_pdch(4, None);
         assert_eq!(reporter.get_state(), tetra_core::TxState::Discarded);
         assert!(sched.dltx_queues.iter().all(|q| q.is_empty()));
         assert!(sched.pdch_channel_debt.iter().all(Option::is_none));
+        assert!(sched.pdch_reply_wanted.is_empty());
+    }
+
+    /// A segment that asks for an acknowledgement leaves with a grant of one full slot for the
+    /// answer, far enough for the MS to build it; the radio is then deaf around that slot. The
+    /// segments before it and after it get none.
+    #[test]
+    fn test_a_reply_slot_rides_on_an_ar_segment() {
+        let mut sched = channel_sched(&[3, 4]);
+        let reporters: Vec<TxReporter> = (0..5).map(|_| TxReporter::new_unacked()).collect();
+        for (i, r) in reporters.iter().enumerate() {
+            let (pdu, sdu) = resource(200);
+            sched.dl_enqueue_tma_for_link(4, pdu, sdu, Some(r.clone()));
+            if i == 1 {
+                sched.pdch_want_reply(RADIO, r.clone());
+            }
+        }
+        let slots = finalize_slots(&mut sched, 16);
+        let carried: Vec<(TdmaTime, Option<(usize, usize)>)> = slots
+            .iter()
+            .filter(|s| dl_pdus(s).iter().any(|p| p.1 == Some(RADIO)))
+            .map(|s| (s.ts, grant_in(s)))
+            .collect();
+        // The second goes in (4,4) with its reply slot (5,4), two opportunities on; the radio does
+        // not hear (6,3), so the fifth goes in (6,4).
+        assert_eq!(
+            carried,
+            vec![
+                (at(4, 3), None),
+                (at(4, 4), Some((1, 2))),
+                (at(5, 3), None),
+                (at(5, 4), None),
+                (at(6, 4), None)
+            ]
+        );
+        assert!(reporters.iter().all(|r| r.is_transmitted()));
+        assert!(sched.pdch_reply_wanted.is_empty(), "the wish went with its segment");
     }
 
     /// A random access of the radio on its channel drops the downlink fragmentation under way on

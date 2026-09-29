@@ -28,7 +28,7 @@ use tetra_pdus::{
 use crate::{
     lmac::components::scrambler,
     umac::subcomp::{
-        bs_frag::{BsFragger, MIN_SLOT_CAP_FOR_FRAG},
+        bs_frag::{BsFragger, MIN_SLOT_CAP_FOR_FRAG, MIN_SLOT_CAP_FOR_RES_FRAG_START},
         circuit_mgr::CircuitMgr,
     },
 };
@@ -175,6 +175,11 @@ pub struct BsChannelScheduler {
 
     /// The grant `multislot` placed in the slot being built, checked once it is built.
     pdch_lazy: Option<multislot::LazyGrant>,
+
+    /// Queued advanced link segments to the radio of a packet-data channel of several slots that
+    /// ask for an acknowledgement, by the radio and the segment's report: each gets a slot for the
+    /// answer granted with it (see `multislot`).
+    pdch_reply_wanted: Vec<(u32, TxReporter)>,
 }
 
 #[derive(Debug)]
@@ -240,6 +245,7 @@ impl BsChannelScheduler {
             pdch_assigned_at: [None; 4],
             pdch_channel_debt: [None; 4],
             pdch_lazy: None,
+            pdch_reply_wanted: Vec::new(),
         }
     }
 
@@ -364,6 +370,7 @@ impl BsChannelScheduler {
         }
         if let Some(old) = old {
             self.pdch_note_uplink_left_behind(old);
+            self.pdch_reply_wanted.retain(|(ssi, _)| *ssi != old);
         }
         self.pdch[idx] = owner;
         self.pdch_ul_debt[idx] = None;
@@ -1610,6 +1617,15 @@ impl BsChannelScheduler {
         len.is_some_and(|len| len.div_ceil(8) * 8 <= room)
     }
 
+    /// Whether a resource that does not go whole in `room` bits can open its fragmentation there
+    /// (see `BsFragger`); true for anything else.
+    fn may_open_fragmentation(elem: &DlSchedElem, room: usize) -> bool {
+        match elem {
+            DlSchedElem::Resource(pdu, ..) => room >= MIN_SLOT_CAP_FOR_RES_FRAG_START && room >= pdu.compute_header_len(),
+            _ => true,
+        }
+    }
+
     /// `dl_take_prioritized_sched_item` for a block with `room` bits still free. With
     /// `whole_only` nothing is taken that would start a fragmentation (a started one goes on).
     fn dl_take_next_sched_item(&mut self, ts: TdmaTime, room: usize, whole_only: bool) -> Option<DlSchedElem> {
@@ -1629,7 +1645,8 @@ impl BsChannelScheduler {
         // On a packet-data channel of several slots frame 18 already leaves three channel slots
         // without a fragment, and N.203 is only ">= 4" (EN 300 392-2 annex B.2): next to it, in
         // frames 17 and 1, a started fragment opens the block and signalling waits behind it.
-        let let_in = self.multislot_owner(ts.t).is_none() || !matches!(ts.f, 1 | 17);
+        let multislot = self.multislot_owner(ts.t).is_some();
+        let let_in = !multislot || !matches!(ts.f, 1 | 17);
         let Some(q) = self.dltx_queues.get_mut(slot) else {
             return None;
         };
@@ -1657,10 +1674,13 @@ impl BsChannelScheduler {
             return Some(q.remove(i));
         }
 
-        // Return Resources next
+        // Return Resources next. On a packet-data channel of several slots a resource that can
+        // neither go whole nor open its fragmentation in the room left stays as it is for the next
+        // slot of the channel (elsewhere it is queued again as a fragger, first in line).
         if let Some(i) = q.iter().position(|e| {
             (matches!(e, DlSchedElem::Resource(..)) || matches!(e, DlSchedElem::FragBuf(f) if f.is_packet_data() && !f.is_started()))
                 && (!whole_only || Self::goes_whole(e, room))
+                && (!multislot || Self::goes_whole(e, room) || Self::may_open_fragmentation(e, room))
         }) {
             return Some(q.remove(i));
         }

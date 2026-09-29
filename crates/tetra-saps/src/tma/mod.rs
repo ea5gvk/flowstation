@@ -50,6 +50,11 @@ pub struct TmaReportInd {
 /// implementer).
 pub const DATA_CATEGORY_PACKET_DATA: Todo = 1;
 
+/// `TmaUnitdataReq::data_category` of an advanced link segment that asks for an acknowledgement,
+/// on a packet-data channel of several slots: the MAC reserves the radio an uplink slot for its
+/// answer and grants it with the segment (EN 300 392-2 23.5.1.3.3, 23.5.2.2.1 b).
+pub const DATA_CATEGORY_AL_REPLY: Todo = 3;
+
 /// Clause 20.4.1.1.4
 /// TMA-UNITDATA request: this primitive shall be used to request the MAC to
 /// transmit a TM-SDU.
