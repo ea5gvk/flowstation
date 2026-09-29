@@ -142,7 +142,9 @@ impl UmacBs {
             let mut issis: Vec<u32> = state.pdch_by_issi.keys().copied().collect();
             issis.sort_unstable();
             for issi in issis {
-                let Some((grant, timeslots)) = state.pdch_channel(issi) else { continue };
+                let Some((grant, timeslots)) = state.pdch_channel(issi) else {
+                    continue;
+                };
                 if grant.slot.carrier_num != main {
                     continue;
                 }
@@ -159,7 +161,12 @@ impl UmacBs {
         }
         if conflict != self.pdch_conflict {
             if let Some((ts, first, second)) = conflict {
-                tracing::warn!("UMAC: PDCH ts {} claimed by ISSI {} and ISSI {}, kept for the first", ts, first, second);
+                tracing::warn!(
+                    "UMAC: PDCH ts {} claimed by ISSI {} and ISSI {}, kept for the first",
+                    ts,
+                    first,
+                    second
+                );
             }
             self.pdch_conflict = conflict;
         }

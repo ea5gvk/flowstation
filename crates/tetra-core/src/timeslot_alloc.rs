@@ -384,7 +384,10 @@ mod tests {
         let (mut a, mut b) = (TimeslotAllocator::default(), TimeslotAllocator::default());
         a.configure_carriers(&[1584]);
         b.configure_carriers(&[1584]);
-        assert_eq!(a.reserve_packet_data_slots(&[3, 4], 1), vec![b.reserve_packet_data_slot(&[3, 4]).unwrap()]);
+        assert_eq!(
+            a.reserve_packet_data_slots(&[3, 4], 1),
+            vec![b.reserve_packet_data_slot(&[3, 4]).unwrap()]
+        );
     }
 
     #[test]

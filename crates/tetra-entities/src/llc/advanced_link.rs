@@ -1167,7 +1167,9 @@ impl AdvancedLinkEngine {
         }
         let Some(ssi) = self.next_to_serve() else { return };
         self.last_served = Some(ssi);
-        let Some(reporter) = self.send_segment(queue, ssi, main) else { return };
+        let Some(reporter) = self.send_segment(queue, ssi, main) else {
+            return;
+        };
         self.inflight = Some(Inflight {
             ssi,
             reporter,
@@ -1189,7 +1191,10 @@ impl AdvancedLinkEngine {
         ssis.sort_unstable();
         for ssi in ssis {
             let width = self.width(ssi);
-            let in_mac = |l: &Link| l.tx.as_ref().map_or(0, |tx| tx.segments.iter().filter(|s| s.in_mac.is_some()).count());
+            let in_mac = |l: &Link| {
+                l.tx.as_ref()
+                    .map_or(0, |tx| tx.segments.iter().filter(|s| s.in_mac.is_some()).count())
+            };
             if let Some(link) = self.links.get_mut(&ssi) {
                 if in_mac(link) == 0 {
                     link.in_mac_since = None;
@@ -1984,7 +1989,10 @@ mod tests {
         let mut two = four;
         two.uplink_timeslots = Some(1);
         let answer = negotiate_setup_with(&two, 3);
-        assert_eq!((answer.setup_report, answer.uplink_timeslots), (AlSetup::SETUP_REPORT_SUCCESS, Some(1)));
+        assert_eq!(
+            (answer.setup_report, answer.uplink_timeslots),
+            (AlSetup::SETUP_REPORT_SUCCESS, Some(1))
+        );
     }
 
     #[test]
@@ -2063,7 +2071,10 @@ mod tests {
             let service = request(&mut engine, octets);
             engine.tick_end(&mut queue, MAIN);
             let first = pushed(&mut queue);
-            assert_eq!(first.iter().map(|p| (p.1.ss, p.3)).collect::<Vec<_>>(), vec![(0, 4), (1, 4), (2, 4)]);
+            assert_eq!(
+                first.iter().map(|p| (p.1.ss, p.3)).collect::<Vec<_>>(),
+                vec![(0, 4), (1, 4), (2, 4)]
+            );
             engine.tick_end(&mut queue, MAIN);
             assert!(pushed(&mut queue).is_empty(), "three in the MAC");
             first[0].2.mark_transmitted();
@@ -2104,7 +2115,11 @@ mod tests {
         engine.tick_end(&mut queue, MAIN);
         let p = pushed(&mut queue);
         assert_eq!(p.iter().filter(|x| x.0 == ISSI).count(), 3);
-        assert_eq!(p.iter().filter(|x| x.0 == ISSI2).map(|x| x.3).collect::<Vec<_>>(), vec![0], "one on the MCCH");
+        assert_eq!(
+            p.iter().filter(|x| x.0 == ISSI2).map(|x| x.3).collect::<Vec<_>>(),
+            vec![0],
+            "one on the MCCH"
+        );
         let gate = |e: &AdvancedLinkEngine| (e.inflight.as_ref().map(|i| i.ssi), e.last_served);
         assert_eq!(gate(&engine), (Some(ISSI2), Some(ISSI2)));
         let _c = request_to(&mut engine, ISSI3, 10);

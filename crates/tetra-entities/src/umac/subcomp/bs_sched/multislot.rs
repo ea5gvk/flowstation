@@ -349,7 +349,8 @@ impl BsChannelScheduler {
         let q = self.queue_index(d.t);
         // A segment asking for an acknowledgement first in line: a slot for the answer, unless
         // the radio is owed some already (it answers in any granted slot, 23.5.2.3.1).
-        self.pdch_reply_wanted.retain(|(_, r)| r.get_state() == tetra_core::TxState::Pending);
+        self.pdch_reply_wanted
+            .retain(|(_, r)| r.get_state() == tetra_core::TxState::Pending);
         if self.pdch_channel_debt[q].is_none() && self.pdch_first_pdu_wants_a_reply(q, ssi) {
             self.pdch_channel_debt[q] = Some(ChannelDebt {
                 addr: TetraAddress::issi(ssi),
@@ -743,7 +744,14 @@ mod tests {
         );
         assert_eq!(
             ms_granted_labels(time(3, 17, 3), 0, 6, CH34),
-            vec![time(3, 17, 3), time(3, 17, 4), time(3, 18, 3), time(4, 1, 3), time(4, 1, 4), time(4, 2, 3)]
+            vec![
+                time(3, 17, 3),
+                time(3, 17, 4),
+                time(3, 18, 3),
+                time(4, 1, 3),
+                time(4, 1, 4),
+                time(4, 2, 3)
+            ]
         );
         // EXAMPLE 4: timeslots 1 and 2, grant in slot 2 of frame 4, delay 5: slot 1 of frame 7.
         assert_eq!(
@@ -916,7 +924,10 @@ mod tests {
         let granted = slots.iter().position(|s| grant_in(s).is_some()).expect("the grant");
         assert!(granted > end, "the grant after the group's MAC-END ({end}, {granted})");
         let (n, delay) = grant_in(&slots[granted]).unwrap();
-        assert_eq!(held_by_radio(&sched, slots[granted].ts), ms_granted_labels(slots[granted].ts, delay, n, CH34));
+        assert_eq!(
+            held_by_radio(&sched, slots[granted].ts),
+            ms_granted_labels(slots[granted].ts, delay, n, CH34)
+        );
     }
 
     /// At a message boundary the debt goes first: between two datagrams that each need several

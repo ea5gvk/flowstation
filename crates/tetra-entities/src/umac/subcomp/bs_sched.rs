@@ -3092,7 +3092,10 @@ mod tests {
         while sdu.len() < bits {
             sdu.push(if sdu.len() % 2 == 0 { '1' } else { '0' });
         }
-        (BsChannelScheduler::dl_make_minimal_resource(addr, None, false), BitBuffer::from_bitstr(&sdu))
+        (
+            BsChannelScheduler::dl_make_minimal_resource(addr, None, false),
+            BitBuffer::from_bitstr(&sdu),
+        )
     }
 
     /// Every slot of a packet-data channel of several slots takes its downlink from one queue,
@@ -3129,11 +3132,7 @@ mod tests {
             .flat_map(dl_pdus)
             .map(|(kind, _, li)| (kind, if kind == 0 { li } else { 0 }))
             .collect();
-        assert_eq!(
-            kinds.iter().map(|k| k.0).collect::<Vec<_>>(),
-            vec![0, 2, 3, 0, 2, 3],
-            "{kinds:?}"
-        );
+        assert_eq!(kinds.iter().map(|k| k.0).collect::<Vec<_>>(), vec![0, 2, 3, 0, 2, 3], "{kinds:?}");
         assert!(kinds.iter().filter(|k| k.0 == 0).all(|k| k.1 == 0b111111));
     }
 
@@ -3196,7 +3195,13 @@ mod tests {
         slots.extend(finalize_slots(&mut sched, 4 * 5));
         for s in slots.iter().filter(|s| s.ts.t >= 2 && matches!(s.ts.f, 17 | 1)) {
             let first = dl_pdus(s).first().map(|p| p.0);
-            assert!(matches!(first, Some(2 | 3)), "a fragment opens ({},{}): {:?}", s.ts.f, s.ts.t, dl_pdus(s));
+            assert!(
+                matches!(first, Some(2 | 3)),
+                "a fragment opens ({},{}): {:?}",
+                s.ts.f,
+                s.ts.t,
+                dl_pdus(s)
+            );
         }
         assert!(reporter.is_transmitted(), "the datagram completed");
         let signalling = slots

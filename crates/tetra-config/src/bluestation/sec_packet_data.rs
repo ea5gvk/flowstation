@@ -256,7 +256,9 @@ pdch_idle_release_secs = 300"))
         assert_eq!(apply_packet_data_patch(dto("")).unwrap().pdch_max_slots, 1);
         for n in 1..=4u8 {
             assert_eq!(
-                apply_packet_data_patch(dto(&format!("pdch_max_slots = {n}"))).unwrap().pdch_max_slots,
+                apply_packet_data_patch(dto(&format!("pdch_max_slots = {n}")))
+                    .unwrap()
+                    .pdch_max_slots,
                 n
             );
         }
@@ -281,7 +283,11 @@ pdch_idle_release_secs = 300"))
         assert_eq!(cfg(PacketDataBearer::Pdch, &[4, 3, 2], 4).pdch_slots_per_radio(), 3);
         assert_eq!(cfg(PacketDataBearer::Pdch, &[4, 3, 2], 2).pdch_slots_per_radio(), 2);
         assert_eq!(cfg(PacketDataBearer::Pdch, &[3], 3).pdch_slots_per_radio(), 1);
-        assert_eq!(cfg(PacketDataBearer::Pdch, &[4, 4, 3], 3).pdch_slots_per_radio(), 2, "distinct slots");
+        assert_eq!(
+            cfg(PacketDataBearer::Pdch, &[4, 4, 3], 3).pdch_slots_per_radio(),
+            2,
+            "distinct slots"
+        );
         assert_eq!(CfgPacketData::default().pdch_slots_per_radio(), 1);
     }
 }

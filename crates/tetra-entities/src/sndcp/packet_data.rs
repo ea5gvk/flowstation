@@ -361,10 +361,7 @@ impl PacketDataRuntime {
             );
         }
         if pd.bearer == PacketDataBearer::Mcch && pd.pdch_max_slots > 1 {
-            tracing::warn!(
-                "SNDCP: pdch_max_slots = {} has no effect with bearer = \"mcch\"",
-                pd.pdch_max_slots
-            );
+            tracing::warn!("SNDCP: pdch_max_slots = {} has no effect with bearer = \"mcch\"", pd.pdch_max_slots);
         }
         let pdch_cfg = (pd.bearer == PacketDataBearer::Pdch).then(|| PdchConfig {
             main_carrier: cfg.cell.main_carrier,
@@ -967,12 +964,7 @@ impl PacketDataRuntime {
             taken
         };
         for slot in taken {
-            let issis: Vec<u32> = self
-                .pdch
-                .iter()
-                .filter(|(_, p)| p.slots.contains(&slot))
-                .map(|(i, _)| *i)
-                .collect();
+            let issis: Vec<u32> = self.pdch.iter().filter(|(_, p)| p.slots.contains(&slot)).map(|(i, _)| *i).collect();
             for issi in issis {
                 let Some(p) = self.pdch.remove(&issi) else { continue };
                 if p.slots.len() == 1 {
