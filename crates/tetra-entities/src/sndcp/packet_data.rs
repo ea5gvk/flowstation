@@ -11,10 +11,13 @@
 //! its own radio's next datagram.
 //!
 //! With `bearer = "pdch"` the SN-DATA TRANSMIT RESPONSE assigns the radio a packet-data channel
-//! (PDCH): one timeslot of the main carrier (`pdch_timeslots`), held in the timeslot allocator as
-//! `PacketData` and published in `StackState::pdch_by_issi` for the MAC (AACH) and the LLC
-//! (routing). Voice takes the slot when nothing else is free; the radio then sees the AACH change
-//! and returns to the MCCH by itself, where its data goes on. The channel is given back with
+//! (PDCH): one timeslot of the main carrier (`pdch_timeslots`), or up to `pdch_max_slots` of them
+//! for a multislot radio, held in the timeslot allocator as `PacketData` and published in
+//! `StackState::pdch_by_issi` (and `pdch_timeslots_by_issi`) for the MAC (AACH) and the LLC
+//! (routing). Voice takes a slot when nothing else is free, and with it the whole channel; the
+//! radio then sees the AACH change and returns to the MCCH by itself, where its data goes on. A
+//! channel of several slots leaves one main-carrier traffic slot free for voice when no other
+//! carrier has one. The channel is given back with
 //! SN-END OF DATA (quit and go back to the MCCH, STANDBY) when READY ends or after
 //! `pdch_idle_release_secs` without data, and without signalling when the radio goes into a call,
 //! reconnects from the MCCH without data (it is in STANDBY already) or its contexts end. With no
@@ -145,7 +148,8 @@ struct Inflight {
 
 /// A radio's packet-data channel.
 struct Pdch {
-    slot: CarrierSlot,
+    /// Its timeslots, the one of its grant (where its PDUs are sent) first.
+    slots: Vec<CarrierSlot>,
     /// The SN-DATA TRANSMIT RESPONSE carrying the assignment, until it went out.
     assignment: Option<TxReporter>,
     /// The same once it went out, until the radio acknowledges it: lost, the radio never got it.
@@ -163,6 +167,8 @@ struct PdchConfig {
     main_carrier: u16,
     prefs: Vec<u8>,
     idle_slots: u64,
+    /// Timeslots a radio's channel may have (`CfgPacketData::pdch_slots_per_radio`).
+    max_slots: u8,
 }
 
 pub struct PacketDataRuntime {
@@ -239,16 +245,40 @@ pub(crate) fn in_call(state: &StackState, issi: u32) -> bool {
             .any(|g| state.active_call_ts.contains_key(g))
 }
 
-/// Channel allocation of a packet-data channel: `slot`, both directions, replacing the MCCH.
-fn pdch_assignment(slot: CarrierSlot) -> CmceChanAllocReq {
+/// "Timeslot assigned" of the slots of a packet-data channel (clause 21.5.2, a bitmap).
+fn timeslot_bits(slots: &[CarrierSlot]) -> [bool; 4] {
     let mut timeslots = [false; 4];
-    timeslots[usize::from(slot.ts.clamp(1, 4)) - 1] = true;
+    for slot in slots {
+        timeslots[usize::from(slot.ts.clamp(1, 4)) - 1] = true;
+    }
+    timeslots
+}
+
+/// Channel allocation of a packet-data channel: `slots` (of the first one's carrier), both
+/// directions, replacing the MCCH.
+fn pdch_assignment(slots: &[CarrierSlot]) -> CmceChanAllocReq {
     CmceChanAllocReq {
         usage: None,
-        carrier: Some(slot.carrier_num),
-        timeslots,
+        carrier: slots.first().map(|s| s.carrier_num),
+        timeslots: timeslot_bits(slots),
         alloc_type: ChanAllocType::Replace,
         ul_dl_assigned: UlDlAssignment::Both,
+    }
+}
+
+/// The timeslots of a packet-data channel for the log: "4", or "4+3".
+fn ts_list(slots: &[CarrierSlot]) -> String {
+    slots.iter().map(|s| s.ts.to_string()).collect::<Vec<_>>().join("+")
+}
+
+/// Timeslots per TDMA frame the radio can take (clause 28.4.5.34, table 28.115): its full phase
+/// modulation capability, which also bounds a channel wider than it asked for (28.3.4.8 NOTE 1);
+/// 1 without a resource request. The count it asks is no limit: after its first session the
+/// radio asks the N.264 of its advanced link (28.3.5.2a).
+fn slots_capable(request: &SndcpPacketDataResourceRequest) -> u8 {
+    match request {
+        SndcpPacketDataResourceRequest::None => 1,
+        SndcpPacketDataResourceRequest::PhaseModulation(r) => r.full_phase_modulation_capability_timeslots.max(1),
     }
 }
 
@@ -272,17 +302,23 @@ fn with_chan_alloc(mut msg: SapMsg, chan_alloc: CmceChanAllocReq, reporter: &TxR
     msg
 }
 
-fn resources(request: &SndcpPacketDataResourceRequest) -> String {
+/// The resource request for the log; with `full` its full capability too.
+fn resources(request: &SndcpPacketDataResourceRequest, full: bool) -> String {
     match request {
         SndcpPacketDataResourceRequest::None => "no resource request".to_string(),
         SndcpPacketDataResourceRequest::PhaseModulation(r) => format!(
-            "asks {} UL / {} DL slot(s){}",
+            "asks {} UL / {} DL slot(s){}{}",
             r.uplink_timeslots,
             r.downlink_timeslots,
             if r.unspecified_phase_modulation_resource {
                 ", unspecified"
             } else {
                 ""
+            },
+            if full {
+                format!(", full {}", r.full_phase_modulation_capability_timeslots)
+            } else {
+                String::new()
             }
         ),
     }
@@ -315,17 +351,39 @@ impl PacketDataRuntime {
                 fetch_ms
             );
         }
+        let max_slots = pd.pdch_slots_per_radio();
+        if pd.bearer == PacketDataBearer::Pdch && pd.pdch_max_slots > max_slots {
+            tracing::warn!(
+                "SNDCP: pdch_max_slots = {} but pdch_timeslots has {} distinct main-carrier slot(s): at most {} slot(s) per radio (a PDCH on a secondary carrier is not supported)",
+                pd.pdch_max_slots,
+                pd.pdch_timeslot_count(),
+                max_slots
+            );
+        }
+        if pd.bearer == PacketDataBearer::Mcch && pd.pdch_max_slots > 1 {
+            tracing::warn!(
+                "SNDCP: pdch_max_slots = {} has no effect with bearer = \"mcch\"",
+                pd.pdch_max_slots
+            );
+        }
         let pdch_cfg = (pd.bearer == PacketDataBearer::Pdch).then(|| PdchConfig {
             main_carrier: cfg.cell.main_carrier,
             prefs: pd.pdch_timeslots.clone(),
             idle_slots: slots(u64::from(pd.pdch_idle_release_secs) * 1000),
+            max_slots,
         });
         tracing::info!(
             "SNDCP: packet data on {} (pool {}..{}, gateway {}, MTU {}, READY {} ms announced / {} ms here)",
             match &pdch_cfg {
                 Some(p) => format!(
-                    "a PDCH of main-carrier ts {:?}, released after {} s idle, else the MCCH",
-                    p.prefs, pd.pdch_idle_release_secs
+                    "a PDCH of main-carrier ts {:?}{}, released after {} s idle, else the MCCH",
+                    p.prefs,
+                    if p.max_slots > 1 {
+                        format!(", up to {} slots per radio", p.max_slots)
+                    } else {
+                        String::new()
+                    },
+                    pd.pdch_idle_release_secs
                 ),
                 None => "the MCCH".to_string(),
             },
@@ -400,7 +458,7 @@ impl PacketDataRuntime {
             tracing::info!(
                 "SNDCP: ISSI {} is back on the MCCH, its PDCH ts {} is kept for now",
                 issi,
-                p.slot.ts
+                ts_list(&p.slots)
             );
             Self::publish_pdch(config, issi, Some(p));
         }
@@ -637,8 +695,9 @@ impl PacketDataRuntime {
     }
 
     /// SN-DATA TRANSMIT RESPONSE for `nsapi`: accepted when the context exists, which enters READY,
-    /// with the assignment of a packet-data channel (`bearer = "pdch"` and a slot free) or with no
-    /// channel assignment (the data stays on the MCCH).
+    /// with the assignment of a packet-data channel (`bearer = "pdch"` and a slot free; up to
+    /// `capable` slots, see `slots_capable`) or with no channel assignment (the data stays on the
+    /// MCCH).
     #[allow(clippy::too_many_arguments)]
     fn respond_transmit(
         &mut self,
@@ -647,6 +706,7 @@ impl PacketDataRuntime {
         nsapi: u8,
         what: &str,
         detail: &str,
+        capable: u8,
         wap: Option<&mut WapService>,
         config: &SharedConfig,
         now: Instant,
@@ -661,7 +721,7 @@ impl PacketDataRuntime {
         } else if self.pdch_cfg.is_some() && in_call(&config.state_read(), issi) {
             (None, "no channel (MCCH, the radio is in a call)".to_string())
         } else {
-            self.pdch_for_transfer(config, issi, ind.link_id)
+            self.pdch_for_transfer(config, issi, ind.link_id, capable)
         };
         let result = match self.ctxs.get_mut(&(issi, nsapi)) {
             Some(ctx) => {
@@ -701,13 +761,28 @@ impl PacketDataRuntime {
         self.sync_pause(issi, wap, now);
     }
 
-    /// The packet-data channel for a transfer of `issi` whose request came in on timeslot
-    /// `link_id`: the assignment to send with the RESPONSE (none when the radio is already on its
-    /// channel, or with the data on the MCCH), and how the log should name it.
-    fn pdch_for_transfer(&mut self, config: &SharedConfig, issi: u32, link_id: u32) -> (Option<(CmceChanAllocReq, TxReporter)>, String) {
+    /// The packet-data channel for a transfer of `issi`, which can take `capable` slots, whose
+    /// request came in on timeslot `link_id`: the assignment to send with the RESPONSE (none when
+    /// the radio is already on its channel, or with the data on the MCCH), and how the log should
+    /// name it.
+    ///
+    /// A new channel has as many slots as the radio can take, up to `pdch_max_slots`, the first
+    /// free ones of `pdch_timeslots` (in their order, contiguous or not: "timeslot assigned" is a
+    /// bitmap, clause 23.5.4.1), fewer when fewer are free (28.3.4.8). Voice first: when no other
+    /// carrier has a free slot, a channel of several slots leaves one main-carrier traffic slot
+    /// free, since voice takes a packet-data slot, and with it the whole channel, only when
+    /// nothing else is free.
+    fn pdch_for_transfer(
+        &mut self,
+        config: &SharedConfig,
+        issi: u32,
+        link_id: u32,
+        capable: u8,
+    ) -> (Option<(CmceChanAllocReq, TxReporter)>, String) {
         let Some(pcfg) = &self.pdch_cfg else {
             return (None, "no channel (MCCH)".to_string());
         };
+        let max_slots = pcfg.max_slots;
         let clock = self.clock;
         let (prefs, waiting): (Vec<u8>, Vec<u8>) = pcfg.prefs.iter().copied().partition(|ts| {
             self.slot_busy_at
@@ -720,23 +795,49 @@ impl PacketDataRuntime {
         if let Some(p) = self.pdch.get_mut(&issi) {
             p.last_activity = clock;
             p.quit = None;
-            if p.on_air && link_id == u32::from(p.slot.ts) {
-                return (None, format!("already on its PDCH ts {}", p.slot.ts));
+            // The request may come in on any slot of the channel.
+            if p.on_air && p.slots.iter().any(|s| u32::from(s.ts) == link_id) {
+                return (None, format!("already on its PDCH ts {}", ts_list(&p.slots)));
             }
             let reporter = TxReporter::new();
             p.assignment = Some(reporter.clone());
             p.assignment_ack = None;
-            return (Some((pdch_assignment(p.slot), reporter)), format!("PDCH ts {} (again)", p.slot.ts));
+            return (
+                Some((pdch_assignment(&p.slots), reporter)),
+                format!("PDCH ts {} (again)", ts_list(&p.slots)),
+            );
         }
-        let slot = {
+        let wanted = usize::from(capable.min(max_slots).max(1));
+        let (slots, headroom) = {
             let mut state = config.state_write();
-            let slot = state.timeslot_alloc.reserve_packet_data_slot(&prefs);
-            if let Some(slot) = slot {
-                state.pdch_by_issi.insert(issi, PdchGrant { slot, on_air: false });
+            let mut n = wanted;
+            let mut headroom = false;
+            if n > 1 {
+                let (main_free, others_free) = state.timeslot_alloc.free_traffic_slots();
+                let cap = main_free.saturating_sub(1).max(1);
+                if others_free == 0 && cap < n {
+                    n = cap;
+                    headroom = true;
+                }
             }
-            slot
+            let slots = state.timeslot_alloc.reserve_packet_data_slots(&prefs, n);
+            if let Some(first) = slots.first() {
+                state.pdch_by_issi.insert(
+                    issi,
+                    PdchGrant {
+                        slot: *first,
+                        on_air: false,
+                    },
+                );
+                if slots.len() > 1 {
+                    state.pdch_timeslots_by_issi.insert(issi, timeslot_bits(&slots));
+                } else {
+                    state.pdch_timeslots_by_issi.remove(&issi);
+                }
+            }
+            (slots, headroom)
         };
-        let Some(slot) = slot else {
+        if slots.is_empty() {
             tracing::info!(
                 "SNDCP: no main-carrier slot of {:?} free for a PDCH of ISSI {} ({:?} busy or freed less than a multiframe ago), data on the MCCH",
                 prefs,
@@ -744,13 +845,29 @@ impl PacketDataRuntime {
                 waiting
             );
             return (None, "no channel (MCCH, no PDCH slot free)".to_string());
-        };
-        tracing::info!("SNDCP: PDCH ts {} reserved for ISSI {}", slot.ts, issi);
+        }
+        tracing::info!(
+            "SNDCP: PDCH ts {} reserved for ISSI {}{}",
+            ts_list(&slots),
+            issi,
+            if max_slots > 1 {
+                format!(
+                    " ({} of {} possible{})",
+                    slots.len(),
+                    capable,
+                    if headroom { ", voice headroom" } else { "" }
+                )
+            } else {
+                String::new()
+            }
+        );
         let reporter = TxReporter::new();
+        let assignment = pdch_assignment(&slots);
+        let channel = format!("PDCH ts {}", ts_list(&slots));
         self.pdch.insert(
             issi,
             Pdch {
-                slot,
+                slots,
                 assignment: Some(reporter.clone()),
                 assignment_ack: None,
                 on_air: false,
@@ -758,50 +875,69 @@ impl PacketDataRuntime {
                 quit: None,
             },
         );
-        (Some((pdch_assignment(slot), reporter)), format!("PDCH ts {}", slot.ts))
+        (Some((assignment, reporter)), channel)
     }
 
-    /// Publish the packet-data channel of `issi` (None: removed) for the MAC and the LLC.
+    /// Publish the packet-data channel of `issi` (None: removed) for the MAC and the LLC: its
+    /// grant and, for a channel of several slots, its timeslots, together.
     fn publish_pdch(config: &SharedConfig, issi: u32, pdch: Option<&Pdch>) {
         let mut state = config.state_write();
-        match pdch {
+        match pdch.filter(|p| !p.slots.is_empty()) {
             Some(p) => {
                 state.pdch_by_issi.insert(
                     issi,
                     PdchGrant {
-                        slot: p.slot,
+                        slot: p.slots[0],
                         on_air: p.on_air,
                     },
                 );
+                if p.slots.len() > 1 {
+                    state.pdch_timeslots_by_issi.insert(issi, timeslot_bits(&p.slots));
+                } else {
+                    state.pdch_timeslots_by_issi.remove(&issi);
+                }
             }
             None => {
                 state.pdch_by_issi.remove(&issi);
+                state.pdch_timeslots_by_issi.remove(&issi);
             }
         }
     }
 
-    /// Give back the packet-data channel of `issi`, if it has one.
+    /// Give back the packet-data channel of `issi`, if it has one: every slot of it.
     fn release_pdch(&mut self, config: &SharedConfig, issi: u32, why: &str) {
         let Some(p) = self.pdch.remove(&issi) else { return };
-        let released = {
+        let errors: Vec<_> = {
             let mut state = config.state_write();
             state.pdch_by_issi.remove(&issi);
-            state.timeslot_alloc.release_slot(TimeslotOwner::PacketData, p.slot)
+            state.pdch_timeslots_by_issi.remove(&issi);
+            p.slots
+                .iter()
+                .filter_map(|s| state.timeslot_alloc.release_slot(TimeslotOwner::PacketData, *s).err())
+                .collect()
         };
-        match released {
-            Ok(()) => tracing::info!("SNDCP: PDCH ts {} of ISSI {} released ({})", p.slot.ts, issi, why),
-            Err(e) => tracing::debug!(
+        match errors.as_slice() {
+            [] => tracing::info!("SNDCP: PDCH ts {} of ISSI {} released ({})", ts_list(&p.slots), issi, why),
+            [e] => tracing::debug!(
                 "SNDCP: PDCH ts {} of ISSI {} gone ({}), slot not ours: {:?}",
-                p.slot.ts,
+                ts_list(&p.slots),
                 issi,
                 why,
                 e
             ),
+            errors => tracing::debug!(
+                "SNDCP: PDCH ts {} of ISSI {} gone ({}), slots not ours: {:?}",
+                ts_list(&p.slots),
+                issi,
+                why,
+                errors
+            ),
         }
     }
 
-    /// Packet-data channels voice took: the radio goes back to the MCCH on its own (AACH). Also
-    /// run before every reservation, so a slot taken earlier is never mistaken for a new one.
+    /// Packet-data channels voice took a slot of: the radio goes back to the MCCH on its own
+    /// (AACH), and the whole channel goes (its other slots back to the pool). Also run before
+    /// every reservation, so a slot taken earlier is never mistaken for a new one.
     fn drain_preempted(&mut self, config: &SharedConfig) {
         if self.pdch_cfg.is_none() {
             return;
@@ -810,18 +946,55 @@ impl PacketDataRuntime {
             let mut state = config.state_write();
             let taken = state.timeslot_alloc.drain_preempted_packet_data();
             for slot in &taken {
-                state.pdch_by_issi.retain(|_, g| g.slot != *slot);
+                let gone: Vec<u32> = state
+                    .pdch_by_issi
+                    .iter()
+                    .filter(|(issi, g)| {
+                        g.slot == *slot
+                            || (g.slot.carrier_num == slot.carrier_num
+                                && state
+                                    .pdch_timeslots_by_issi
+                                    .get(*issi)
+                                    .is_some_and(|bits| bits[usize::from(slot.ts.clamp(1, 4)) - 1]))
+                    })
+                    .map(|(issi, _)| *issi)
+                    .collect();
+                for issi in gone {
+                    state.pdch_by_issi.remove(&issi);
+                    state.pdch_timeslots_by_issi.remove(&issi);
+                }
             }
             taken
         };
         for slot in taken {
-            let issis: Vec<u32> = self.pdch.iter().filter(|(_, p)| p.slot == slot).map(|(i, _)| *i).collect();
+            let issis: Vec<u32> = self
+                .pdch
+                .iter()
+                .filter(|(_, p)| p.slots.contains(&slot))
+                .map(|(i, _)| *i)
+                .collect();
             for issi in issis {
-                self.pdch.remove(&issi);
+                let Some(p) = self.pdch.remove(&issi) else { continue };
+                if p.slots.len() == 1 {
+                    tracing::info!(
+                        "SNDCP: PDCH ts {} of ISSI {} taken by a call, its data goes on on the MCCH",
+                        slot.ts,
+                        issi
+                    );
+                    continue;
+                }
+                let mut state = config.state_write();
+                for s in p.slots.iter().filter(|s| **s != slot) {
+                    if let Err(e) = state.timeslot_alloc.release_slot(TimeslotOwner::PacketData, *s) {
+                        tracing::debug!("SNDCP: PDCH ts {} of ISSI {} not ours any more: {:?}", s.ts, issi, e);
+                    }
+                }
+                drop(state);
                 tracing::info!(
-                    "SNDCP: PDCH ts {} of ISSI {} taken by a call, its data goes on on the MCCH",
-                    slot.ts,
-                    issi
+                    "SNDCP: PDCH ts {} of ISSI {} taken by a call (ts {}), its data goes on on the MCCH",
+                    ts_list(&p.slots),
+                    issi,
+                    slot.ts
                 );
             }
         }
@@ -854,7 +1027,7 @@ impl PacketDataRuntime {
                 tracing::info!(
                     "SNDCP: ISSI {} transmitted on the MCCH, off its PDCH ts {} (kept for now)",
                     issi,
-                    p.slot.ts
+                    ts_list(&p.slots)
                 );
             }
         }
@@ -887,7 +1060,7 @@ impl PacketDataRuntime {
         on_air.sort_unstable();
         for issi in on_air {
             if let Some(p) = self.pdch.get(&issi) {
-                tracing::info!("SNDCP: ISSI {} sent to its PDCH ts {}", issi, p.slot.ts);
+                tracing::info!("SNDCP: ISSI {} sent to its PDCH ts {}", issi, ts_list(&p.slots));
                 Self::publish_pdch(config, issi, Some(p));
             }
         }
@@ -910,7 +1083,7 @@ impl PacketDataRuntime {
             (Some(p), Some(main)) if p.on_air => {
                 let reporter = TxReporter::new();
                 p.quit = Some(reporter.clone());
-                tracing::info!("SNDCP: ISSI {} leaves its PDCH ts {} ({})", addr.ssi, p.slot.ts, why);
+                tracing::info!("SNDCP: ISSI {} leaves its PDCH ts {} ({})", addr.ssi, ts_list(&p.slots), why);
                 Some(with_chan_alloc(msg, quit_to_mcch(main), &reporter))
             }
             _ => {
@@ -930,25 +1103,32 @@ impl PacketDataRuntime {
         now: Instant,
     ) {
         let issi = ind.received_tetra_address.ssi;
-        let (nsapi, detail) = match decode_data_transmit_request(&BitBuffer::from_bitstr(bits)) {
+        let full = self.multislot();
+        let (nsapi, detail, capable) = match decode_data_transmit_request(&BitBuffer::from_bitstr(bits)) {
             Ok(r) => (
                 r.nsapi,
                 format!(
                     "link status {}, {}",
                     u8::from(r.logical_link_status),
-                    resources(&r.resource_request)
+                    resources(&r.resource_request, full)
                 ),
+                slots_capable(&r.resource_request),
             ),
             // The runtime needs only the NSAPI: an odd resource request still gets its answer.
             Err(e) => match field(bits, 4, 4).filter(|n| valid_nsapi(*n)) {
-                Some(nsapi) => (nsapi, format!("rest not decoded: {e:?}")),
+                Some(nsapi) => (nsapi, format!("rest not decoded: {e:?}"), 1),
                 None => {
                     self.warn_malformed(issi, "SN-DATA TRANSMIT REQUEST");
                     return;
                 }
             },
         };
-        self.respond_transmit(queue, ind, nsapi, "SN-DATA TRANSMIT REQUEST", &detail, wap, config, now);
+        self.respond_transmit(queue, ind, nsapi, "SN-DATA TRANSMIT REQUEST", &detail, capable, wap, config, now);
+    }
+
+    /// Whether a radio's packet-data channel may have more than one slot here.
+    fn multislot(&self) -> bool {
+        self.pdch_cfg.as_ref().is_some_and(|p| p.max_slots > 1)
     }
 
     fn on_reconnect(
@@ -961,12 +1141,13 @@ impl PacketDataRuntime {
         now: Instant,
     ) {
         let issi = ind.received_tetra_address.ssi;
+        let full = self.multislot();
         // The NSAPI is there exactly when "data to send" is 1.
-        let (nsapi, detail) = match decode_reconnect(&BitBuffer::from_bitstr(bits)) {
-            Ok(r) => (r.nsapi, resources(&r.resource_request)),
+        let (nsapi, detail, capable) = match decode_reconnect(&BitBuffer::from_bitstr(bits)) {
+            Ok(r) => (r.nsapi, resources(&r.resource_request, full), slots_capable(&r.resource_request)),
             Err(e) => match (field(bits, 4, 1), field(bits, 5, 4).filter(|n| valid_nsapi(*n))) {
-                (Some(1), Some(nsapi)) => (Some(nsapi), format!("rest not decoded: {e:?}")),
-                (Some(0), _) => (None, format!("rest not decoded: {e:?}")),
+                (Some(1), Some(nsapi)) => (Some(nsapi), format!("rest not decoded: {e:?}"), 1),
+                (Some(0), _) => (None, format!("rest not decoded: {e:?}"), 1),
                 _ => {
                     self.warn_malformed(issi, "SN-RECONNECT");
                     return;
@@ -974,7 +1155,7 @@ impl PacketDataRuntime {
             },
         };
         match nsapi {
-            Some(nsapi) => self.respond_transmit(queue, ind, nsapi, "SN-RECONNECT", &detail, wap, config, now),
+            Some(nsapi) => self.respond_transmit(queue, ind, nsapi, "SN-RECONNECT", &detail, capable, wap, config, now),
             None => self.reconnect_without_data(issi, &detail, wap, config, now),
         }
     }
@@ -1310,7 +1491,7 @@ impl PacketDataRuntime {
         };
         let clock = self.clock;
         let mut release: Vec<(u32, &str)> = Vec::new();
-        let mut end: Vec<(u32, u8)> = Vec::new();
+        let mut end: Vec<(u32, String)> = Vec::new();
         for (issi, p) in &self.pdch {
             if status.get(issi).is_some_and(|s| s.1) {
                 release.push((*issi, "the radio is in a call"));
@@ -1325,7 +1506,7 @@ impl PacketDataRuntime {
                 continue;
             }
             if self.ctxs.iter().any(|(k, c)| k.0 == *issi && c.state == CtxState::Ready) {
-                end.push((*issi, p.slot.ts));
+                end.push((*issi, ts_list(&p.slots)));
             } else {
                 release.push((*issi, "idle"));
             }

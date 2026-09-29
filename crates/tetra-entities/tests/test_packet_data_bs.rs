@@ -3805,3 +3805,205 @@ fn the_al_ack_comes_in_the_reply_slot() {
         }
     }
 }
+
+/// SN-DATA TRANSMIT REQUEST asking `asks` slots both ways with a full phase modulation capability
+/// of `full` (the MXP600 asks the N.264 of its link, full 4).
+fn transmit_request_full(nsapi: u8, asks: u8, full: u8) -> String {
+    encode_data_transmit_request(&SndcpDataTransmitRequest {
+        nsapi,
+        logical_link_status: true,
+        resource_request: SndcpPacketDataResourceRequest::PhaseModulation(SndcpPhaseModulationResourceRequest {
+            uplink_timeslots: asks,
+            downlink_timeslots: asks,
+            full_phase_modulation_capability_timeslots: full,
+            unspecified_phase_modulation_resource: false,
+        }),
+    })
+    .unwrap()
+    .to_bitstr()
+}
+
+/// PDP context and the TRANSMIT REQUEST `request`: the timeslots of the channel assigned (none:
+/// the data stays on the MCCH); the radio is on it once the RESPONSE went out.
+fn onto_channel(air: &mut Air, issi: u32, request: &str) -> Vec<u8> {
+    air.send(issi, &demand(1, None, false));
+    air.next_sn(8).expect("ACCEPT");
+    air.send(issi, request);
+    let response = air.next_sn(8).expect("RESPONSE");
+    assert_eq!(
+        decode_data_transmit_response(&response.sn_buf()).unwrap().result,
+        SndcpDataTransmitResponseResult::Accepted
+    );
+    air.run(2);
+    air.take_sn();
+    response.alloc.as_ref().map(ts_of).unwrap_or_default()
+}
+
+/// Main-carrier timeslots the allocator gives the SNDCP bearer.
+fn packet_data_slots(air: &Air) -> Vec<u8> {
+    let state = air.test.config.state_read();
+    (2..=4u8)
+        .filter(|ts| state.timeslot_alloc.owner(*ts) == Some(TimeslotOwner::PacketData))
+        .collect()
+}
+
+/// By default a radio gets one slot, whatever it asks or can take.
+#[test]
+fn the_default_keeps_one_slot_whatever_the_radio_asks() {
+    let mut air = Air::new(pdch_config(false));
+    assert_eq!(onto_channel(&mut air, ISSI, &transmit_request_full(1, 4, 4)), vec![4]);
+    assert!(air.test.config.state_read().pdch_timeslots_by_issi.is_empty());
+    assert_eq!(packet_data_slots(&air), vec![4]);
+}
+
+/// A radio that can take 4 slots gets the slots of `pdch_timeslots` (3 at most on the main
+/// carrier): one channel allocation with all of them, the grant on the first one preferred, the
+/// timeslots published next to it. On a single carrier one traffic slot stays for voice.
+#[test]
+fn a_request_for_four_slots_gets_the_slots_of_pdch_timeslots() {
+    debug::setup_logging_verbose();
+    let mut cfg = multislot_config(false, 4);
+    cfg.cell.secondary_carrier = Some(SECONDARY_CARRIER);
+    let mut air = Air::new(cfg);
+    air.send(ISSI, &demand(1, None, false));
+    air.next_sn(8).expect("ACCEPT");
+    air.send(ISSI, &transmit_request_full(1, 4, 4));
+    let response = air.next_sn(8).expect("RESPONSE");
+    let alloc = response.alloc.clone().expect("a PDCH");
+    assert_eq!(
+        (ts_of(&alloc), alloc.carrier, alloc.alloc_type, alloc.ul_dl_assigned),
+        (vec![2, 3, 4], Some(MAIN_CARRIER), ChanAllocType::Replace, UlDlAssignment::Both)
+    );
+    {
+        let state = air.test.config.state_read();
+        assert_eq!(state.pdch_by_issi[&ISSI].slot.ts, 4);
+        assert_eq!(state.pdch_timeslots_by_issi[&ISSI], [false, true, true, true]);
+    }
+    assert_eq!(packet_data_slots(&air), vec![2, 3, 4]);
+
+    let mut air = Air::new(multislot_config(false, 4));
+    assert_eq!(onto_channel(&mut air, ISSI, &transmit_request_full(1, 4, 4)), vec![3, 4], "voice headroom");
+    assert_eq!(packet_data_slots(&air), vec![3, 4]);
+}
+
+/// The width is the smallest of what the radio can take (its full capability, not what it
+/// asks), `pdch_max_slots`, the free slots of `pdch_timeslots` and the voice headroom.
+#[test]
+fn the_width_is_the_smallest_of_capability_config_free_slots_and_headroom() {
+    let case = |max: u8, secondary: bool, voice_on: Option<u8>, request: String| {
+        let mut cfg = multislot_config(false, max);
+        if secondary {
+            cfg.cell.secondary_carrier = Some(SECONDARY_CARRIER);
+        }
+        let mut air = Air::new(cfg);
+        if let Some(ts) = voice_on {
+            air.test
+                .config
+                .state_write()
+                .timeslot_alloc
+                .reserve(TimeslotOwner::Cmce, ts)
+                .unwrap();
+        }
+        onto_channel(&mut air, ISSI, &request)
+    };
+    assert_eq!(case(2, false, None, transmit_request_full(1, 1, 4)), vec![3, 4], "the ask is no limit");
+    assert_eq!(case(2, false, None, transmit_request_full(1, 1, 1)), vec![4], "a one-slot radio");
+    assert_eq!(case(3, false, None, transmit_request_full(1, 4, 4)), vec![3, 4], "ts2 left for voice");
+    assert_eq!(case(3, true, None, transmit_request_full(1, 4, 4)), vec![2, 3, 4]);
+    assert_eq!(case(3, true, Some(3), transmit_request_full(1, 4, 4)), vec![2, 4], "not contiguous");
+    assert_eq!(case(3, false, Some(3), transmit_request_full(1, 4, 4)), vec![4], "ts2 left for voice");
+    assert_eq!(case(3, false, None, transmit_request(1, None)), vec![4], "no resource request");
+}
+
+/// After its first session the MXP600 asks the N.264 of its link (1 slot while it was 1): with
+/// its full capability of 4 it still gets the channel.
+#[test]
+fn a_radio_with_an_old_one_slot_link_still_gets_the_channel() {
+    let mut air = Air::new(multislot_config(false, 2));
+    assert_eq!(onto_channel(&mut air, ISSI, &transmit_request_full(1, 1, 4)), vec![3, 4]);
+}
+
+/// A TRANSMIT REQUEST on any slot of its channel is from a radio on it: answered there without a
+/// new assignment.
+#[test]
+fn a_request_on_another_slot_of_the_channel_is_not_reassigned() {
+    let mut air = Air::new(multislot_config(false, 2));
+    assert_eq!(onto_channel(&mut air, ISSI, &transmit_request_full(1, 1, 4)), vec![3, 4]);
+    air.send_on(ISSI, &transmit_request_full(1, 2, 4), 3);
+    let there = air.next_sn(8).expect("RESPONSE");
+    assert_eq!((there.link_id, there.chan_alloc), (4, false), "on its PDCH, no new assignment");
+}
+
+/// SN-END OF DATA on the channel: "quit and go" back to the MCCH, and every slot of the channel is
+/// free once it went out.
+#[test]
+fn end_of_data_frees_every_slot_of_the_channel() {
+    let mut air = Air::new(multislot_config(false, 2));
+    assert_eq!(onto_channel(&mut air, ISSI, &transmit_request_full(1, 2, 4)), vec![3, 4]);
+    air.send_on(ISSI, &end_of_data(), 3);
+    let eod = air.next_sn(8).expect("END OF DATA");
+    assert_eq!(eod.alloc.as_ref().map(|a| a.alloc_type), Some(ChanAllocType::QuitAndGo));
+    air.run(2);
+    let state = air.test.config.state_read();
+    assert!(state.pdch_by_issi.is_empty() && state.pdch_timeslots_by_issi.is_empty());
+    assert_eq!((state.timeslot_alloc.owner(3), state.timeslot_alloc.owner(4)), (None, None));
+}
+
+/// An idle channel of several slots ends like one of one slot.
+#[test]
+fn an_idle_multislot_pdch_ends_with_end_of_data() {
+    let mut cfg = multislot_config(false, 2);
+    cfg.packet_data.ready_timer_code = 11;
+    cfg.packet_data.pdch_idle_release_secs = 2;
+    let mut air = Air::new(cfg);
+    assert_eq!(onto_channel(&mut air, ISSI, &transmit_request_full(1, 2, 4)), vec![3, 4]);
+    air.run(300);
+    let sent = air.take_sn();
+    assert_eq!(sent.iter().filter(|d| d.sn_type() == Some(8)).count(), 1, "{sent:?}");
+    assert!(packet_data_slots(&air).is_empty());
+    assert!(air.test.config.state_read().pdch_timeslots_by_issi.is_empty());
+}
+
+/// Voice taking one slot of a channel of several slots takes the whole channel: the grant and
+/// the timeslots go, the other slots back to the pool, which gives them to a PDCH again only
+/// after a multiframe.
+#[test]
+fn voice_taking_one_slot_releases_the_whole_multislot_pdch() {
+    let mut cfg = multislot_config(false, 3);
+    cfg.cell.secondary_carrier = Some(SECONDARY_CARRIER);
+    let mut air = Air::new(cfg);
+    assert_eq!(onto_channel(&mut air, ISSI, &transmit_request_full(1, 4, 4)), vec![2, 3, 4]);
+    {
+        let mut state = air.test.config.state_write();
+        for ts in 1..=4 {
+            state
+                .timeslot_alloc
+                .reserve_slot(TimeslotOwner::Cmce, CarrierSlot { carrier_num: SECONDARY_CARRIER, ts })
+                .unwrap();
+        }
+        let taken = state.timeslot_alloc.allocate_any_slot(TimeslotOwner::Cmce).unwrap();
+        assert_eq!(taken.ts, 2, "the call takes ts2 of the channel");
+        assert!(state.pdch_channel(ISSI).is_none(), "the channel is gone at once for the MAC and the LLC");
+    }
+    // The SNDCP learns of it at its next housekeeping (about once a second).
+    for _ in 0..80 {
+        if air.test.config.state_read().pdch_by_issi.is_empty() {
+            break;
+        }
+        air.step();
+    }
+    {
+        let state = air.test.config.state_read();
+        assert!(state.pdch_by_issi.is_empty() && state.pdch_timeslots_by_issi.is_empty());
+        assert_eq!(state.timeslot_alloc.owner(2), Some(TimeslotOwner::Cmce));
+        assert_eq!((state.timeslot_alloc.owner(3), state.timeslot_alloc.owner(4)), (None, None));
+    }
+    air.send(ISSI, &transmit_request_full(1, 4, 4));
+    let response = air.next_sn(8).expect("RESPONSE");
+    assert!(response.alloc.is_none(), "ts3 and ts4 were the channel's less than a multiframe ago");
+    air.run(80);
+    air.send(ISSI, &transmit_request_full(1, 4, 4));
+    let response = air.next_sn(8).expect("RESPONSE");
+    let slots = response.alloc.as_ref().map(ts_of).expect("a PDCH again");
+    assert!(!slots.is_empty() && !slots.contains(&2), "{slots:?}");
+}
