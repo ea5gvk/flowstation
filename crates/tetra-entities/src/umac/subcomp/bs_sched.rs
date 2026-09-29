@@ -176,6 +176,10 @@ pub struct BsChannelScheduler {
     /// The grant `multislot` placed in the slot being built, checked once it is built.
     pdch_lazy: Option<multislot::LazyGrant>,
 
+    /// Grants `multislot` placed that left, by the downlink slot that carried them: the radio and
+    /// the uplink slots they reserved (the last few slots only; see `pdch_random_access`).
+    pdch_grants_out: Vec<(TdmaTime, u32, Vec<TdmaTime>)>,
+
     /// Queued advanced link segments to the radio of a packet-data channel of several slots that
     /// ask for an acknowledgement, by the radio and the segment's report: each gets a slot for the
     /// answer granted with it (see `multislot`).
@@ -245,6 +249,7 @@ impl BsChannelScheduler {
             pdch_assigned_at: [None; 4],
             pdch_channel_debt: [None; 4],
             pdch_lazy: None,
+            pdch_grants_out: Vec::new(),
             pdch_reply_wanted: Vec::new(),
         }
     }

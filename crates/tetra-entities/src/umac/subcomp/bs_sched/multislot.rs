@@ -21,7 +21,8 @@
 //! - G2: while it holds uplink slots of its channel ahead, no downlink fragmentation starts (the
 //!   MS drops a partial TM-SDU after N.203 slots without a fragment, 23.4.3.1.1 iii);
 //! - a random access of the radio on its channel, which the BS learns of only after the downlink
-//!   slots around it went out, drops the fragmented downlink message under way (23.4.2.1.1).
+//!   slots around it went out, drops the fragmented downlink message under way (23.4.2.1.1) and
+//!   frees the uplink slots granted in those slots.
 //!
 //! Uplink capacity the radio asks for on its channel is not granted when the request arrives but
 //! when a downlink slot of the channel it hears is built (as Nexus-BS grants pending capacity at
@@ -150,7 +151,10 @@ impl BsChannelScheduler {
     /// once the downlink slots around it went out: the MS lost what was sent in them (23.5.1.4.12
     /// lets it skip such an access, not undo it), so the fragmented downlink message under way on
     /// the channel is dropped ("by sending no more fragments", 23.4.2.1.1) rather than sent to
-    /// its end for nothing. Dropping it reports its TM-SDU discarded.
+    /// its end for nothing. Dropping it reports its TM-SDU discarded. The uplink slots granted in
+    /// downlink `label`+1..+3 are freed: the MS will not use them, and a requirement it sends
+    /// would be taken as covered by them (23.5.2.1 NOTE 1 counts what it holds); the PDU's own
+    /// requirement, or its lack of one, then sets what it is owed.
     pub fn pdch_random_access(&mut self, label: TdmaTime, block: PhyBlockNum, ssi: u32) {
         if self.multislot_owner(label.t) != Some(ssi) || self.ul_get_slot_owner(label, block) == Some(ssi) {
             return;
@@ -163,6 +167,24 @@ impl BsChannelScheduler {
                 "UMAC: ISSI {} random access on ts {} of its PDCH: the downlink message being fragmented to it dropped",
                 ssi,
                 label.t
+            );
+        }
+        let unheard: Vec<TdmaTime> = self
+            .pdch_grants_out
+            .iter()
+            .filter(|(d, s, _)| *s == ssi && (1..=3).contains(&d.diff(label)))
+            .flat_map(|(_, _, labels)| labels.iter().copied())
+            .filter(|u| self.ul_reserved_to(*u, ssi))
+            .collect();
+        for u in &unheard {
+            self.ul_free_slot(*u);
+        }
+        if !unheard.is_empty() {
+            tracing::info!(
+                "UMAC: ISSI {} random access on ts {} of its PDCH: {} uplink slot(s) granted while it transmitted freed",
+                ssi,
+                label.t,
+                unheard.len()
             );
         }
     }
@@ -487,6 +509,10 @@ impl BsChannelScheduler {
             break;
         }
         let Some((i, empty)) = found else {
+            // It left: a random access of its radio in the uplink slots before may show that the
+            // radio did not hear it.
+            self.pdch_grants_out.retain(|(t, ..)| d.diff(*t) < 4);
+            self.pdch_grants_out.push((d, lazy.ssi, lazy.labels));
             return;
         };
         if empty {
@@ -1139,6 +1165,33 @@ mod tests {
         );
         assert!(reporters.iter().all(|r| r.is_transmitted()));
         assert!(sched.pdch_reply_wanted.is_empty(), "the wish went with its segment");
+    }
+
+    /// A request the radio sends by random access in uplink u is not taken as covered by a slot
+    /// granted in downlink u+1..u+3, which it did not hear while it transmitted: that slot is
+    /// freed and what it asks for is granted afresh.
+    #[test]
+    fn test_a_random_access_does_not_count_grants_the_radio_did_not_hear() {
+        let mut sched = channel_sched(&[3, 4]);
+        let reporter = TxReporter::new_unacked();
+        let (pdu, sdu) = resource(200);
+        sched.dl_enqueue_tma_for_link(4, pdu, sdu, Some(reporter.clone()));
+        sched.pdch_want_reply(RADIO, reporter);
+        let slots = finalize_slots(&mut sched, 3);
+        assert_eq!((slots[2].ts, grant_in(&slots[2])), (at(4, 3), Some((1, 2))));
+        assert_eq!(held_by_radio(&sched, at(4, 3)), vec![at(5, 3)]);
+        // A MAC-ACCESS asking for a slot came by random access in (3,4), learnt of now.
+        let label = at(3, 4);
+        assert_eq!(sched.cur_dltime.add_timeslots(-2), label);
+        sched.pdch_random_access(label, PhyBlockNum::Block1, RADIO);
+        assert!(sched.ul_defer_to_channel(label, radio(), &ReservationRequirement::Req1Slot));
+        assert!(held_by_radio(&sched, label).is_empty(), "the reply slot it did not hear freed");
+        assert_eq!(sched.pdch_channel_debt[2].map(|d| d.slots), Some(1));
+        let slot = finalize_slots(&mut sched, 1).remove(0);
+        assert_eq!((slot.ts, grant_in(&slot)), (at(4, 4), Some((1, 0))));
+        // Not a grant sent once it was back (u+4 on).
+        sched.pdch_random_access(label, PhyBlockNum::Block1, RADIO);
+        assert_eq!(held_by_radio(&sched, label), vec![at(4, 4)]);
     }
 
     /// A random access of the radio on its channel drops the downlink fragmentation under way on
