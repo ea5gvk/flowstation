@@ -33,6 +33,9 @@ use crate::{
     },
 };
 
+/// Packet-data channels of several slots: the half-duplex guard and their uplink grants.
+mod multislot;
+
 /// We submit this many TX timeslots ahead of the current time
 pub const MACSCHED_TX_AHEAD: usize = 1;
 
@@ -159,6 +162,11 @@ pub struct BsChannelScheduler {
     /// Uplink capacity still owed on a packet-data channel after a chunked grant: the radio, the
     /// slots left and the last slot of the chunk already granted.
     pdch_ul_debt: [Option<(TetraAddress, usize, TdmaTime)>; 4],
+
+    /// Downlink slot that carried the channel assignment of a packet-data channel of several
+    /// slots, by the channel's lowest slot: the slot right after it is not received on the new
+    /// channel (see `multislot`).
+    pdch_assigned_at: [Option<TdmaTime>; 4],
 }
 
 #[derive(Debug)]
@@ -221,6 +229,7 @@ impl BsChannelScheduler {
             next_usage_marker: [4, 4, 4, 4],
             pdch: [None; 4],
             pdch_ul_debt: [None; 4],
+            pdch_assigned_at: [None; 4],
         }
     }
 
@@ -345,6 +354,7 @@ impl BsChannelScheduler {
         }
         self.pdch[idx] = owner;
         self.pdch_ul_debt[idx] = None;
+        self.pdch_assigned_at[idx] = None;
         if let Some(old) = old {
             let dropped = self.dl_drop_queued_for_ssi(ts, old);
             tracing::info!(
@@ -1410,10 +1420,13 @@ impl BsChannelScheduler {
     fn dl_build_block_from_signalling_schedule(&mut self, ts: TdmaTime) -> Option<BitBuffer> {
         let mut buf_opt = None;
         let q = self.queue_index(ts.t);
+        // On a packet-data channel of several slots, no fragmentation starts in this block while
+        // its radio is about to transmit (see `multislot`).
+        let whole_only = self.pdch_whole_only(ts);
 
         while !self.dltx_queues[q].is_empty() {
             let room = buf_opt.as_ref().map_or(SCH_F_CAP, |buf: &BitBuffer| buf.get_len_remaining());
-            let opt = self.dl_take_next_sched_item(ts, room);
+            let opt = self.dl_take_next_sched_item(ts, room, whole_only);
 
             match opt {
                 Some(sched_elem) => {
@@ -1425,6 +1438,9 @@ impl BsChannelScheduler {
                         DlSchedElem::Resource(pdu, sdu, tx_reporter) => {
                             // Allocate bitbuf if not already done
                             let mut buf = buf_opt.unwrap_or_else(|| BitBuffer::new(SCH_F_CAP));
+                            if let Some(c) = pdu.chan_alloc_element.as_ref() {
+                                self.pdch_note_assignment(ts, c.carrier_num, &c.ts_assigned);
+                            }
                             // Create fragger, either to send the whole PDU or to start fragmentation
                             let mut fragger = BsFragger::new(pdu, sdu, tx_reporter);
                             if !fragger.get_next_chunk(&mut buf) {
@@ -1556,7 +1572,7 @@ impl BsChannelScheduler {
     /// If none; return first to-be-transmitted resource.
     /// If none, return None.
     pub fn dl_take_prioritized_sched_item(&mut self, ts: TdmaTime) -> Option<DlSchedElem> {
-        self.dl_take_next_sched_item(ts, SCH_F_CAP)
+        self.dl_take_next_sched_item(ts, SCH_F_CAP, false)
     }
 
     /// Whether `elem` goes whole in `room` bits and leaves room for a fragment after it.
@@ -1569,8 +1585,20 @@ impl BsChannelScheduler {
         len.div_ceil(8) * 8 + MIN_SLOT_CAP_FOR_FRAG <= room
     }
 
-    /// `dl_take_prioritized_sched_item` for a block with `room` bits still free.
-    fn dl_take_next_sched_item(&mut self, ts: TdmaTime, room: usize) -> Option<DlSchedElem> {
+    /// Whether `elem` goes whole in `room` bits, a packet-data TM-SDU not started yet included;
+    /// an element of unknown length does not.
+    fn goes_whole(elem: &DlSchedElem, room: usize) -> bool {
+        let len = match elem {
+            DlSchedElem::Resource(pdu, sdu, _) => Some(pdu.compute_header_len() + sdu.get_len()),
+            DlSchedElem::FragBuf(f) if !f.is_started() => Some(f.whole_len_bits()),
+            _ => None,
+        };
+        len.is_some_and(|len| len.div_ceil(8) * 8 <= room)
+    }
+
+    /// `dl_take_prioritized_sched_item` for a block with `room` bits still free. With
+    /// `whole_only` nothing is taken that would start a fragmentation (a started one goes on).
+    fn dl_take_next_sched_item(&mut self, ts: TdmaTime, room: usize, whole_only: bool) -> Option<DlSchedElem> {
         if ts.f == 18 {
             // No resources on frame 18
             return None;
@@ -1599,10 +1627,9 @@ impl BsChannelScheduler {
 
         // Return FragBufs next. A packet-data TM-SDU not started yet waits in line with the
         // resources instead.
-        if let Some(i) = q
-            .iter()
-            .position(|e| matches!(e, DlSchedElem::FragBuf(f) if f.is_started() || !f.is_packet_data()))
-        {
+        if let Some(i) = q.iter().position(|e| {
+            matches!(e, DlSchedElem::FragBuf(f) if f.is_started() || (!f.is_packet_data() && (!whole_only || Self::goes_whole(e, room))))
+        }) {
             // A packet-data TM-SDU being fragmented lets signalling go first that fits whole in this
             // block and leaves room for its next fragment: the BS may interrupt a fragmented
             // message with non-fragmented ones (EN 300 392-2 23.4.2.1.1), and a fragment still goes
@@ -1618,7 +1645,8 @@ impl BsChannelScheduler {
 
         // Return Resources next
         if let Some(i) = q.iter().position(|e| {
-            matches!(e, DlSchedElem::Resource(_, _, _)) || matches!(e, DlSchedElem::FragBuf(f) if f.is_packet_data() && !f.is_started())
+            (matches!(e, DlSchedElem::Resource(..)) || matches!(e, DlSchedElem::FragBuf(f) if f.is_packet_data() && !f.is_started()))
+                && (!whole_only || Self::goes_whole(e, room))
         }) {
             return Some(q.remove(i));
         }
@@ -1751,9 +1779,14 @@ impl BsChannelScheduler {
             }
         } else {
             self.pdch_route_out_of_build_items(ts);
-            self.dl_integrate_sched_elems_for_timeslot(ts);
-
-            let buf = self.dl_build_block_from_signalling_schedule(ts);
+            // The radio of a packet-data channel of several slots does not hear this slot while
+            // it transmits or switches: nothing goes on it then (see `multislot`).
+            let buf = if self.pdch_radio_hears(ts) {
+                self.dl_integrate_sched_elems_for_timeslot(ts);
+                self.dl_build_block_from_signalling_schedule(ts)
+            } else {
+                None
+            };
             if let Some(buf) = buf {
                 TmvUnitdataReqSlot {
                     carrier_num,

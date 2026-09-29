@@ -76,3 +76,13 @@ The sections above are copied verbatim from Nexus-BS. In this repository:
   with `NOTICE`, next to this file in `/usr/share/doc/flowstation/`.
 - `LICENSE-OVERVIEW.md` is not included: `NOTICE` and the PolyForm text cover
   its role for the imported files.
+- `crates/tetra-entities/src/umac/subcomp/bs_sched/multislot.rs` (flowstation-miura,
+  packet-data channels of several slots): the uplink grant opportunity search
+  over the slots of the channel and the grant made when the downlink slot that
+  carries it is built follow Nexus-BS `bs_sched.rs`
+  (`ul_find_grant_opportunity_on_channel_from`, the pending grant built at
+  transmission). Adapted: one uplink debt per channel granted in chunks of up to
+  four slots, frame 18 counted but never granted, the half-duplex guard of a
+  radio without fast switching (nothing sent in the downlink slots it cannot
+  hear, no downlink fragmentation across its uplink), a reply slot on advanced
+  link segments that ask for an acknowledgement.

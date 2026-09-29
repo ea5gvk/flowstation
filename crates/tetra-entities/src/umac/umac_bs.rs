@@ -777,7 +777,10 @@ impl UmacBs {
         }
 
         // Handle reservation if present
-        let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago. 
+        let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago.
+        if carrier_num == self.main_carrier() {
+            self.channel_scheduler.pdch_random_access(msg_dltime, prim.block_num, addr.ssi);
+        }
         if let Some(res_req) = &pdu.reservation_req {
             let grant_result = self.scheduler_for_mut(carrier_num).ul_process_cap_req(msg_dltime.t, addr, res_req);
             if let Some((grant, usage_marker)) = grant_result {
@@ -931,6 +934,9 @@ impl UmacBs {
         // Marking those as RA causes the next stolen downlink MAC-RESOURCE to carry
         // random_access_flag=true, which some radios reject during call setup.
         let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago.
+        if carrier_num == self.main_carrier() {
+            self.channel_scheduler.pdch_random_access(msg_dltime, prim.block_num, addr.ssi);
+        }
         if msg_dltime.t == 1 && !self.scheduler_for(carrier_num).allow_mcch() {
             if !self.scheduler_for(carrier_num).circuit_is_active(Direction::Dl, msg_dltime.t) {
                 tracing::info!(
@@ -1477,6 +1483,7 @@ impl UmacBs {
         else {
             return;
         };
+        self.channel_scheduler.pdch_random_access(msg_dltime, PhyBlockNum::Both, ssi);
         let addr = TetraAddress::issi(ssi);
         // Reservation requirement, with the MAC-U-BLCK meaning of the last two values
         // (table 21.37): 14 = more than 68 slots, 15 = none.

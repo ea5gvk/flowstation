@@ -41,6 +41,11 @@ advanced link engine, with parts adapted from the Nexus-BS LLC):
 - crates/tetra-pdus/src/llc/pdus/al_ack.rs
 - crates/tetra-entities/src/llc/advanced_link.rs
 
+Packet-data channels of several slots (the half-duplex guard, and the uplink
+grant counted over the slots of the channel when the slot carrying it is
+built, following the Nexus-BS scheduler):
+- crates/tetra-entities/src/umac/subcomp/bs_sched/multislot.rs
+
 Nexus-BS credits (from the Nexus-BS NOTICE):
 - BlueStation Project for historical TETRA BS foundation and
   protocol-structure contributions:
