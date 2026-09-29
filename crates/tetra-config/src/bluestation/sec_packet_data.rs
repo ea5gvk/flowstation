@@ -12,7 +12,8 @@ pub const PACKET_DATA_MAX_POOL: u32 = 1024;
 pub enum PacketDataBearer {
     /// On the common control channel, no channel assigned (clause 28.3.4.2 NOTE 2).
     Mcch,
-    /// On a packet-data channel of one timeslot of the main carrier, which voice takes back.
+    /// On a packet-data channel of the main carrier (`pdch_max_slots` timeslots at most per
+    /// radio), which voice takes back.
     Pdch,
 }
 
@@ -34,6 +35,11 @@ pub struct CfgPacketData {
     pub pdch_timeslots: Vec<u8>,
     /// A PDCH without data for this long goes back to the pool (voice takes it earlier if needed).
     pub pdch_idle_release_secs: u32,
+    /// Timeslots one radio's PDCH may have (1..=4), within the full capability the radio declares
+    /// in its resource request: at most the distinct slots of `pdch_timeslots` (the main carrier's
+    /// ts1 is the MCCH), one main traffic slot is left for voice when no other carrier has a free
+    /// one, and 1 with the bearer on the MCCH. See `pdch_slots_per_radio`.
+    pub pdch_max_slots: u8,
 }
 
 impl Default for CfgPacketData {
@@ -46,6 +52,7 @@ impl Default for CfgPacketData {
             bearer: PacketDataBearer::Mcch,
             pdch_timeslots: vec![4, 3, 2],
             pdch_idle_release_secs: 10,
+            pdch_max_slots: 1,
         }
     }
 }
@@ -54,6 +61,21 @@ impl CfgPacketData {
     /// Whether `ip` is in the dynamic pool.
     pub fn in_pool(&self, ip: Ipv4Addr) -> bool {
         (u32::from(self.pool_first)..=u32::from(self.pool_last)).contains(&u32::from(ip))
+    }
+
+    /// Distinct main-carrier timeslots (2..=4) of `pdch_timeslots`.
+    pub fn pdch_timeslot_count(&self) -> u8 {
+        (2..=4u8).filter(|ts| self.pdch_timeslots.contains(ts)).count() as u8
+    }
+
+    /// Timeslots a radio's packet-data channel may have here: `pdch_max_slots` within the
+    /// distinct slots of `pdch_timeslots` (a PDCH on a secondary carrier is not supported), 1 with
+    /// the bearer on the MCCH.
+    pub fn pdch_slots_per_radio(&self) -> u8 {
+        match self.bearer {
+            PacketDataBearer::Pdch => self.pdch_max_slots.min(self.pdch_timeslot_count()).max(1),
+            PacketDataBearer::Mcch => 1,
+        }
     }
 }
 
@@ -94,6 +116,8 @@ pub struct CfgPacketDataDto {
     pub pdch_timeslots: Vec<u8>,
     #[serde(default = "default_pdch_idle_release_secs")]
     pub pdch_idle_release_secs: u32,
+    #[serde(default = "default_pdch_max_slots")]
+    pub pdch_max_slots: u8,
 
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
@@ -116,6 +140,9 @@ fn default_pdch_timeslots() -> Vec<u8> {
 }
 fn default_pdch_idle_release_secs() -> u32 {
     CfgPacketData::default().pdch_idle_release_secs
+}
+fn default_pdch_max_slots() -> u8 {
+    CfgPacketData::default().pdch_max_slots
 }
 
 fn parse_ipv4(key: &str, s: &str) -> Result<Ipv4Addr, String> {
@@ -149,6 +176,9 @@ pub fn apply_packet_data_patch(dto: CfgPacketDataDto) -> Result<CfgPacketData, S
     if !(1..=300).contains(&dto.pdch_idle_release_secs) {
         return Err("packet_data: pdch_idle_release_secs must be within 1..=300".to_string());
     }
+    if !(1..=4).contains(&dto.pdch_max_slots) {
+        return Err("packet_data: pdch_max_slots must be within 1..=4".to_string());
+    }
     Ok(CfgPacketData {
         enabled: dto.enabled,
         pool_first,
@@ -157,6 +187,7 @@ pub fn apply_packet_data_patch(dto: CfgPacketDataDto) -> Result<CfgPacketData, S
         bearer,
         pdch_timeslots: dto.pdch_timeslots,
         pdch_idle_release_secs: dto.pdch_idle_release_secs,
+        pdch_max_slots: dto.pdch_max_slots,
     })
 }
 
@@ -218,5 +249,39 @@ pdch_idle_release_secs = 300"))
         ] {
             assert!(apply_packet_data_patch(dto(bad)).is_err(), "{bad} must be rejected");
         }
+    }
+
+    #[test]
+    fn pdch_max_slots_range_and_default() {
+        assert_eq!(apply_packet_data_patch(dto("")).unwrap().pdch_max_slots, 1);
+        for n in 1..=4u8 {
+            assert_eq!(
+                apply_packet_data_patch(dto(&format!("pdch_max_slots = {n}"))).unwrap().pdch_max_slots,
+                n
+            );
+        }
+        for bad in ["pdch_max_slots = 0", "pdch_max_slots = 5"] {
+            assert_eq!(
+                apply_packet_data_patch(dto(bad)),
+                Err("packet_data: pdch_max_slots must be within 1..=4".to_string())
+            );
+        }
+    }
+
+    /// At most the distinct main-carrier slots of `pdch_timeslots`, and 1 on the MCCH.
+    #[test]
+    fn pdch_slots_per_radio_is_clamped() {
+        let cfg = |bearer: PacketDataBearer, slots: &[u8], max: u8| CfgPacketData {
+            bearer,
+            pdch_timeslots: slots.to_vec(),
+            pdch_max_slots: max,
+            ..CfgPacketData::default()
+        };
+        assert_eq!(cfg(PacketDataBearer::Mcch, &[4, 3, 2], 3).pdch_slots_per_radio(), 1);
+        assert_eq!(cfg(PacketDataBearer::Pdch, &[4, 3, 2], 4).pdch_slots_per_radio(), 3);
+        assert_eq!(cfg(PacketDataBearer::Pdch, &[4, 3, 2], 2).pdch_slots_per_radio(), 2);
+        assert_eq!(cfg(PacketDataBearer::Pdch, &[3], 3).pdch_slots_per_radio(), 1);
+        assert_eq!(cfg(PacketDataBearer::Pdch, &[4, 4, 3], 3).pdch_slots_per_radio(), 2, "distinct slots");
+        assert_eq!(CfgPacketData::default().pdch_slots_per_radio(), 1);
     }
 }
