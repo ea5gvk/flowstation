@@ -2,6 +2,7 @@ use std::cmp::min;
 
 use tetra_core::{BitBuffer, SsiType, TxReporter};
 
+use tetra_pdus::umac::fields::channel_allocation::ChanAllocElement;
 use tetra_pdus::umac::pdus::{mac_end_dl::MacEndDl, mac_frag_dl::MacFragDl, mac_resource::MacResource};
 
 use crate::umac::subcomp::fillbits;
@@ -56,6 +57,11 @@ impl BsFragger {
     /// The MAC-RESOURCE of a PDU nothing of which went out yet, to change it before it does.
     pub fn unsent_resource_mut(&mut self) -> Option<&mut MacResource> {
         (!self.mac_hdr_is_written).then_some(&mut self.resource)
+    }
+
+    /// The channel allocation its MAC-RESOURCE carries.
+    pub fn chan_alloc(&self) -> Option<&ChanAllocElement> {
+        self.resource.chan_alloc_element.as_ref()
     }
 
     /// MAC-RESOURCE header and TM-SDU, in bits, before anything went out.

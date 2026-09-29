@@ -1459,15 +1459,14 @@ impl BsChannelScheduler {
                         DlSchedElem::Resource(pdu, sdu, tx_reporter) => {
                             // Allocate bitbuf if not already done
                             let mut buf = buf_opt.unwrap_or_else(|| BitBuffer::new(SCH_F_CAP));
-                            if let Some(c) = pdu.chan_alloc_element.as_ref() {
-                                self.pdch_note_assignment(ts, c.carrier_num, &c.ts_assigned);
-                            }
                             // Create fragger, either to send the whole PDU or to start fragmentation
                             let mut fragger = BsFragger::new(pdu, sdu, tx_reporter);
                             if !fragger.get_next_chunk(&mut buf) {
                                 // Fragmentation was started and we have more chunks to send
                                 // Enqueue fragger with remaining data for retrieval next frame
                                 self.dl_enqueue_tma_frag_next_frame(fragger);
+                            } else {
+                                self.pdch_note_assignment(ts, &fragger);
                             }
                             buf_opt = Some(buf);
                         }
@@ -1479,6 +1478,8 @@ impl BsChannelScheduler {
                                 // Fragmentation was continued and we still have more chunks to send
                                 // Re-enqueue fragger with remaining data for retrieval next frame
                                 self.dl_enqueue_tma_frag_next_frame(fragger);
+                            } else {
+                                self.pdch_note_assignment(ts, &fragger);
                             }
                             buf_opt = Some(buf);
                         }

@@ -130,13 +130,16 @@ impl BsChannelScheduler {
         })
     }
 
-    /// A packet-data channel assignment to `ts_assigned` of `carrier` goes out in downlink slot
-    /// `ts`: the first slot of the new channel the MS receives is the first one starting at
-    /// least one slot after the end of this one (23.5.4.3.1 rule 1, NOTE 7 ii).
-    pub(super) fn pdch_note_assignment(&mut self, ts: TdmaTime, carrier: u16, ts_assigned: &[bool; 4]) {
-        if carrier == self.carrier_num
-            && ts_assigned.iter().filter(|set| **set).count() > 1
-            && let Some(lowest) = ts_assigned.iter().position(|set| *set)
+    /// The last of the PDU `fragger` sends went out in downlink slot `ts`: if it assigns a
+    /// packet-data channel of several slots of this carrier, the first slot of the new channel
+    /// the MS receives is the first one starting at least one slot after the end of this one
+    /// (23.5.4.3.1 rule 1, NOTE 7 ii). Not where it was first taken: with no room left there it
+    /// waits for the next block, fragmented it moves the MS only once all out (23.4.2.1.1).
+    pub(super) fn pdch_note_assignment(&mut self, ts: TdmaTime, fragger: &BsFragger) {
+        if let Some(c) = fragger.chan_alloc()
+            && c.carrier_num == self.carrier_num
+            && c.ts_assigned.iter().filter(|set| **set).count() > 1
+            && let Some(lowest) = c.ts_assigned.iter().position(|set| *set)
         {
             self.pdch_assigned_at[lowest] = Some(ts);
         }
@@ -606,6 +609,46 @@ mod tests {
                 .collect();
             assert_eq!(carried.first(), Some(&first), "channel {channel:?}: {carried:?}");
         }
+    }
+
+    /// An assignment that does not fit in the rest of the MCCH block it is taken for waits for the
+    /// next one: the slot not received is the one after the slot it goes out in, (5,2), not (4,2).
+    #[test]
+    fn test_the_slot_after_a_deferred_assignment_is_not_used() {
+        use tetra_pdus::umac::fields::channel_allocation::ChanAllocElement;
+        use tetra_saps::lcmc::enums::{alloc_type::ChanAllocType, ul_dl_assignment::UlDlAssignment};
+        let mut sched = channel_sched(&[2, 3, 4]);
+        // 240 bits for another radio first in (4,1): 28 are left, too few for the assignment.
+        let other = BsChannelScheduler::dl_make_minimal_resource(&TetraAddress::issi(RADIO + 1), None, false);
+        let sdu: String = (0..197).map(|i| if i % 2 == 0 { '1' } else { '0' }).collect();
+        sched.dl_enqueue_tma_for_link(0, other, BitBuffer::from_bitstr(&sdu), None);
+        let mut assignment = BsChannelScheduler::dl_make_minimal_resource(&radio(), None, false);
+        assignment.chan_alloc_element = Some(ChanAllocElement {
+            alloc_type: ChanAllocType::Replace,
+            ts_assigned: [false, true, true, true],
+            ul_dl_assigned: UlDlAssignment::Both,
+            clch_permission: false,
+            cell_change_flag: false,
+            carrier_num: sched.carrier_num(),
+            ext: None,
+            mon_pattern: 1,
+            frame18_mon_pattern: None,
+        });
+        sched.dl_enqueue_tma_for_link(0, assignment, BitBuffer::from_bitstr("1011001110001111"), None);
+        let slots = finalize_slots(&mut sched, 8);
+        let sent_in: Vec<TdmaTime> = slots
+            .iter()
+            .filter(|s| {
+                resources(s)
+                    .iter()
+                    .any(|r| r.addr.is_some_and(|a| a.ssi == RADIO) && r.chan_alloc_element.is_some())
+            })
+            .map(|s| s.ts)
+            .collect();
+        assert_eq!(sent_in, vec![at(5, 1)]);
+        assert_eq!(sched.pdch_assigned_at[1], Some(at(5, 1)));
+        assert!(sched.pdch_radio_hears(at(4, 2)));
+        assert!(!sched.pdch_radio_hears(at(5, 2)));
     }
 
     /// A datagram for the radio waits while the radio holds uplink slots of its channel ahead
