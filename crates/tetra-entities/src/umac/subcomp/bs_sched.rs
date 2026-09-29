@@ -1607,14 +1607,16 @@ impl BsChannelScheduler {
     }
 
     /// Whether `elem` goes whole in `room` bits, a packet-data TM-SDU not started yet included;
-    /// an element of unknown length does not.
+    /// an element of unknown length does not. As the fragger sends it: a PDU that fills the rest
+    /// of the block to the bit goes whole too (its length is indicated as the next octet,
+    /// 23.4.3.2), a full advanced link segment with a grant of several slots say.
     fn goes_whole(elem: &DlSchedElem, room: usize) -> bool {
         let len = match elem {
             DlSchedElem::Resource(pdu, sdu, _) => Some(pdu.compute_header_len() + sdu.get_len()),
             DlSchedElem::FragBuf(f) if !f.is_started() => Some(f.whole_len_bits()),
             _ => None,
         };
-        len.is_some_and(|len| len.div_ceil(8) * 8 <= room)
+        len.is_some_and(|len| len <= room)
     }
 
     /// Whether a resource that does not go whole in `room` bits can open its fragmentation there

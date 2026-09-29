@@ -1021,6 +1021,29 @@ mod tests {
         assert!(!dl_pdus(&slots[2]).iter().any(|p| p.2 == 0b111111), "{:?}", dl_pdus(&slots[2]));
     }
 
+    /// A full advanced link segment (a 211-bit TM-SDU) with a grant of several slots and its usage
+    /// marker fills the block to the bit: it goes whole, the grant with it, and the segments after
+    /// it follow in order.
+    #[test]
+    fn test_a_grant_rides_on_a_segment_that_fills_the_block() {
+        let mut sched = channel_sched(&[3, 4]);
+        let reporters: Vec<TxReporter> = (0..3).map(|_| TxReporter::new()).collect();
+        for r in &reporters {
+            let (pdu, sdu) = resource(211);
+            sched.dl_enqueue_tma_for_link(3, pdu, sdu, Some(r.clone()));
+        }
+        assert!(sched.ul_defer_to_channel(at(3, 3), radio(), &ReservationRequirement::Req4Slots));
+        let slots = finalize_slots(&mut sched, 16);
+        let carried: Vec<(TdmaTime, Option<(usize, usize)>)> = slots
+            .iter()
+            .filter(|s| dl_pdus(s).iter().any(|p| p.1 == Some(RADIO)))
+            .map(|s| (s.ts, grant_in(s)))
+            .collect();
+        assert_eq!(carried, vec![(at(4, 3), Some((4, 0))), (at(6, 4), None), (at(7, 3), None)]);
+        assert!(reporters.iter().all(|r| r.is_transmitted()));
+        assert!(sched.pdch_channel_debt[2].is_none(), "nothing owed any more");
+    }
+
     /// When the channel goes, what was queued on it for its radio and what it was owed go too.
     #[test]
     fn test_losing_a_multislot_channel_drops_its_queue() {
