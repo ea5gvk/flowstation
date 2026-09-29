@@ -764,6 +764,13 @@ impl UmacBs {
             prim.pdu.dump_bin_full(true)
         );
 
+        // A radio on its packet-data channel of several slots with nothing more to send (no
+        // reservation requirement) no longer uses the slots it holds there (23.5.2.3.1).
+        let on_main = carrier_num == self.main_carrier();
+        if on_main && pdu.reservation_req.is_none() && !is_frag_start && !second_half_stolen {
+            self.channel_scheduler.ul_release_after(self.dltime.add_timeslots(-2), addr.ssi);
+        }
+
         if is_null_pdu {
             // TODO not sure if there is scenarios in which we want to pass a null pdu to the LLC
             // tracing::warn!("rx_mac_data: Null PDU not passed to LLC");
@@ -778,18 +785,22 @@ impl UmacBs {
 
         // Handle reservation if present
         let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago.
-        if carrier_num == self.main_carrier() {
+        if on_main {
             self.channel_scheduler.pdch_random_access(msg_dltime, prim.block_num, addr.ssi);
         }
         if let Some(res_req) = &pdu.reservation_req {
-            let grant_result = self.scheduler_for_mut(carrier_num).ul_process_cap_req(msg_dltime.t, addr, res_req);
-            if let Some((grant, usage_marker)) = grant_result {
-                // Schedule grant — marker propagates into the MAC-RESOURCE ACK
-                // so the MS can tag its reservation when continuing the burst.
-                self.scheduler_for_mut(carrier_num)
-                    .dl_enqueue_grant(msg_dltime.t, addr, grant, usage_marker);
-            } else {
-                tracing::warn!("rx_mac_data: No grant for reservation request {:?}", res_req);
+            // On a packet-data channel of several slots it is granted when a slot of the channel
+            // the radio hears is built.
+            if !(on_main && self.channel_scheduler.ul_defer_to_channel(msg_dltime, addr, res_req)) {
+                let grant_result = self.scheduler_for_mut(carrier_num).ul_process_cap_req(msg_dltime.t, addr, res_req);
+                if let Some((grant, usage_marker)) = grant_result {
+                    // Schedule grant — marker propagates into the MAC-RESOURCE ACK
+                    // so the MS can tag its reservation when continuing the burst.
+                    self.scheduler_for_mut(carrier_num)
+                        .dl_enqueue_grant(msg_dltime.t, addr, grant, usage_marker);
+                } else {
+                    tracing::warn!("rx_mac_data: No grant for reservation request {:?}", res_req);
+                }
             }
         };
 
@@ -923,6 +934,13 @@ impl UmacBs {
             prim.pdu.dump_bin_full(true)
         );
 
+        // An SCH/HU block without a reservation requirement: the radio no longer uses what it
+        // holds on its packet-data channel of several slots (23.5.2.3.1).
+        let on_main = carrier_num == self.main_carrier();
+        if on_main && pdu.reservation_req.is_none() && !pdu.is_frag_start() {
+            self.channel_scheduler.ul_release_after(self.dltime.add_timeslots(-2), addr.ssi);
+        }
+
         if pdu.is_null_pdu() {
             // tracing::warn!("rx_mac_access: Null PDU not passed to LLC");
             return;
@@ -934,7 +952,7 @@ impl UmacBs {
         // Marking those as RA causes the next stolen downlink MAC-RESOURCE to carry
         // random_access_flag=true, which some radios reject during call setup.
         let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago.
-        if carrier_num == self.main_carrier() {
+        if on_main {
             self.channel_scheduler.pdch_random_access(msg_dltime, prim.block_num, addr.ssi);
         }
         if msg_dltime.t == 1 && !self.scheduler_for(carrier_num).allow_mcch() {
@@ -982,14 +1000,18 @@ impl UmacBs {
 
         // Handle reservation if present
         if let Some(res_req) = &pdu.reservation_req {
-            let grant_result = self.scheduler_for_mut(carrier_num).ul_process_cap_req(msg_dltime.t, addr, res_req);
-            if let Some((grant, usage_marker)) = grant_result {
-                // Schedule grant — marker propagates into the MAC-RESOURCE ACK
-                // so the MS can tag its reservation when continuing the burst.
-                self.scheduler_for_mut(carrier_num)
-                    .dl_enqueue_grant(msg_dltime.t, addr, grant, usage_marker);
-            } else {
-                tracing::warn!("rx_mac_access: No grant for reservation request {:?}", res_req);
+            // On a packet-data channel of several slots it is granted when a slot of the channel
+            // the radio hears is built.
+            if !(on_main && self.channel_scheduler.ul_defer_to_channel(msg_dltime, addr, res_req)) {
+                let grant_result = self.scheduler_for_mut(carrier_num).ul_process_cap_req(msg_dltime.t, addr, res_req);
+                if let Some((grant, usage_marker)) = grant_result {
+                    // Schedule grant — marker propagates into the MAC-RESOURCE ACK
+                    // so the MS can tag its reservation when continuing the burst.
+                    self.scheduler_for_mut(carrier_num)
+                        .dl_enqueue_grant(msg_dltime.t, addr, grant, usage_marker);
+                } else {
+                    tracing::warn!("rx_mac_access: No grant for reservation request {:?}", res_req);
+                }
             }
         };
 
@@ -1166,6 +1188,12 @@ impl UmacBs {
             tracing::debug!("rx_mac_end_ul: Received MAC-END-UL for unassigned block {:?}", prim.block_num);
             return;
         };
+        // Without a reservation requirement the radio no longer uses what it holds on its
+        // packet-data channel of several slots (23.5.2.3.1).
+        let on_main = carrier_num == self.main_carrier();
+        if on_main && pdu.reservation_req.is_none() {
+            self.channel_scheduler.ul_release_after(msg_dltime, slot_owner);
+        }
         if let Some(_aie_info) = self.defrag.get_aie_info(slot_owner, msg_dltime) {
             unimplemented_log!("rx_mac_end_ul: Encryption not supported");
             return;
@@ -1180,16 +1208,20 @@ impl UmacBs {
 
         // Handle reservation if present
         if let Some(res_req) = &pdu.reservation_req {
-            let grant_result = self
-                .scheduler_for_mut(carrier_num)
-                .ul_process_cap_req(msg_dltime.t, defragbuf.addr, res_req);
-            if let Some((grant, usage_marker)) = grant_result {
-                // Schedule grant — marker propagates into the MAC-RESOURCE ACK
-                // so the MS can tag its reservation when continuing the burst.
-                self.scheduler_for_mut(carrier_num)
-                    .dl_enqueue_grant(msg_dltime.t, defragbuf.addr, grant, usage_marker);
-            } else {
-                tracing::warn!("rx_mac_end_ul: No grant for reservation request {:?}", res_req);
+            // On a packet-data channel of several slots it is granted when a slot of the channel
+            // the radio hears is built.
+            if !(on_main && self.channel_scheduler.ul_defer_to_channel(msg_dltime, defragbuf.addr, res_req)) {
+                let grant_result = self
+                    .scheduler_for_mut(carrier_num)
+                    .ul_process_cap_req(msg_dltime.t, defragbuf.addr, res_req);
+                if let Some((grant, usage_marker)) = grant_result {
+                    // Schedule grant — marker propagates into the MAC-RESOURCE ACK
+                    // so the MS can tag its reservation when continuing the burst.
+                    self.scheduler_for_mut(carrier_num)
+                        .dl_enqueue_grant(msg_dltime.t, defragbuf.addr, grant, usage_marker);
+                } else {
+                    tracing::warn!("rx_mac_end_ul: No grant for reservation request {:?}", res_req);
+                }
             }
         };
 
@@ -1295,6 +1327,12 @@ impl UmacBs {
             self.scheduler_for(carrier_num).dump_ul_schedule_full(true);
             return;
         };
+        // An SCH/HU block without a reservation requirement: the radio no longer uses what it
+        // holds on its packet-data channel of several slots (23.5.2.3.1).
+        let on_main = carrier_num == self.main_carrier();
+        if on_main && pdu.reservation_req.is_none() {
+            self.channel_scheduler.ul_release_after(msg_dltime, slot_owner);
+        }
         if let Some(_aie_info) = self.defrag.get_aie_info(slot_owner, msg_dltime) {
             unimplemented_log!("rx_mac_end_hu: Encryption not supported");
             return;
@@ -1309,16 +1347,20 @@ impl UmacBs {
 
         // Handle reservation if present
         if let Some(res_req) = &pdu.reservation_req {
-            let grant_result = self
-                .scheduler_for_mut(carrier_num)
-                .ul_process_cap_req(msg_dltime.t, defragbuf.addr, res_req);
-            if let Some((grant, usage_marker)) = grant_result {
-                // Schedule grant — marker propagates into the MAC-RESOURCE ACK
-                // so the MS can tag its reservation when continuing the burst.
-                self.scheduler_for_mut(carrier_num)
-                    .dl_enqueue_grant(msg_dltime.t, defragbuf.addr, grant, usage_marker);
-            } else {
-                tracing::warn!("rx_mac_end_hu: No grant for reservation request {:?}", res_req);
+            // On a packet-data channel of several slots it is granted when a slot of the channel
+            // the radio hears is built.
+            if !(on_main && self.channel_scheduler.ul_defer_to_channel(msg_dltime, defragbuf.addr, res_req)) {
+                let grant_result = self
+                    .scheduler_for_mut(carrier_num)
+                    .ul_process_cap_req(msg_dltime.t, defragbuf.addr, res_req);
+                if let Some((grant, usage_marker)) = grant_result {
+                    // Schedule grant — marker propagates into the MAC-RESOURCE ACK
+                    // so the MS can tag its reservation when continuing the burst.
+                    self.scheduler_for_mut(carrier_num)
+                        .dl_enqueue_grant(msg_dltime.t, defragbuf.addr, grant, usage_marker);
+                } else {
+                    tracing::warn!("rx_mac_end_hu: No grant for reservation request {:?}", res_req);
+                }
             }
         };
 
@@ -1494,11 +1536,16 @@ impl UmacBs {
             14 => Some(tetra_pdus::umac::enums::reservation_requirement::ReservationRequirement::ReqOver68),
             _ => None,
         };
-        if let Some(res_req) = res_req {
-            match self.channel_scheduler.ul_process_cap_req(msg_dltime.t, addr, &res_req) {
+        match res_req {
+            // On a packet-data channel of several slots it is granted when a slot of the channel
+            // the radio hears is built.
+            Some(res_req) if self.channel_scheduler.ul_defer_to_channel(msg_dltime, addr, &res_req) => {}
+            Some(res_req) => match self.channel_scheduler.ul_process_cap_req(msg_dltime.t, addr, &res_req) {
                 Some((grant, usage_marker)) => self.channel_scheduler.dl_enqueue_grant(msg_dltime.t, addr, grant, usage_marker),
                 None => tracing::warn!("rx_ul_mac_u_blck: No grant for reservation request {:?}", res_req),
-            }
+            },
+            // "No reservation requirement": the radio no longer uses what it holds (23.5.2.3.1).
+            None => self.channel_scheduler.ul_release_after(msg_dltime, ssi),
         }
         if pdu.encrypted {
             unimplemented_log!("rx_ul_mac_u_blck: Encryption mode > 0");

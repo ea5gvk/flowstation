@@ -53,6 +53,11 @@ impl BsFragger {
         self.mac_hdr_is_written
     }
 
+    /// The MAC-RESOURCE of a PDU nothing of which went out yet, to change it before it does.
+    pub fn unsent_resource_mut(&mut self) -> Option<&mut MacResource> {
+        (!self.mac_hdr_is_written).then_some(&mut self.resource)
+    }
+
     /// MAC-RESOURCE header and TM-SDU, in bits, before anything went out.
     pub fn whole_len_bits(&self) -> usize {
         self.resource.compute_header_len() + self.sdu.get_len_remaining()

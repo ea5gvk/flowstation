@@ -167,6 +167,14 @@ pub struct BsChannelScheduler {
     /// slots, by the channel's lowest slot: the slot right after it is not received on the new
     /// channel (see `multislot`).
     pdch_assigned_at: [Option<TdmaTime>; 4],
+
+    /// Uplink capacity owed to the radio of a packet-data channel of several slots, by the
+    /// channel's lowest slot, granted when a slot of the channel it hears is built (see
+    /// `multislot`). Never in `pdch_ul_debt`, which keeps its one-slot meaning.
+    pdch_channel_debt: [Option<multislot::ChannelDebt>; 4],
+
+    /// The grant `multislot` placed in the slot being built, checked once it is built.
+    pdch_lazy: Option<multislot::LazyGrant>,
 }
 
 #[derive(Debug)]
@@ -230,6 +238,8 @@ impl BsChannelScheduler {
             pdch: [None; 4],
             pdch_ul_debt: [None; 4],
             pdch_assigned_at: [None; 4],
+            pdch_channel_debt: [None; 4],
+            pdch_lazy: None,
         }
     }
 
@@ -352,9 +362,13 @@ impl BsChannelScheduler {
         if old == owner {
             return;
         }
+        if let Some(old) = old {
+            self.pdch_note_uplink_left_behind(old);
+        }
         self.pdch[idx] = owner;
         self.pdch_ul_debt[idx] = None;
         self.pdch_assigned_at[idx] = None;
+        self.pdch_channel_debt[idx] = None;
         if let Some(old) = old {
             let dropped = self.dl_drop_queued_for_ssi(ts, old);
             tracing::info!(
@@ -1783,7 +1797,11 @@ impl BsChannelScheduler {
             // it transmits or switches: nothing goes on it then (see `multislot`).
             let buf = if self.pdch_radio_hears(ts) {
                 self.dl_integrate_sched_elems_for_timeslot(ts);
-                self.dl_build_block_from_signalling_schedule(ts)
+                // Its uplink capacity is granted in the slot that carries the grant.
+                self.pdch_lazy_grant(ts);
+                let buf = self.dl_build_block_from_signalling_schedule(ts);
+                self.pdch_check_lazy_grant(ts);
+                buf
             } else {
                 None
             };
