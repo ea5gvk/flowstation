@@ -79,6 +79,12 @@ pub struct UmacBs {
     /// Last slot two radios' packet-data channels both claimed (timeslot, ISSI kept, ISSI
     /// refused), warned once.
     pdch_conflict: Option<(u8, u32, u32)>,
+    /// The uplink MAC block being read: a PDU in it said its radio has nothing more to send (its
+    /// uplink slot and ISSI), and whether a PDU in it carried a reservation requirement. With
+    /// association the requirement is in the last PDU (23.5.2.1) and 23.5.2.3.1 judges the
+    /// block, so the radio's multislot reservations are freed once the whole block is read.
+    ul_block_release: Option<(TdmaTime, u32)>,
+    ul_block_requirement: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -127,6 +133,8 @@ impl UmacBs {
             telemetry,
             pdch_mode,
             pdch_conflict: None,
+            ul_block_release: None,
+            ul_block_requirement: false,
         }
     }
 
@@ -535,6 +543,8 @@ impl UmacBs {
             return;
         };
         tracing::trace!("rx_tmv_unitdata_ind: {:?}", prim.logical_channel);
+        self.ul_block_release = None;
+        self.ul_block_requirement = false;
 
         match prim.logical_channel {
             LogicalChannel::SchF => {
@@ -568,6 +578,14 @@ impl UmacBs {
             other => {
                 tracing::warn!("rx_tmv_unitdata_ind: unhandled logical channel {:?}, dropping", other);
             }
+        }
+        // A radio on its packet-data channel of several slots with nothing more to send (no
+        // reservation requirement in the block) no longer uses the slots it holds there
+        // (23.5.2.3.1).
+        if let Some((label, ssi)) = self.ul_block_release.take()
+            && !self.ul_block_requirement
+        {
+            self.channel_scheduler.ul_release_after(label, ssi);
         }
     }
 
@@ -786,10 +804,12 @@ impl UmacBs {
         );
 
         // A radio on its packet-data channel of several slots with nothing more to send (no
-        // reservation requirement) no longer uses the slots it holds there (23.5.2.3.1).
+        // reservation requirement) no longer uses the slots it holds there (23.5.2.3.1), once
+        // the rest of the block says so too.
         let on_main = carrier_num == self.main_carrier();
+        self.ul_block_requirement |= pdu.reservation_req.is_some();
         if on_main && pdu.reservation_req.is_none() && !is_frag_start && !second_half_stolen {
-            self.channel_scheduler.ul_release_after(self.dltime.add_timeslots(-2), addr.ssi);
+            self.ul_block_release = Some((self.dltime.add_timeslots(-2), addr.ssi));
         }
 
         if is_null_pdu {
@@ -959,8 +979,9 @@ impl UmacBs {
         // An SCH/HU block without a reservation requirement: the radio no longer uses what it
         // holds on its packet-data channel of several slots (23.5.2.3.1).
         let on_main = carrier_num == self.main_carrier();
+        self.ul_block_requirement |= pdu.reservation_req.is_some();
         if on_main && pdu.reservation_req.is_none() && !pdu.is_frag_start() {
-            self.channel_scheduler.ul_release_after(self.dltime.add_timeslots(-2), addr.ssi);
+            self.ul_block_release = Some((self.dltime.add_timeslots(-2), addr.ssi));
         }
 
         if pdu.is_null_pdu() {
@@ -1213,10 +1234,12 @@ impl UmacBs {
             return;
         };
         // Without a reservation requirement the radio no longer uses what it holds on its
-        // packet-data channel of several slots (23.5.2.3.1).
+        // packet-data channel of several slots (23.5.2.3.1), once the rest of the block says so
+        // too.
         let on_main = carrier_num == self.main_carrier();
+        self.ul_block_requirement |= pdu.reservation_req.is_some();
         if on_main && pdu.reservation_req.is_none() {
-            self.channel_scheduler.ul_release_after(msg_dltime, slot_owner);
+            self.ul_block_release = Some((msg_dltime, slot_owner));
         }
         let key = self.defrag_time(prim.carrier_num, msg_dltime, slot_owner);
         if let Some(_aie_info) = self.defrag.get_aie_info(slot_owner, key) {
@@ -1355,8 +1378,9 @@ impl UmacBs {
         // An SCH/HU block without a reservation requirement: the radio no longer uses what it
         // holds on its packet-data channel of several slots (23.5.2.3.1).
         let on_main = carrier_num == self.main_carrier();
+        self.ul_block_requirement |= pdu.reservation_req.is_some();
         if on_main && pdu.reservation_req.is_none() {
-            self.channel_scheduler.ul_release_after(msg_dltime, slot_owner);
+            self.ul_block_release = Some((msg_dltime, slot_owner));
         }
         let key = self.defrag_time(prim.carrier_num, msg_dltime, slot_owner);
         if let Some(_aie_info) = self.defrag.get_aie_info(slot_owner, key) {

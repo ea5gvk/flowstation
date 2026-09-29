@@ -3637,6 +3637,51 @@ fn uplink_grant_and_reassembly_across_the_channel() {
     );
 }
 
+/// With PDU association the reservation requirement is in the last PDU of the block (EN 300
+/// 392-2 23.5.2.1), and "nothing more to send" is judged per block (23.5.2.3.1): a MAC-DATA
+/// with a length and no requirement, followed in its block by one opening a fragmentation and
+/// asking for 2 slots, leaves the radio the 3 slots it still holds on its channel {3, 4}. Its
+/// MAC-FRAG and MAC-END in the next two are reassembled.
+#[test]
+fn associated_pdus_keep_the_multislot_reservations_of_their_block() {
+    use tetra_pdus::umac::enums::reservation_requirement::ReservationRequirement;
+    debug::setup_logging_verbose();
+    let mut air = UmacAir::new(multislot_config(false, 2));
+    grant_pdch_slots(&air.test.config, ISSI, &[4, 3], true);
+    let bits = |n: usize, k: usize| -> String { (0..n).map(|i| if (i * k) % 5 < 2 { '1' } else { '0' }).collect() };
+    // MAC-DATA: type 00, fill, not encrypted, address type 00 and address, capacity request
+    // (fragmentation flag, requirement, reserved bit) or length indication.
+    let with_req = |fill: bool, frag: bool, req: ReservationRequirement| {
+        format!("00{}000{ISSI:024b}1{}{:04b}0", u8::from(fill), u8::from(frag), req as u64)
+    };
+    let s0 = bits(100, 3);
+    let start = TdmaTime { t: 3, f: 3, m: 1, h: 0 };
+    let header = with_req(true, false, ReservationRequirement::Req4Slots);
+    air.uplink_at(start, from_lmac(uplink_block(&header, &s0)));
+    let (at, slots, delay) = air.next_grant(ISSI, 16);
+    assert_eq!(slots, 4, "the 4 slots asked for");
+    let labels = ms_granted_labels(at, delay, slots, &[3, 4]);
+
+    // 37-bit header and 19 bits: 7 octets, no fill bits; then the fragmentation start.
+    let s1 = bits(19, 7);
+    let s2 = bits(450, 11);
+    let (first, frag, end) = (&s2[..150], &s2[150..300], &s2[300..]);
+    let header = format!(
+        "000000{ISSI:024b}0{:06b}{s1}{}",
+        7,
+        with_req(true, true, ReservationRequirement::Req2Slots)
+    );
+    air.uplink_at(labels[0], from_lmac(uplink_block(&header, first)));
+    air.uplink_at(labels[1], from_lmac(uplink_block("0101", frag)));
+    let end_octets = (10 + end.len() + 1).div_ceil(8);
+    air.uplink_at(labels[2], from_lmac(uplink_block(&format!("0111{end_octets:06b}"), end)));
+    for _ in 0..4 {
+        air.tick();
+    }
+    let up: Vec<String> = air.up.iter().map(|u| u.pdu.as_ref().unwrap().to_bitstr()).collect();
+    assert_eq!(up, vec![s0, s1, s2]);
+}
+
 /// A BL-DATA from the radio on a slot of its channel other than the one its PDUs are sent to
 /// is acknowledged on the channel, not stolen as if the slot carried a call; and a BL-DATA going
 /// down to it meanwhile carries that acknowledgement (BL-ADATA, 22.3.2.3 d).
