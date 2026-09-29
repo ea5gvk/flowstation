@@ -3666,3 +3666,30 @@ fn a_bl_ack_for_an_uplink_on_another_slot_stays_on_the_pdch() {
     let adata = mine.iter().find(|d| d.llc == LlcPduType::BlAdata).expect("BL-ADATA");
     assert_eq!((adata.link_id, adata.stealing), (4, false));
 }
+
+/// The AL-SETUP answer gives N.264 at most the slots a radio's channel may have here: the lower
+/// of the radio's proposal and `pdch_max_slots` (within `pdch_timeslots`); 1 by default and with
+/// the bearer on the MCCH.
+#[test]
+fn al_setup_answers_the_multislot_cap() {
+    let slots = |n: u8| {
+        let mut setup = radio_al_setup();
+        setup.connection_width = true;
+        setup.uplink_timeslots = Some(n - 1);
+        setup
+    };
+    let answer = |cfg: StackConfig, n: u8| {
+        let mut air = Air::new(cfg);
+        let a = air.al_setup_with(ISSI, slots(n));
+        (a.setup_report, a.uplink_timeslots.map(|s| s + 1))
+    };
+    assert_eq!(
+        answer(multislot_config(false, 3), 4),
+        (AlSetup::SETUP_REPORT_SERVICE_CHANGE, Some(3))
+    );
+    assert_eq!(answer(multislot_config(false, 3), 2), (AlSetup::SETUP_REPORT_SUCCESS, Some(2)));
+    let mut mcch = config(true, false);
+    mcch.packet_data.pdch_max_slots = 3;
+    assert_eq!(answer(mcch, 4), (AlSetup::SETUP_REPORT_SERVICE_CHANGE, Some(1)));
+    assert_eq!(answer(pdch_config(false), 4), (AlSetup::SETUP_REPORT_SERVICE_CHANGE, Some(1)));
+}

@@ -18,8 +18,9 @@
 //!   TL-SDU up to N.273 times; after that the link is closed with AL-DISC.
 //! - Voice first: the engine never steals (every PDU goes on the MCCH with link 0, or on the
 //!   radio's packet-data channel) and keeps at most one data segment waiting in the MAC, so a call
-//!   set-up waits behind one segment at most. While a radio is in a call its TL-SDU under way
-//!   waits: no segments, T.252 held.
+//!   set-up waits behind one segment at most. A link on a packet-data channel of several slots,
+//!   whose PDUs never go on the MCCH, keeps one segment per slot of its channel in the MAC
+//!   instead. While a radio is in a call its TL-SDU under way waits: no segments, T.252 held.
 //! - Uplink segments are reassembled within the TL-SDU window, checked against the FCS and
 //!   delivered in N(S) order as TL-DATA indications; AL-DATA-AR / AL-FINAL-AR get an AL-ACK
 //!   (complete, selective or "repeat").
@@ -58,7 +59,8 @@ const AL_ACK_MAX_BITS: usize = SCH_F_CAP - MAC_RESOURCE_HEADER_BITS;
 /// An acknowledgement is requested at least every this many segments.
 const SEGMENTS_PER_ACK_REQUEST: usize = 4;
 
-/// Negotiation limit: 1 phase-modulation slot (the data rides on the MCCH or a 1-slot PDCH).
+/// Negotiation limit by default: 1 phase-modulation slot (the data rides on the MCCH or a 1-slot
+/// PDCH). `[packet_data] pdch_max_slots` raises it (`AdvancedLinkEngine::set_max_timeslots`).
 const MAX_TIMESLOTS: u8 = 1;
 /// Retransmissions of our TL-SDUs at most (fewer retries on the shared MCCH): N.273 and N.274
 /// are the radio's as agreed, the station just gives up sooner.
@@ -111,6 +113,13 @@ fn report_failed(r: &TxReporter) {
 /// original link instead ("service change"), always a non-augmented original acknowledged link
 /// (clause 22.2.2.1).
 pub fn negotiate_setup(proposal: &AlSetup) -> AlSetup {
+    negotiate_setup_with(proposal, MAX_TIMESLOTS)
+}
+
+/// `negotiate_setup` with at most `max_timeslots` phase-modulation slots: N.264 is the lower of
+/// the radio's proposal and that (the responder may only lower it, clause 22.2.2.1 NOTE 2 and
+/// 28.3.4.2 b NOTE 5).
+pub fn negotiate_setup_with(proposal: &AlSetup, max_timeslots: u8) -> AlSetup {
     let mut answer = *proposal;
     let mut changed = false;
     if let Some(aug) = proposal.augmented {
@@ -124,7 +133,7 @@ pub fn negotiate_setup(proposal: &AlSetup) -> AlSetup {
         answer.augmented = None;
     }
     if answer.connection_width {
-        answer = answer.response_with_lower_phase_mod_timeslots(MAX_TIMESLOTS);
+        answer = answer.response_with_lower_phase_mod_timeslots(max_timeslots);
         changed |= answer.setup_report == AlSetup::SETUP_REPORT_SERVICE_CHANGE;
     }
     answer.ns = None;
@@ -226,6 +235,9 @@ struct Link {
     rnr_since: Option<u64>,
     /// The radio is in a call: sending waits.
     held: bool,
+    /// On a packet-data channel of several slots: last report on a segment in the MAC (or when
+    /// one went in), for the guard against a MAC that never reports.
+    in_mac_since: Option<u64>,
     // Receiving side: V(R), the TL-SDUs in the window and the delivered ones not acknowledged yet.
     vr: u8,
     rx: HashMap<u8, RxSdu>,
@@ -248,6 +260,7 @@ impl Link {
             tx: None,
             rnr_since: None,
             held: false,
+            in_mac_since: None,
             vr: 0,
             rx: HashMap::new(),
             acks_owed: Vec::new(),
@@ -296,10 +309,12 @@ pub struct AdvancedLinkEngine {
     disc_sent: HashMap<u32, u64>,
     /// Messages pushed since the last tick.
     activity: bool,
-    /// Radios on a packet-data channel (carrier, timeslot): their PDUs go there.
-    pdch_routes: HashMap<u32, (u16, u8)>,
+    /// Radios on a packet-data channel (carrier, timeslot, number of slots): their PDUs go there.
+    pdch_routes: HashMap<u32, (u16, u8, usize)>,
     /// Radios in a call (among those with something to send): their sending waits.
     in_call: HashSet<u32>,
+    /// Phase-modulation slots an AL-SETUP is answered with at most (N.264).
+    max_timeslots: u8,
 }
 
 impl Default for AdvancedLinkEngine {
@@ -322,12 +337,24 @@ impl AdvancedLinkEngine {
             activity: false,
             pdch_routes: HashMap::new(),
             in_call: HashSet::new(),
+            max_timeslots: MAX_TIMESLOTS,
         }
     }
 
-    /// The radios now on a packet-data channel (`[packet_data] bearer = "pdch"`).
-    pub fn set_pdch_routes(&mut self, routes: HashMap<u32, (u16, u8)>) {
+    /// Answer AL-SETUPs with at most `n` phase-modulation slots (`[packet_data] pdch_max_slots`).
+    pub fn set_max_timeslots(&mut self, n: u8) {
+        self.max_timeslots = n.clamp(1, 4);
+    }
+
+    /// The radios now on a packet-data channel (`[packet_data] bearer = "pdch"`): carrier, the
+    /// slot their PDUs go to and the channel's number of slots.
+    pub fn set_pdch_routes(&mut self, routes: HashMap<u32, (u16, u8, usize)>) {
         self.pdch_routes = routes;
+    }
+
+    /// Slots of the packet-data channel of `ssi`: 1 without one (the MCCH).
+    fn width(&self, ssi: u32) -> usize {
+        self.pdch_routes.get(&ssi).map_or(1, |r| r.2.max(1))
     }
 
     /// Radios with a TL-SDU to send or under way.
@@ -354,7 +381,7 @@ impl AdvancedLinkEngine {
     fn route(&self, ssi: u32, main_carrier: u16) -> (u16, u32) {
         self.pdch_routes
             .get(&ssi)
-            .map_or((main_carrier, 0), |&(carrier, ts)| (carrier, u32::from(ts)))
+            .map_or((main_carrier, 0), |&(carrier, ts, _)| (carrier, u32::from(ts)))
     }
 
     fn push_pdu(&mut self, queue: &mut MessageQueue, addr: TetraAddress, pdu: BitBuffer, reporter: Option<TxReporter>, main: u16) {
@@ -480,7 +507,7 @@ impl AdvancedLinkEngine {
             }
             let agreed = match self.pending.remove(&ssi) {
                 Some(p) if p.answer.advanced_link_number == setup.advanced_link_number => p.answer,
-                _ => negotiate_setup(&setup),
+                _ => negotiate_setup_with(&setup, self.max_timeslots),
             };
             self.establish(addr, &agreed);
             tracing::info!(
@@ -491,7 +518,7 @@ impl AdvancedLinkEngine {
             );
             return;
         }
-        let answer = negotiate_setup(&setup);
+        let answer = negotiate_setup_with(&setup, self.max_timeslots);
         let report = match setup.setup_report {
             AlSetup::SETUP_REPORT_SERVICE_DEFINITION => "service definition",
             AlSetup::SETUP_REPORT_SERVICE_CHANGE => "service change",
@@ -963,6 +990,7 @@ impl AdvancedLinkEngine {
         }
 
         self.send_next_segment(queue, main);
+        self.send_multislot_segments(queue, main);
         self.activity
     }
 
@@ -1010,6 +1038,7 @@ impl AdvancedLinkEngine {
         }
         let Some(tx) = link.tx.as_mut() else { return };
         // MAC reports on the segments under way.
+        let mut reported = false;
         for seg in &mut tx.segments {
             let Some((reporter, ar)) = seg.in_mac.as_ref() else { continue };
             match reporter.get_state() {
@@ -1018,6 +1047,7 @@ impl AdvancedLinkEngine {
                     seg.in_mac = None;
                     seg.sends = seg.sends.saturating_sub(1);
                     seg.need_tx = !seg.acked;
+                    reported = true;
                 }
                 _ => {
                     self.order += 1;
@@ -1027,8 +1057,12 @@ impl AdvancedLinkEngine {
                         tx.last_ar_order = self.order;
                     }
                     seg.in_mac = None;
+                    reported = true;
                 }
             }
+        }
+        if reported {
+            link.in_mac_since = tx.segments.iter().any(|s| s.in_mac.is_some()).then_some(clock);
         }
         if tx.segments.iter().all(|s| s.sends > 0 && !s.need_tx && s.in_mac.is_none()) {
             report_transmitted(&tx.service);
@@ -1075,7 +1109,7 @@ impl AdvancedLinkEngine {
         self.send_disc(queue, addr, disc, main);
     }
 
-    /// The next link with a segment to send, round robin.
+    /// The next link on the MCCH or a one-slot channel with a segment to send, round robin.
     fn next_to_serve(&self) -> Option<u32> {
         let mut ssis: Vec<u32> = self
             .links
@@ -1083,6 +1117,7 @@ impl AdvancedLinkEngine {
             .filter(|(ssi, l)| {
                 l.connected()
                     && !self.in_call.contains(ssi)
+                    && self.width(**ssi) == 1
                     && match &l.tx {
                         Some(tx) => tx.segments.iter().all(|s| s.in_mac.is_none()) && tx.segments.iter().any(|s| s.need_tx),
                         None => !l.queue.is_empty() && l.rnr_since.is_none(),
@@ -1119,24 +1154,90 @@ impl AdvancedLinkEngine {
         }
         let Some(ssi) = self.next_to_serve() else { return };
         self.last_served = Some(ssi);
+        let Some(reporter) = self.send_segment(queue, ssi, main) else { return };
+        self.inflight = Some(Inflight {
+            ssi,
+            reporter,
+            since: self.clock,
+        });
+    }
+
+    /// Links on a packet-data channel of several slots (whose PDUs never go on the MCCH): each
+    /// keeps up to one segment per slot of its channel in the MAC, outside the one-segment rule
+    /// of the MCCH. Segments the MAC never reports on go again after `INFLIGHT_GUARD_SLOTS`.
+    fn send_multislot_segments(&mut self, queue: &mut MessageQueue, main: u16) {
         let clock = self.clock;
-        let Some(link) = self.links.get_mut(&ssi) else { return };
+        let mut ssis: Vec<u32> = self
+            .links
+            .iter()
+            .filter(|(ssi, l)| l.connected() && !self.in_call.contains(ssi) && self.width(**ssi) > 1)
+            .map(|(ssi, _)| *ssi)
+            .collect();
+        ssis.sort_unstable();
+        for ssi in ssis {
+            let width = self.width(ssi);
+            let in_mac = |l: &Link| l.tx.as_ref().map_or(0, |tx| tx.segments.iter().filter(|s| s.in_mac.is_some()).count());
+            if let Some(link) = self.links.get_mut(&ssi) {
+                if in_mac(link) == 0 {
+                    link.in_mac_since = None;
+                } else if link.in_mac_since.is_some_and(|t| clock.saturating_sub(t) >= INFLIGHT_GUARD_SLOTS)
+                    && let Some(tx) = link.tx.as_mut()
+                {
+                    tracing::debug!(
+                        "LLC: the MAC never reported the AL segments for ISSI {}, not waiting for them any longer",
+                        ssi
+                    );
+                    for seg in &mut tx.segments {
+                        if seg.in_mac.take().is_some() {
+                            seg.need_tx = !seg.acked;
+                        }
+                    }
+                    link.in_mac_since = None;
+                }
+            }
+            loop {
+                let Some(link) = self.links.get(&ssi) else { break };
+                let more = match &link.tx {
+                    Some(tx) => tx.segments.iter().any(|s| s.need_tx && !s.acked && s.in_mac.is_none()),
+                    None => !link.queue.is_empty() && link.rnr_since.is_none(),
+                };
+                if !more || in_mac(link) >= width || self.send_segment(queue, ssi, main).is_none() {
+                    break;
+                }
+                if let Some(link) = self.links.get_mut(&ssi)
+                    && link.in_mac_since.is_none()
+                {
+                    link.in_mac_since = Some(clock);
+                }
+            }
+        }
+    }
+
+    /// Push the next segment of the link of `ssi` to the MAC: the first one to send that is not
+    /// there yet, of the TL-SDU under way or of the next one queued. A segment past N.274 sends
+    /// the whole TL-SDU again (N.273), once nothing of it is left in the MAC; past N.273 the link
+    /// is closed. Returns the segment's report.
+    fn send_segment(&mut self, queue: &mut MessageQueue, ssi: u32, main: u16) -> Option<TxReporter> {
+        let clock = self.clock;
+        let width = self.width(ssi);
+        let link = self.links.get_mut(&ssi)?;
         link.last_activity = clock;
         if link.tx.is_none() {
-            let Some((sdu, service)) = link.queue.pop_front() else { return };
+            let (sdu, service) = link.queue.pop_front()?;
             let ns = link.next_ns;
             link.next_ns = (ns + 1) & 7;
             link.tx = Some(start_sdu(ns, sdu, service));
         }
         let (n273, n274, al_number, addr) = (link.n273, link.n274, link.al_number, link.addr);
-        let Some(tx) = link.tx.as_mut() else { return };
-        let Some(idx) = tx.segments.iter().position(|s| s.need_tx && !s.acked) else {
-            return;
-        };
+        let tx = link.tx.as_mut()?;
+        let idx = tx.segments.iter().position(|s| s.need_tx && !s.acked && s.in_mac.is_none())?;
         if tx.segments[idx].sends > n274 {
+            if tx.segments.iter().any(|s| s.in_mac.is_some()) {
+                return None;
+            }
             if tx.sdu_retx >= n273 {
                 self.fail_link(queue, ssi, "N.274 and N.273 exhausted", main);
-                return;
+                return None;
             }
             restart_sdu(tx);
             tracing::info!(
@@ -1148,12 +1249,12 @@ impl AdvancedLinkEngine {
                 tx.sdu_retx + 1
             );
         }
-        let Some(idx) = tx.segments.iter().position(|s| s.need_tx && !s.acked) else {
-            return;
-        };
+        let idx = tx.segments.iter().position(|s| s.need_tx && !s.acked && s.in_mac.is_none())?;
         let last = tx.segments.len() - 1;
         let others_waiting = tx.segments[idx + 1..].iter().any(|s| s.need_tx && !s.acked);
-        let ar = idx == last || (idx + 1) % SEGMENTS_PER_ACK_REQUEST == 0 || !others_waiting;
+        // On a channel of several slots fewer acknowledgement requests (each answer makes the
+        // half-duplex radio deaf around it): one every SEGMENTS_PER_ACK_REQUEST per slot.
+        let ar = idx == last || (idx + 1) % (SEGMENTS_PER_ACK_REQUEST * width) == 0 || !others_waiting;
         let header = AlData {
             final_segment: idx == last,
             acknowledgement_requested: ar,
@@ -1177,11 +1278,7 @@ impl AdvancedLinkEngine {
         pdu.seek(0);
         tracing::debug!("LLC: -> ISSI {} {} ({} bits)", ssi, header, len);
         self.push_pdu(queue, addr, pdu, Some(reporter.clone()), main);
-        self.inflight = Some(Inflight {
-            ssi,
-            reporter,
-            since: clock,
-        });
+        Some(reporter)
     }
 }
 
@@ -1847,5 +1944,208 @@ mod tests {
         assert!(c.is_in_final_state());
         ack(&mut engine, &mut queue, AlAck::complete(2));
         run(&mut engine, &mut queue, 5);
+    }
+
+    const ISSI2: u32 = 2_260_619;
+    const ISSI3: u32 = 2_260_620;
+
+    /// The answer lowers the radio's slots to the cap and never raises them (22.2.2.1 NOTE 2).
+    #[test]
+    fn negotiation_lowers_the_slots_to_the_cap() {
+        let mut four = proposal();
+        four.connection_width = true;
+        four.uplink_timeslots = Some(3);
+        let answer = negotiate_setup_with(&four, 3);
+        assert_eq!(
+            (answer.setup_report, answer.uplink_timeslots),
+            (AlSetup::SETUP_REPORT_SERVICE_CHANGE, Some(2))
+        );
+        let answer = negotiate_setup_with(&four, 4);
+        assert_eq!(
+            (answer.setup_report, answer.uplink_timeslots),
+            (AlSetup::SETUP_REPORT_SUCCESS, Some(3))
+        );
+        assert_eq!(negotiate_setup_with(&four, 1), negotiate_setup(&four));
+        let mut two = four;
+        two.uplink_timeslots = Some(1);
+        let answer = negotiate_setup_with(&two, 3);
+        assert_eq!((answer.setup_report, answer.uplink_timeslots), (AlSetup::SETUP_REPORT_SUCCESS, Some(1)));
+    }
+
+    #[test]
+    fn an_engine_with_a_cap_answers_it() {
+        let mut engine = AdvancedLinkEngine::new();
+        engine.set_max_timeslots(3);
+        let mut queue = MessageQueue::new();
+        let mut four = proposal();
+        four.connection_width = true;
+        four.uplink_timeslots = Some(3);
+        let mut pdu = BitBuffer::new_autoexpand(32);
+        four.to_bitbuf(&mut pdu);
+        pdu.seek(0);
+        engine.rx(&mut queue, &ind(pdu.clone()), pdu, LlcPduType::AlSetup, MAIN);
+        let Some(SapMsgInner::TmaUnitdataReq(req)) = queue.pop_front().map(|m| m.msg) else {
+            panic!("an answer");
+        };
+        let answer = AlSetup::from_bitbuf(&mut req.pdu.clone()).unwrap();
+        assert_eq!(
+            (answer.setup_report, answer.uplink_timeslots),
+            (AlSetup::SETUP_REPORT_SERVICE_CHANGE, Some(2))
+        );
+    }
+
+    /// The link of `issi` up, as `setup_link` does for ISSI.
+    fn setup_link_of(engine: &mut AdvancedLinkEngine, queue: &mut MessageQueue, issi: u32) {
+        let mut pdu = BitBuffer::new_autoexpand(32);
+        proposal().to_bitbuf(&mut pdu);
+        pdu.seek(0);
+        let mut i = ind(pdu.clone());
+        i.main_address = TetraAddress::new(issi, SsiType::Issi);
+        engine.rx(queue, &i, pdu, LlcPduType::AlSetup, MAIN);
+        assert!(engine.has_link(issi));
+        while queue.pop_front().is_some() {}
+    }
+
+    fn request_to(engine: &mut AdvancedLinkEngine, issi: u32, octets: usize) -> TxReporter {
+        let reporter = TxReporter::new();
+        engine.tx_request(TlDataReqAl {
+            main_address: TetraAddress::new(issi, SsiType::Issi),
+            al_number: 0,
+            tl_sdu: BitBuffer::from_bytes(&vec![0x5a; octets]),
+            tx_reporter: Some(reporter.clone()),
+        });
+        reporter
+    }
+
+    /// The AL-DATA pushed to the MAC since the last call: (ISSI, header, report, link id).
+    fn pushed(queue: &mut MessageQueue) -> Vec<(u32, AlData, TxReporter, u32)> {
+        let mut out = Vec::new();
+        while let Some(msg) = queue.pop_front() {
+            let SapMsgInner::TmaUnitdataReq(req) = msg.msg else { continue };
+            let mut pdu = req.pdu.clone();
+            if pdu.peek_bits(4) == Some(9) {
+                out.push((
+                    req.main_address.ssi,
+                    AlData::from_bitbuf(&mut pdu).unwrap(),
+                    req.tx_reporter.expect("reported"),
+                    req.link_id,
+                ));
+            }
+        }
+        out
+    }
+
+    /// A link on a channel of three slots keeps three segments in the MAC, one more as each
+    /// leaves it, all to its channel; one acknowledgement request per twelve segments and on the
+    /// last.
+    #[test]
+    fn a_multislot_link_keeps_up_to_width_segments_in_the_mac() {
+        for (octets, requests) in [(100usize, vec![4u8]), (300, vec![11, 12])] {
+            let mut engine = AdvancedLinkEngine::new();
+            let mut queue = MessageQueue::new();
+            setup_link(&mut engine, &mut queue, 3, 3);
+            engine.set_pdch_routes(HashMap::from([(ISSI, (MAIN, 4, 3))]));
+            let service = request(&mut engine, octets);
+            engine.tick_end(&mut queue, MAIN);
+            let first = pushed(&mut queue);
+            assert_eq!(first.iter().map(|p| (p.1.ss, p.3)).collect::<Vec<_>>(), vec![(0, 4), (1, 4), (2, 4)]);
+            engine.tick_end(&mut queue, MAIN);
+            assert!(pushed(&mut queue).is_empty(), "three in the MAC");
+            first[0].2.mark_transmitted();
+            engine.tick_end(&mut queue, MAIN);
+            let next = pushed(&mut queue);
+            assert_eq!(next.iter().map(|p| p.1.ss).collect::<Vec<_>>(), vec![3]);
+            let mut all: Vec<(u32, AlData, TxReporter, u32)> = first.into_iter().chain(next).collect();
+            for _ in 0..20 {
+                for p in &all {
+                    if p.2.get_state() == TxState::Pending {
+                        p.2.mark_transmitted();
+                    }
+                }
+                engine.tick_end(&mut queue, MAIN);
+                all.extend(pushed(&mut queue));
+            }
+            assert_eq!(all.len(), (octets * 8 + 32).div_ceil(AL_SEGMENT_BITS));
+            assert!(all.iter().all(|p| p.3 == 4));
+            let ar: Vec<u8> = all.iter().filter(|p| p.1.acknowledgement_requested).map(|p| p.1.ss).collect();
+            assert_eq!(ar, requests, "{octets} octets");
+            assert_eq!(service.get_state(), TxState::Transmitted);
+        }
+    }
+
+    /// The segments of a multislot link never go on the MCCH, so they do not take its one
+    /// segment: a link on the MCCH still gets it, and its segment in the MAC still holds the other
+    /// MCCH links; the multislot link's pushes never touch that rule.
+    #[test]
+    fn a_multislot_link_does_not_hold_the_mcch() {
+        let mut engine = AdvancedLinkEngine::new();
+        let mut queue = MessageQueue::new();
+        setup_link(&mut engine, &mut queue, 3, 3);
+        setup_link_of(&mut engine, &mut queue, ISSI2);
+        setup_link_of(&mut engine, &mut queue, ISSI3);
+        engine.set_pdch_routes(HashMap::from([(ISSI, (MAIN, 4, 3))]));
+        let _a = request(&mut engine, 100);
+        let _b = request_to(&mut engine, ISSI2, 100);
+        engine.tick_end(&mut queue, MAIN);
+        let p = pushed(&mut queue);
+        assert_eq!(p.iter().filter(|x| x.0 == ISSI).count(), 3);
+        assert_eq!(p.iter().filter(|x| x.0 == ISSI2).map(|x| x.3).collect::<Vec<_>>(), vec![0], "one on the MCCH");
+        let gate = |e: &AdvancedLinkEngine| (e.inflight.as_ref().map(|i| i.ssi), e.last_served);
+        assert_eq!(gate(&engine), (Some(ISSI2), Some(ISSI2)));
+        let _c = request_to(&mut engine, ISSI3, 10);
+        p.iter().find(|x| x.0 == ISSI).unwrap().2.mark_transmitted();
+        engine.tick_end(&mut queue, MAIN);
+        let p2 = pushed(&mut queue);
+        assert_eq!(p2.iter().map(|x| x.0).collect::<Vec<_>>(), vec![ISSI], "the MCCH is still held");
+        assert_eq!(gate(&engine), (Some(ISSI2), Some(ISSI2)));
+    }
+
+    /// A segment still in the MAC is never pushed again, and a TL-SDU is started again (N.274
+    /// exhausted) only once nothing of it is left in the MAC: each segment then goes once.
+    #[test]
+    fn a_segment_in_the_mac_is_not_pushed_twice() {
+        let mut engine = AdvancedLinkEngine::new();
+        let mut queue = MessageQueue::new();
+        setup_link(&mut engine, &mut queue, 1, 1);
+        engine.set_pdch_routes(HashMap::from([(ISSI, (MAIN, 4, 2))]));
+        let _service = request(&mut engine, 40);
+        engine.tick_end(&mut queue, MAIN);
+        let first = pushed(&mut queue);
+        assert_eq!(first.iter().map(|p| p.1.ss).collect::<Vec<_>>(), vec![0, 1]);
+        // Segment 1 out and reported missing, twice: past N.274 while segment 0 is in the MAC.
+        first[1].2.mark_transmitted();
+        engine.tick_end(&mut queue, MAIN);
+        ack(&mut engine, &mut queue, AlAck::selective(true, 0, 0, 0, 2));
+        engine.tick_end(&mut queue, MAIN);
+        let again = pushed(&mut queue);
+        assert_eq!(again.iter().map(|p| p.1.ss).collect::<Vec<_>>(), vec![1]);
+        again[0].2.mark_transmitted();
+        engine.tick_end(&mut queue, MAIN);
+        ack(&mut engine, &mut queue, AlAck::selective(true, 0, 0, 0, 2));
+        engine.tick_end(&mut queue, MAIN);
+        assert!(pushed(&mut queue).is_empty(), "no restart while segment 0 is in the MAC");
+        first[0].2.mark_transmitted();
+        engine.tick_end(&mut queue, MAIN);
+        let restart = pushed(&mut queue);
+        assert_eq!(restart.iter().map(|p| p.1.ss).collect::<Vec<_>>(), vec![0, 1], "each once");
+    }
+
+    /// A one-slot channel is one segment at a time, as the MCCH.
+    #[test]
+    fn a_one_slot_route_is_one_segment_at_a_time() {
+        let mut engine = AdvancedLinkEngine::new();
+        let mut queue = MessageQueue::new();
+        setup_link(&mut engine, &mut queue, 3, 3);
+        engine.set_pdch_routes(HashMap::from([(ISSI, (MAIN, 4, 1))]));
+        let _service = request(&mut engine, 100);
+        for _ in 0..5 {
+            engine.tick_end(&mut queue, MAIN);
+            let p = pushed(&mut queue);
+            assert_eq!(p.len(), 1);
+            assert_eq!(p[0].3, 4);
+            engine.tick_end(&mut queue, MAIN);
+            assert!(pushed(&mut queue).is_empty(), "one segment in the MAC at a time");
+            p[0].2.mark_transmitted();
+        }
     }
 }

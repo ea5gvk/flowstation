@@ -106,7 +106,12 @@ impl Llc {
             let cfg = config.config();
             let on = cfg.packet_data.enabled && cfg.stack_mode == StackMode::Bs;
             (
-                on.then(AdvancedLinkEngine::new),
+                on.then(|| {
+                    let mut al = AdvancedLinkEngine::new();
+                    // N.264: at most the slots of the packet-data channel a radio may get.
+                    al.set_max_timeslots(cfg.packet_data.pdch_slots_per_radio());
+                    al
+                }),
                 on && cfg.packet_data.bearer == PacketDataBearer::Pdch,
             )
         };
@@ -773,7 +778,7 @@ impl Llc {
                 if self.al.is_some() =>
             {
                 let main_carrier = self.main_carrier();
-                let routes = self.pdch_mode.then(|| self.pdch_routes());
+                let routes = self.pdch_mode.then(|| self.pdch_channels());
                 if let SapMsgInner::TmaUnitdataInd(prim) = &mut message.msg
                     && let Some(pdu) = prim.pdu.take()
                     && let Some(al) = self.al.as_mut()
@@ -1317,7 +1322,7 @@ impl TetraEntityTrait for Llc {
         // Advanced links ([packet_data] only): timers and the next data segment for the MCCH
         if self.al.is_some() {
             let main_carrier = self.main_carrier();
-            let routes = (self.pdch_mode && self.al.as_ref().is_some_and(|al| !al.is_idle())).then(|| self.pdch_routes());
+            let routes = (self.pdch_mode && self.al.as_ref().is_some_and(|al| !al.is_idle())).then(|| self.pdch_channels());
             // Voice first: a radio in a call gets nothing on its advanced link meanwhile.
             let busy = self.al.as_ref().map(AdvancedLinkEngine::busy_ssis).unwrap_or_default();
             let in_call: HashSet<u32> = if busy.is_empty() {
