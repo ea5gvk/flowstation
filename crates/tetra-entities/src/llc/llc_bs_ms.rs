@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::{MessageQueue, TetraEntityTrait};
-use tetra_config::bluestation::{PacketDataBearer, SharedConfig, StackMode};
+use tetra_config::bluestation::{PacketDataBearer, PdchGrant, SharedConfig, StackMode};
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress, TxReporter, TxState, unimplemented_log};
 use tetra_saps::lcmc::enums::alloc_type::ChanAllocType;
@@ -136,18 +136,30 @@ impl Llc {
         (!on_mcch && (0..=UPLINK_CHANNEL_FRESH_SLOTS).contains(&t.age(self.dltime))).then_some((carrier, ts))
     }
 
-    /// The packet-data channel (carrier, timeslot) of `ssi`, while voice has not taken its slot:
-    /// once the assignment went out (`on_air_only`), or as soon as it is granted (an uplink on
-    /// that slot shows the radio is there). Always None unless `bearer = "pdch"`.
-    fn pdch_slot(&self, ssi: u32, on_air_only: bool) -> Option<(u16, u8)> {
+    /// The packet-data channel of `ssi` (its grant and timeslots), while voice has taken none of
+    /// its slots. Always None unless `bearer = "pdch"`.
+    fn pdch_channel(&self, ssi: u32) -> Option<(PdchGrant, [bool; 4])> {
         if !self.pdch_mode {
             return None;
         }
-        let state = self.config.state_read();
-        let grant = state.pdch_by_issi.get(&ssi)?;
-        let usable =
-            (grant.on_air || !on_air_only) && state.timeslot_alloc.slot_owner(grant.slot) == Some(tetra_core::TimeslotOwner::PacketData);
-        usable.then_some((grant.slot.carrier_num, grant.slot.ts))
+        self.config.state_read().pdch_channel(ssi)
+    }
+
+    /// The packet-data channel (carrier, timeslot its PDUs are sent to) of `ssi`, while voice
+    /// has taken none of its slots: once the assignment went out (`on_air_only`), or as soon as it
+    /// is granted (an uplink on that slot shows the radio is there). Always None unless `bearer =
+    /// "pdch"`.
+    fn pdch_slot(&self, ssi: u32, on_air_only: bool) -> Option<(u16, u8)> {
+        let (grant, _) = self.pdch_channel(ssi)?;
+        (grant.on_air || !on_air_only).then_some((grant.slot.carrier_num, grant.slot.ts))
+    }
+
+    /// Whether `ts` of `carrier_num` is a slot of the packet-data channel of `ssi` (on air or not).
+    fn on_pdch_of(&self, ssi: u32, carrier_num: u16, ts: u8) -> bool {
+        (1..=4).contains(&ts)
+            && self
+                .pdch_channel(ssi)
+                .is_some_and(|(grant, timeslots)| grant.slot.carrier_num == carrier_num && timeslots[usize::from(ts) - 1])
     }
 
     /// Whether `ssi` has a call up (its own or one of its groups') on `slot` (carrier, timeslot).
@@ -157,14 +169,28 @@ impl Llc {
         on_slot(&ssi) || state.subscribers.attached_groups_of(ssi).iter().any(on_slot)
     }
 
-    /// Packet-data channels in use, by ISSI, for the advanced link engine.
-    fn pdch_routes(&self) -> HashMap<u32, (u16, u8)> {
+    /// Packet-data channels in use, by ISSI: the carrier, the slot its PDUs are sent to and its
+    /// number of slots.
+    fn pdch_channels(&self) -> HashMap<u32, (u16, u8, usize)> {
         let state = self.config.state_read();
         state
             .pdch_by_issi
-            .iter()
-            .filter(|(_, g)| g.on_air && state.timeslot_alloc.slot_owner(g.slot) == Some(tetra_core::TimeslotOwner::PacketData))
-            .map(|(issi, g)| (*issi, (g.slot.carrier_num, g.slot.ts)))
+            .keys()
+            .filter_map(|issi| {
+                let (grant, timeslots) = state.pdch_channel(*issi)?;
+                grant.on_air.then(|| {
+                    let width = timeslots.iter().filter(|set| **set).count();
+                    (*issi, (grant.slot.carrier_num, grant.slot.ts, width))
+                })
+            })
+            .collect()
+    }
+
+    /// Packet-data channels in use, by ISSI: the carrier and the slot its PDUs are sent to.
+    fn pdch_routes(&self) -> HashMap<u32, (u16, u8)> {
+        self.pdch_channels()
+            .into_iter()
+            .map(|(issi, (carrier, ts, _))| (issi, (carrier, ts)))
             .collect()
     }
 
@@ -183,13 +209,11 @@ impl Llc {
             let state = self.config.state_read();
             state
                 .pdch_by_issi
-                .iter()
-                .filter(|(issi, g)| {
-                    g.on_air
-                        && state.timeslot_alloc.slot_owner(g.slot) == Some(tetra_core::TimeslotOwner::PacketData)
-                        && state.subscribers.attached_groups_of(**issi).contains(&gssi)
+                .keys()
+                .filter_map(|issi| {
+                    let (grant, _) = state.pdch_channel(*issi)?;
+                    (grant.on_air && state.subscribers.attached_groups_of(*issi).contains(&gssi)).then_some((*issi, grant.slot.ts))
                 })
-                .map(|(issi, g)| (*issi, g.slot.ts))
                 .collect()
         };
         members.sort_unstable();
@@ -241,11 +265,17 @@ impl Llc {
     /// LLC shall emit a combined BL-ADATA PDU. Only an ACK for an uplink received on the channel
     /// the outgoing PDU goes out on (same carrier AND timeslot) is taken: an ACK for an uplink
     /// that came in on a traffic slot used to ride a PDU to the MCCH, which a radio in a call does
-    /// not listen to (22.3.1.1), so it never got its ACK and retransmitted.
+    /// not listen to (22.3.1.1), so it never got its ACK and retransmitted. On a packet-data
+    /// channel of several slots any slot of the channel is the same channel.
     fn get_out_ack_seq_if_any(&mut self, addr: TetraAddress, carrier_num: u16, ts: u8) -> Option<u8> {
+        if self.scheduled_out_acks.is_empty() {
+            return None;
+        }
+        let on_channel = self.on_pdch_of(addr.ssi, carrier_num, ts);
         for i in 0..self.scheduled_out_acks.len() {
             let a = &self.scheduled_out_acks[i];
-            if a.addr.ssi == addr.ssi && a.carrier_num == carrier_num && a.ts == ts {
+            let same_channel = a.ts == ts || (on_channel && self.on_pdch_of(addr.ssi, carrier_num, a.ts));
+            if a.addr.ssi == addr.ssi && a.carrier_num == carrier_num && same_channel {
                 let n = self.scheduled_out_acks[i].nr;
                 self.scheduled_out_acks.remove(i);
                 return Some(n);
@@ -1146,11 +1176,12 @@ impl Llc {
             // unless that is the main carrier's MCCH (TS1). On a secondary carrier TS1 is a
             // traffic slot too: deciding by slot number alone sent those ACKs to the main MCCH,
             // where the radio in the call never heard them.
-            // An uplink on the radio's packet-data channel is acknowledged there, not stolen.
+            // An uplink on the radio's packet-data channel (any slot of it) is acknowledged there,
+            // not stolen.
             let on_pdch = self.pdch_mode
                 && (2..=4).contains(&ack.ts)
                 && ack.carrier_num == self.main_carrier()
-                && self.pdch_slot(ack.addr.ssi, false) == Some((ack.carrier_num, ack.ts));
+                && self.on_pdch_of(ack.addr.ssi, ack.carrier_num, ack.ts);
             let steal = !on_pdch && (1..=4).contains(&ack.ts) && !(ack.carrier_num == self.main_carrier() && ack.ts == 1);
             let mut pdu_buf = BitBuffer::new_autoexpand(5);
             let pdu = BlAck {

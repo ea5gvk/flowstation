@@ -3627,3 +3627,42 @@ fn uplink_grant_and_reassembly_across_the_channel() {
         (ISSI, 4, sdu)
     );
 }
+
+/// A BL-DATA from the radio on a slot of its channel other than the one its PDUs are sent to
+/// is acknowledged on the channel, not stolen as if the slot carried a call; and a BL-DATA going
+/// down to it meanwhile carries that acknowledgement (BL-ADATA, 22.3.2.3 d).
+#[test]
+fn a_bl_ack_for_an_uplink_on_another_slot_stays_on_the_pdch() {
+    debug::setup_logging_verbose();
+    let mut air = Air::new(multislot_config(false, 2));
+    grant_pdch_slots(&air.test.config, ISSI, &[4, 3], true);
+    let bl_data = |ns: u8| {
+        let mut data = BitBuffer::new_autoexpand(32);
+        BlData { has_fcs: false, ns }.to_bitbuf(&mut data);
+        append_bits(&mut data, "0101010101");
+        data
+    };
+    air.uplink_on(ISSI, bl_data(0), 3);
+    air.run(2);
+    let ack = air
+        .down
+        .iter()
+        .find(|d| d.issi == ISSI && d.llc == LlcPduType::BlAck)
+        .expect("BL-ACK");
+    assert!((3..=4).contains(&ack.link_id), "on the channel: {ack:?}");
+    assert!(!ack.stealing && !ack.chan_alloc, "{ack:?}");
+
+    // The next uplink on ts3, with a TL-DATA for the radio in the same tick: one BL-ADATA.
+    air.down.clear();
+    while air.ticks % 4 != 0 {
+        air.step();
+    }
+    air.test.submit_message(tma_ind(ISSI, bl_data(1), 3));
+    air.test.submit_message(tl_data_to(TetraAddress::issi(ISSI), false));
+    air.step();
+    air.run(2);
+    let mine: Vec<&Down> = air.down.iter().filter(|d| d.issi == ISSI).collect();
+    assert!(mine.iter().all(|d| d.llc != LlcPduType::BlAck), "no separate BL-ACK: {mine:?}");
+    let adata = mine.iter().find(|d| d.llc == LlcPduType::BlAdata).expect("BL-ADATA");
+    assert_eq!((adata.link_id, adata.stealing), (4, false));
+}
