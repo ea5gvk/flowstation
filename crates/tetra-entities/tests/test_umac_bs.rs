@@ -1473,6 +1473,25 @@ fn secondary_identity_with_packet_data_on_a_pdch() {
     );
 }
 
+/// With the secondary carrier as the packet-data carrier (`pdch_carrier`) and no data session,
+/// the secondary carrier is what it was.
+fn packet_data_carrier_without_a_session(cfg: &mut tetra_config::bluestation::StackConfig) {
+    packet_data_on_a_pdch(cfg);
+    cfg.packet_data.pdch_carrier = cfg.cell.secondary_carrier;
+}
+
+#[test]
+fn secondary_identity_with_a_packet_data_carrier_and_no_session() {
+    assert_eq!(
+        secondary_scenarios_with(packet_data_carrier_without_a_session),
+        [
+            SECONDARY_IDENTITY_PDCH_MCCH_FALLBACK,
+            SECONDARY_IDENTITY_PDCH_TS1_CHAN_ALLOC,
+            SECONDARY_IDENTITY_PDCH_TS1_CLOSE
+        ]
+    );
+}
+
 #[test]
 fn test_local_loopback_ul_still_loops_back_and_reaches_brew() {
     // Only a LocalParrot circuit hands its uplink to CMCE: an ordinary simplex circuit keeps

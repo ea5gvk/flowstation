@@ -167,8 +167,18 @@ struct PdchConfig {
     main_carrier: u16,
     prefs: Vec<u8>,
     idle_slots: u64,
-    /// Timeslots a radio's channel may have (`CfgPacketData::pdch_slots_per_radio`).
+    /// Timeslots a radio's channel may have (`StackConfig::pdch_slots_per_radio`).
     max_slots: u8,
+    /// The packet-data carrier in use (`[packet_data] pdch_carrier`).
+    carrier: Option<CarrierCfg>,
+}
+
+/// The packet-data carrier: its number, the slots a channel may take there in order of
+/// preference, and whether voice never goes there.
+struct CarrierCfg {
+    num: u16,
+    prefs: Vec<u8>,
+    exclusive: bool,
 }
 
 pub struct PacketDataRuntime {
@@ -201,6 +211,12 @@ pub struct PacketDataRuntime {
     pdch: HashMap<u32, Pdch>,
     /// Last tick each main-carrier timeslot (index) had an owner.
     slot_busy_at: [Option<u64>; 5],
+    /// The same for the slots of the packet-data carrier.
+    carrier_busy_at: [Option<u64>; 5],
+    main_carrier: u16,
+    /// Radios that stayed on the MCCH after an assignment to the packet-data carrier: main-carrier
+    /// channels only for them from then on.
+    carrier_refused: HashSet<u32>,
 }
 
 /// MTU code of the ACCEPT (table 28.79); `[wap] mtu` only takes these values.
@@ -269,6 +285,14 @@ fn pdch_assignment(slots: &[CarrierSlot]) -> CmceChanAllocReq {
 /// The timeslots of a packet-data channel for the log: "4", or "4+3".
 fn ts_list(slots: &[CarrierSlot]) -> String {
     slots.iter().map(|s| s.ts.to_string()).collect::<Vec<_>>().join("+")
+}
+
+/// `ts_list`, with " of carrier N" for a channel of another carrier than `main_carrier`.
+fn ts_on(slots: &[CarrierSlot], main_carrier: u16) -> String {
+    match slots.first() {
+        Some(s) if s.carrier_num != main_carrier => format!("{} of carrier {}", ts_list(slots), s.carrier_num),
+        _ => ts_list(slots),
+    }
 }
 
 /// Timeslots per TDMA frame the radio can take (clause 28.4.5.34, table 28.115): its full phase
@@ -351,14 +375,49 @@ impl PacketDataRuntime {
                 fetch_ms
             );
         }
-        let max_slots = pd.pdch_slots_per_radio();
+        // A packet-data carrier that is not in use is said once, never an error.
+        let carrier = cfg.pdch_carrier();
+        match pd.pdch_carrier {
+            Some(c) if carrier.is_none() => {
+                if c == cfg.cell.main_carrier {
+                    tracing::warn!(
+                        "SNDCP: pdch_carrier = {} is the main carrier (its packet-data slots are pdch_timeslots): ignored",
+                        c
+                    );
+                } else if pd.bearer == PacketDataBearer::Mcch {
+                    tracing::warn!("SNDCP: pdch_carrier = {} has no effect with bearer = \"mcch\"", c);
+                } else {
+                    tracing::warn!(
+                        "SNDCP: pdch_carrier = {} is not the secondary carrier in use ({}): packet data stays on the main carrier's pdch_timeslots",
+                        c,
+                        cfg.cell
+                            .secondary_carrier
+                            .map_or("none, dual carrier off".to_string(), |s| s.to_string())
+                    );
+                }
+            }
+            None if pd.pdch_carrier_timeslots != [4, 3, 2, 1] || pd.pdch_carrier_exclusive => {
+                tracing::warn!("SNDCP: pdch_carrier_timeslots / pdch_carrier_exclusive have no effect without pdch_carrier");
+            }
+            _ => {}
+        }
+        let max_slots = cfg.pdch_slots_per_radio();
         if pd.bearer == PacketDataBearer::Pdch && pd.pdch_max_slots > max_slots {
-            tracing::warn!(
-                "SNDCP: pdch_max_slots = {} but pdch_timeslots has {} distinct main-carrier slot(s): at most {} slot(s) per radio (a PDCH on a secondary carrier is not supported)",
-                pd.pdch_max_slots,
-                pd.pdch_timeslot_count(),
-                max_slots
-            );
+            match &carrier {
+                None => tracing::warn!(
+                    "SNDCP: pdch_max_slots = {} but pdch_timeslots has {} distinct main-carrier slot(s): at most {} slot(s) per radio (a PDCH on a secondary carrier is not supported)",
+                    pd.pdch_max_slots,
+                    pd.pdch_timeslot_count(),
+                    max_slots
+                ),
+                Some(c) => tracing::warn!(
+                    "SNDCP: pdch_max_slots = {} but pdch_timeslots {:?} and pdch_carrier_timeslots {:?} give at most {} slot(s) per radio",
+                    pd.pdch_max_slots,
+                    pd.pdch_timeslots,
+                    c.timeslots,
+                    max_slots
+                ),
+            }
         }
         if pd.bearer == PacketDataBearer::Mcch && pd.pdch_max_slots > 1 {
             tracing::warn!("SNDCP: pdch_max_slots = {} has no effect with bearer = \"mcch\"", pd.pdch_max_slots);
@@ -368,13 +427,31 @@ impl PacketDataRuntime {
             prefs: pd.pdch_timeslots.clone(),
             idle_slots: slots(u64::from(pd.pdch_idle_release_secs) * 1000),
             max_slots,
+            carrier: carrier.map(|c| CarrierCfg {
+                num: c.carrier,
+                prefs: c.timeslots,
+                exclusive: c.exclusive,
+            }),
         });
         tracing::info!(
             "SNDCP: packet data on {} (pool {}..{}, gateway {}, MTU {}, READY {} ms announced / {} ms here)",
             match &pdch_cfg {
                 Some(p) => format!(
-                    "a PDCH of main-carrier ts {:?}{}, released after {} s idle, else the MCCH",
-                    p.prefs,
+                    "{}{}, released after {} s idle, else the MCCH",
+                    match &p.carrier {
+                        None => format!("a PDCH of main-carrier ts {:?}", p.prefs),
+                        Some(c) => format!(
+                            "a PDCH of carrier {} ts {:?} (uplink never on ts1; {}), else main-carrier ts {:?}",
+                            c.num,
+                            c.prefs,
+                            if c.exclusive {
+                                "data only, voice never there"
+                            } else {
+                                "shared with voice"
+                            },
+                            p.prefs
+                        ),
+                    },
                     if p.max_slots > 1 {
                         format!(", up to {} slots per radio", p.max_slots)
                     } else {
@@ -413,6 +490,9 @@ impl PacketDataRuntime {
             pdch_cfg,
             pdch: HashMap::new(),
             slot_busy_at: [None; 5],
+            carrier_busy_at: [None; 5],
+            main_carrier: cfg.cell.main_carrier,
+            carrier_refused: HashSet::new(),
         })
     }
 
@@ -446,18 +526,31 @@ impl PacketDataRuntime {
             bits.len(),
             ind.bearer
         );
-        // Anything from the radio on the MCCH: it left its packet-data channel.
-        if ind.link_id == 1
-            && let Some(p) = self.pdch.get_mut(&issi)
-            && p.on_air
+        // A radio of a channel of the packet-data carrier the LLC heard there again (a stale "back
+        // on the MCCH" undone): its answers go there.
+        if let Some(p) = self.pdch.get_mut(&issi)
+            && !p.on_air
+            && p.assignment.is_none()
+            && p.slots.first().is_some_and(|s| s.carrier_num != self.main_carrier)
+            && config.state_read().pdch_by_issi.get(&issi).is_some_and(|g| g.on_air)
         {
-            p.on_air = false;
-            tracing::info!(
-                "SNDCP: ISSI {} is back on the MCCH, its PDCH ts {} is kept for now",
-                issi,
-                ts_list(&p.slots)
-            );
-            Self::publish_pdch(config, issi, Some(p));
+            p.on_air = true;
+            tracing::info!("SNDCP: ISSI {} is back on its PDCH ts {}", issi, ts_on(&p.slots, self.main_carrier));
+        }
+        // Anything from the radio on the MCCH: it left its packet-data channel. (A channel of the
+        // packet-data carrier never transmits on its ts1: link 1 is always the MCCH.)
+        if ind.link_id == 1 && self.pdch.get(&issi).is_some_and(|p| p.on_air) {
+            if let Some(carrier) = self.not_heard_on_its_carrier(config, issi) {
+                self.stayed_on_the_mcch(config, issi, carrier);
+            } else if let Some(p) = self.pdch.get_mut(&issi) {
+                p.on_air = false;
+                tracing::info!(
+                    "SNDCP: ISSI {} is back on the MCCH, its PDCH ts {} is kept for now",
+                    issi,
+                    ts_on(&p.slots, self.main_carrier)
+                );
+                Self::publish_pdch(config, issi, Some(p));
+            }
         }
         match sn_type {
             Some(SN_ACTIVATE_PDP_CONTEXT) => self.on_demand(queue, ind, bits, wap),
@@ -769,6 +862,12 @@ impl PacketDataRuntime {
     /// carrier has a free slot, a channel of several slots leaves one main-carrier traffic slot
     /// free, since voice takes a packet-data slot, and with it the whole channel, only when
     /// nothing else is free.
+    ///
+    /// With a packet-data carrier in use the channel may be there instead (`pdch_carrier_timeslots`,
+    /// ts1 only together with one of ts 2-4, which then comes first: the channel's uplink never
+    /// uses ts1): the carrier or the main carrier, whichever gives more slots, the carrier on a
+    /// tie (it leaves the main carrier's traffic slots to voice). Shared with voice, a channel
+    /// there leaves one of its slots free when the main carrier has none.
     fn pdch_for_transfer(
         &mut self,
         config: &SharedConfig,
@@ -788,25 +887,64 @@ impl PacketDataRuntime {
                 .flatten()
                 .is_none_or(|t| clock.saturating_sub(t) >= PDCH_QUARANTINE_SLOTS)
         });
+        // The packet-data carrier: its slots not in quarantine (never for a radio that did not go
+        // there before).
+        let carrier = pcfg.carrier.as_ref().map(|c| {
+            let (usable, waiting): (Vec<u8>, Vec<u8>) = c.prefs.iter().copied().partition(|ts| {
+                self.carrier_busy_at
+                    .get(usize::from(*ts))
+                    .copied()
+                    .flatten()
+                    .is_none_or(|t| clock.saturating_sub(t) >= PDCH_QUARANTINE_SLOTS)
+            });
+            (c.num, usable, waiting, c.exclusive)
+        });
+        let refused = self.carrier_refused.contains(&issi);
         self.drain_preempted(config);
+        let main_carrier = self.main_carrier;
         if let Some(p) = self.pdch.get_mut(&issi) {
             p.last_activity = clock;
             p.quit = None;
             // The request may come in on any slot of the channel.
             if p.on_air && p.slots.iter().any(|s| u32::from(s.ts) == link_id) {
-                return (None, format!("already on its PDCH ts {}", ts_list(&p.slots)));
+                return (None, format!("already on its PDCH ts {}", ts_on(&p.slots, main_carrier)));
             }
             let reporter = TxReporter::new();
             p.assignment = Some(reporter.clone());
             p.assignment_ack = None;
+            config.state_write().pdch_heard_on_channel.remove(&issi);
             return (
                 Some((pdch_assignment(&p.slots), reporter)),
-                format!("PDCH ts {} (again)", ts_list(&p.slots)),
+                format!("PDCH ts {} (again)", ts_on(&p.slots, main_carrier)),
             );
         }
         let wanted = usize::from(capable.min(max_slots).max(1));
-        let (slots, headroom) = {
+        let (slots, headroom, carrier_busy) = {
             let mut state = config.state_write();
+            // On the packet-data carrier: the free usable slots, the first of ts 2-4 first.
+            let mut on_carrier = None;
+            if let Some((c, usable, _, exclusive)) = carrier.as_ref().filter(|_| !refused) {
+                let mut free: Vec<u8> = usable
+                    .iter()
+                    .copied()
+                    .filter(|ts| state.timeslot_alloc.slot_is_free(CarrierSlot { carrier_num: *c, ts: *ts }))
+                    .collect();
+                if let Some(i) = free.iter().position(|ts| (2..=4).contains(ts)) {
+                    let first = free.remove(i);
+                    free.insert(0, first);
+                    let mut n = wanted.min(free.len());
+                    let mut hr = false;
+                    let (main_free, others_free) = state.timeslot_alloc.free_traffic_slots();
+                    if !*exclusive && n > 1 && main_free == 0 {
+                        let cap = others_free.saturating_sub(1).max(1);
+                        if cap < n {
+                            n = cap;
+                            hr = true;
+                        }
+                    }
+                    on_carrier = Some((*c, free, n, hr));
+                }
+            }
             let mut n = wanted;
             let mut headroom = false;
             if n > 1 {
@@ -817,7 +955,14 @@ impl PacketDataRuntime {
                     headroom = true;
                 }
             }
-            let slots = state.timeslot_alloc.reserve_packet_data_slots(&prefs, n);
+            let main_gives = n.min(prefs.iter().filter(|ts| state.timeslot_alloc.is_free(**ts)).count());
+            let slots = match on_carrier {
+                Some((c, free, n_c, hr)) if n_c >= main_gives => {
+                    headroom = hr;
+                    state.timeslot_alloc.reserve_packet_data_slots_on(c, &free, n_c)
+                }
+                _ => state.timeslot_alloc.reserve_packet_data_slots(&prefs, n),
+            };
             if let Some(first) = slots.first() {
                 state.pdch_by_issi.insert(
                     issi,
@@ -831,21 +976,36 @@ impl PacketDataRuntime {
                 } else {
                     state.pdch_timeslots_by_issi.remove(&issi);
                 }
+                state.pdch_heard_on_channel.remove(&issi);
             }
-            (slots, headroom)
+            let carrier_busy = carrier
+                .as_ref()
+                .filter(|_| !refused && slots.first().is_some_and(|s| s.carrier_num == main_carrier));
+            (slots, headroom, carrier_busy.map(|c| c.0))
         };
         if slots.is_empty() {
-            tracing::info!(
-                "SNDCP: no main-carrier slot of {:?} free for a PDCH of ISSI {} ({:?} busy or freed less than a multiframe ago), data on the MCCH",
-                prefs,
-                issi,
-                waiting
-            );
+            match &carrier {
+                None => tracing::info!(
+                    "SNDCP: no main-carrier slot of {:?} free for a PDCH of ISSI {} ({:?} busy or freed less than a multiframe ago), data on the MCCH",
+                    prefs,
+                    issi,
+                    waiting
+                ),
+                Some((c, usable, c_waiting, _)) => tracing::info!(
+                    "SNDCP: no slot of {:?} or of carrier {} {:?} free for a PDCH of ISSI {} ({:?} and {:?} busy or freed less than a multiframe ago), data on the MCCH",
+                    prefs,
+                    c,
+                    usable,
+                    issi,
+                    waiting,
+                    c_waiting
+                ),
+            }
             return (None, "no channel (MCCH, no PDCH slot free)".to_string());
         }
         tracing::info!(
-            "SNDCP: PDCH ts {} reserved for ISSI {}{}",
-            ts_list(&slots),
+            "SNDCP: PDCH ts {} reserved for ISSI {}{}{}",
+            ts_on(&slots, main_carrier),
             issi,
             if max_slots > 1 {
                 format!(
@@ -856,11 +1016,12 @@ impl PacketDataRuntime {
                 )
             } else {
                 String::new()
-            }
+            },
+            carrier_busy.map_or(String::new(), |c| format!(", carrier {c} busy"))
         );
         let reporter = TxReporter::new();
         let assignment = pdch_assignment(&slots);
-        let channel = format!("PDCH ts {}", ts_list(&slots));
+        let channel = format!("PDCH ts {}", ts_on(&slots, main_carrier));
         self.pdch.insert(
             issi,
             Pdch {
@@ -873,6 +1034,26 @@ impl PacketDataRuntime {
             },
         );
         (Some((assignment, reporter)), channel)
+    }
+
+    /// The packet-data carrier when `issi` has a channel there and was not heard on it since it
+    /// was assigned (see `stayed_on_the_mcch`).
+    fn not_heard_on_its_carrier(&self, config: &SharedConfig, issi: u32) -> Option<u16> {
+        let carrier = self.pdch.get(&issi)?.slots.first()?.carrier_num;
+        (carrier != self.main_carrier && !config.state_read().pdch_heard_on_channel.contains(&issi)).then_some(carrier)
+    }
+
+    /// A radio assigned a channel of the packet-data carrier is heard on the MCCH before anything
+    /// of it was heard on the channel: it did not go there (its acknowledgement of the assignment
+    /// on the MCCH tells nothing). Its channel is released, and it gets channels of the main
+    /// carrier (or the MCCH) from then on.
+    fn stayed_on_the_mcch(&mut self, config: &SharedConfig, issi: u32, carrier: u16) {
+        self.carrier_refused.insert(issi);
+        tracing::info!(
+            "SNDCP: ISSI {} stayed on the MCCH after a carrier assignment: main-carrier packet-data channels only from now on",
+            issi
+        );
+        self.release_pdch(config, issi, &format!("the radio did not take its PDCH of carrier {carrier}"));
     }
 
     /// Publish the packet-data channel of `issi` (None: removed) for the MAC and the LLC: its
@@ -914,17 +1095,22 @@ impl PacketDataRuntime {
                 .collect()
         };
         match errors.as_slice() {
-            [] => tracing::info!("SNDCP: PDCH ts {} of ISSI {} released ({})", ts_list(&p.slots), issi, why),
+            [] => tracing::info!(
+                "SNDCP: PDCH ts {} of ISSI {} released ({})",
+                ts_on(&p.slots, self.main_carrier),
+                issi,
+                why
+            ),
             [e] => tracing::debug!(
                 "SNDCP: PDCH ts {} of ISSI {} gone ({}), slot not ours: {:?}",
-                ts_list(&p.slots),
+                ts_on(&p.slots, self.main_carrier),
                 issi,
                 why,
                 e
             ),
             errors => tracing::debug!(
                 "SNDCP: PDCH ts {} of ISSI {} gone ({}), slots not ours: {:?}",
-                ts_list(&p.slots),
+                ts_on(&p.slots, self.main_carrier),
                 issi,
                 why,
                 errors
@@ -970,7 +1156,7 @@ impl PacketDataRuntime {
                 if p.slots.len() == 1 {
                     tracing::info!(
                         "SNDCP: PDCH ts {} of ISSI {} taken by a call, its data goes on on the MCCH",
-                        slot.ts,
+                        ts_on(&p.slots, self.main_carrier),
                         issi
                     );
                     continue;
@@ -984,7 +1170,7 @@ impl PacketDataRuntime {
                 drop(state);
                 tracing::info!(
                     "SNDCP: PDCH ts {} of ISSI {} taken by a call (ts {}), its data goes on on the MCCH",
-                    ts_list(&p.slots),
+                    ts_on(&p.slots, self.main_carrier),
                     issi,
                     slot.ts
                 );
@@ -1000,27 +1186,57 @@ impl PacketDataRuntime {
         if self.pdch_cfg.is_none() {
             return;
         }
-        let off: Vec<u32> = {
+        let main_carrier = self.main_carrier;
+        let (off, back): (Vec<u32>, Vec<u32>) = {
             let state = config.state_read();
             for ts in 2..=4u8 {
                 if state.timeslot_alloc.owner(ts).is_some() {
                     self.slot_busy_at[usize::from(ts)] = Some(self.clock);
                 }
             }
-            self.pdch
+            if let Some(c) = self.pdch_cfg.as_ref().and_then(|p| p.carrier.as_ref()) {
+                for ts in 1..=4u8 {
+                    if state.timeslot_alloc.slot_owner(CarrierSlot { carrier_num: c.num, ts }).is_some() {
+                        self.carrier_busy_at[usize::from(ts)] = Some(self.clock);
+                    }
+                }
+            }
+            let off = self
+                .pdch
                 .iter()
                 .filter(|(issi, p)| p.on_air && state.pdch_by_issi.get(issi).is_some_and(|g| !g.on_air))
                 .map(|(issi, _)| *issi)
-                .collect()
+                .collect();
+            // A radio of a channel of the packet-data carrier the LLC heard there again.
+            let back = self
+                .pdch
+                .iter()
+                .filter(|(issi, p)| {
+                    !p.on_air
+                        && p.assignment.is_none()
+                        && p.slots.first().is_some_and(|s| s.carrier_num != main_carrier)
+                        && state.pdch_by_issi.get(issi).is_some_and(|g| g.on_air)
+                })
+                .map(|(issi, _)| *issi)
+                .collect();
+            (off, back)
         };
         for issi in off {
-            if let Some(p) = self.pdch.get_mut(&issi) {
+            if let Some(carrier) = self.not_heard_on_its_carrier(config, issi) {
+                self.stayed_on_the_mcch(config, issi, carrier);
+            } else if let Some(p) = self.pdch.get_mut(&issi) {
                 p.on_air = false;
                 tracing::info!(
                     "SNDCP: ISSI {} transmitted on the MCCH, off its PDCH ts {} (kept for now)",
                     issi,
-                    ts_list(&p.slots)
+                    ts_on(&p.slots, main_carrier)
                 );
+            }
+        }
+        for issi in back {
+            if let Some(p) = self.pdch.get_mut(&issi) {
+                p.on_air = true;
+                tracing::info!("SNDCP: ISSI {} is back on its PDCH ts {}", issi, ts_on(&p.slots, main_carrier));
             }
         }
         let mut on_air = Vec::new();
@@ -1052,7 +1268,7 @@ impl PacketDataRuntime {
         on_air.sort_unstable();
         for issi in on_air {
             if let Some(p) = self.pdch.get(&issi) {
-                tracing::info!("SNDCP: ISSI {} sent to its PDCH ts {}", issi, ts_list(&p.slots));
+                tracing::info!("SNDCP: ISSI {} sent to its PDCH ts {}", issi, ts_on(&p.slots, self.main_carrier));
                 Self::publish_pdch(config, issi, Some(p));
             }
         }
@@ -1075,7 +1291,12 @@ impl PacketDataRuntime {
             (Some(p), Some(main)) if p.on_air => {
                 let reporter = TxReporter::new();
                 p.quit = Some(reporter.clone());
-                tracing::info!("SNDCP: ISSI {} leaves its PDCH ts {} ({})", addr.ssi, ts_list(&p.slots), why);
+                tracing::info!(
+                    "SNDCP: ISSI {} leaves its PDCH ts {} ({})",
+                    addr.ssi,
+                    ts_on(&p.slots, self.main_carrier),
+                    why
+                );
                 Some(with_chan_alloc(msg, quit_to_mcch(main), &reporter))
             }
             _ => {
@@ -1498,7 +1719,7 @@ impl PacketDataRuntime {
                 continue;
             }
             if self.ctxs.iter().any(|(k, c)| k.0 == *issi && c.state == CtxState::Ready) {
-                end.push((*issi, ts_list(&p.slots)));
+                end.push((*issi, ts_on(&p.slots, self.main_carrier)));
             } else {
                 release.push((*issi, "idle"));
             }

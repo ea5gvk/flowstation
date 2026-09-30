@@ -4299,3 +4299,16 @@ fn two_radios_never_share_a_slot() {
     let owners: Vec<Option<u32>> = (2..=4).map(|ts| umac.channel_scheduler.pdch_owner(ts)).collect();
     assert_eq!(owners, vec![Some(ISSI2), Some(ISSI), Some(ISSI)]);
 }
+
+/// With `pdch_carrier` set and no data session, two duplex calls on two carriers are what they
+/// were (the fingerprint recorded before the packet-data carrier).
+#[test]
+fn dual_identity_duplex_calls_with_a_packet_data_carrier() {
+    fn with_carrier(cfg: &mut StackConfig) {
+        cfg.packet_data.pdch_carrier = cfg.cell.secondary_carrier;
+    }
+    let hash = common::component_test::with_config_tweak(with_carrier, || {
+        fingerprint(duplex_calls_on_two_carriers_are_the_same_with_packet_data_on)
+    });
+    assert_eq!(hash, 0xdb61_bf54_cae9_5f0b);
+}
