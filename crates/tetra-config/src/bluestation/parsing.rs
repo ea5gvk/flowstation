@@ -932,10 +932,22 @@ ready_timer_code = 9
                 exclusive: false
             })
         );
-        assert_eq!(carrier("secondary_carrier = 1585", "bearer = \"pdch\"\npdch_carrier = 1585"), None, "packet data off");
-        assert_eq!(carrier("secondary_carrier = 1585", "enabled = true\npdch_carrier = 1585"), None, "bearer mcch");
+        assert_eq!(
+            carrier("secondary_carrier = 1585", "bearer = \"pdch\"\npdch_carrier = 1585"),
+            None,
+            "packet data off"
+        );
+        assert_eq!(
+            carrier("secondary_carrier = 1585", "enabled = true\npdch_carrier = 1585"),
+            None,
+            "bearer mcch"
+        );
         assert_eq!(carrier("", on), None, "no secondary");
-        assert_eq!(carrier("secondary_carrier = 1585\ndual_carrier_enabled = false", on), None, "dual carrier off");
+        assert_eq!(
+            carrier("secondary_carrier = 1585\ndual_carrier_enabled = false", on),
+            None,
+            "dual carrier off"
+        );
         assert_eq!(carrier("secondary_carrier = 1586", on), None, "another secondary");
         let exclusive = carrier(
             "secondary_carrier = 1585",

@@ -520,8 +520,7 @@ impl BsChannelScheduler {
         let (handoff, owners) = (self.pdch_handoff_carrier, self.pdch_handoff_owners);
         let mine = |e: &DlSchedElem| match e {
             DlSchedElem::Resource(pdu, _, _) => {
-                !Self::is_handoff_assignment(pdu, handoff, owners)
-                    && pdu.addr.is_some_and(|a| a.ssi == ssi && a.ssi_type != SsiType::Gssi)
+                !Self::is_handoff_assignment(pdu, handoff, owners) && pdu.addr.is_some_and(|a| a.ssi == ssi && a.ssi_type != SsiType::Gssi)
             }
             DlSchedElem::FragBuf(f) => f.ssi() == Some(ssi) && !f.is_for_group(),
             DlSchedElem::Grant(addr, ..) | DlSchedElem::RandomAccessAck(addr) => addr.ssi == ssi,
