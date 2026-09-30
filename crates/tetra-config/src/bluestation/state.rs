@@ -624,9 +624,9 @@ impl StackState {
     }
 }
 
-/// One packet-data channel: its slot on the main carrier (the first of its slots when it has
-/// more, see `StackState::pdch_timeslots_by_issi`), and whether the radio was sent there (the
-/// SN-DATA TRANSMIT RESPONSE carrying the assignment went out).
+/// One packet-data channel: its slot on the main carrier or on the packet-data carrier (the
+/// first of its slots when it has more, see `StackState::pdch_timeslots_by_issi`), and whether
+/// the radio was sent there (the SN-DATA TRANSMIT RESPONSE carrying the assignment went out).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PdchGrant {
     pub slot: CarrierSlot,
@@ -772,6 +772,31 @@ mod tests {
         assert_eq!(state.pdch_channel(1001), None, "the whole channel goes");
         state.pdch_by_issi.clear();
         assert_eq!(state.pdch_channel(1001), None);
+    }
+
+    /// On the packet-data carrier the channel may hold ts1, and goes as a whole there too.
+    #[test]
+    fn pdch_channel_on_the_carrier_includes_ts1() {
+        let mut state = StackState::default();
+        state.timeslot_alloc.configure_carriers(&[1584, 1598]);
+        let slots = state.timeslot_alloc.reserve_packet_data_slots_on(1598, &[4, 3, 2, 1], 4);
+        assert_eq!(slots.len(), 4);
+        let grant = PdchGrant {
+            slot: slots[0],
+            on_air: true,
+        };
+        state.pdch_by_issi.insert(1001, grant);
+        state.pdch_timeslots_by_issi.insert(1001, [true; 4]);
+        assert_eq!(state.pdch_channel(1001), Some((grant, [true; 4])));
+        for ts in 2..=4 {
+            state.timeslot_alloc.reserve(TimeslotOwner::Cmce, ts).unwrap();
+        }
+        assert_eq!(
+            state.timeslot_alloc.allocate_any_slot(TimeslotOwner::Cmce),
+            Some(CarrierSlot { carrier_num: 1598, ts: 1 }),
+            "voice takes ts1 of the carrier"
+        );
+        assert_eq!(state.pdch_channel(1001), None, "the whole channel goes");
     }
 
     #[test]

@@ -2,8 +2,8 @@
 pub enum TimeslotOwner {
     Brew,
     Cmce,
-    /// A packet-data channel (PDCH) of the SNDCP bearer: only on the main carrier, and any other
-    /// owner takes it when nothing else is free (voice first).
+    /// A packet-data channel (PDCH) of the SNDCP bearer: on the main carrier, or on the
+    /// packet-data carrier; any other owner takes it when nothing else is free (voice first).
     PacketData,
 }
 
@@ -43,6 +43,8 @@ pub struct TimeslotAllocator {
     owners: Vec<[Option<TimeslotOwner>; 4]>,
     /// Packet-data slots another owner took, until the packet-data bearer drains them.
     preempted: Vec<CarrierSlot>,
+    /// A carrier whose slots only packet data may take (`[packet_data] pdch_carrier_exclusive`).
+    data_only_carrier: Option<u16>,
 }
 
 impl Default for TimeslotAllocator {
@@ -51,6 +53,7 @@ impl Default for TimeslotAllocator {
             carriers: vec![0],
             owners: vec![[None, None, None, None]],
             preempted: Vec::new(),
+            data_only_carrier: None,
         }
     }
 }
@@ -104,12 +107,26 @@ impl TimeslotAllocator {
         &self.carriers
     }
 
+    /// Only packet data may take the slots of `carrier` (None: every carrier takes voice).
+    pub fn set_data_only_carrier(&mut self, carrier: Option<u16>) {
+        self.data_only_carrier = carrier;
+    }
+
+    /// Whether the carrier at `carrier_i` is the data-only one.
+    fn data_only(&self, carrier_i: usize) -> bool {
+        self.data_only_carrier == Some(self.carriers[carrier_i])
+    }
+
     pub fn allocate_any(&mut self, owner: TimeslotOwner) -> Option<u8> {
         self.allocate_any_slot(owner).map(|slot| slot.ts)
     }
 
     pub fn allocate_any_slot(&mut self, owner: TimeslotOwner) -> Option<CarrierSlot> {
+        let data_only = self.data_only_carrier;
         for (carrier_i, slots) in self.owners.iter_mut().enumerate() {
+            if owner != TimeslotOwner::PacketData && data_only == Some(self.carriers[carrier_i]) {
+                continue;
+            }
             let ts_range = if carrier_i == 0 { 2..=4 } else { 1..=4 };
             for ts in ts_range {
                 let slot = &mut slots[ts as usize - 1];
@@ -136,6 +153,24 @@ impl TimeslotAllocator {
                     return Some(taken);
                 }
             }
+            // Then a packet-data channel of the packet-data carrier (never a data-only one).
+            for carrier_i in 1..self.carriers.len() {
+                if self.data_only(carrier_i) {
+                    continue;
+                }
+                for ts in 1..=4u8 {
+                    let slot = &mut self.owners[carrier_i][ts as usize - 1];
+                    if *slot == Some(TimeslotOwner::PacketData) {
+                        *slot = Some(owner);
+                        let taken = CarrierSlot {
+                            carrier_num: self.carriers[carrier_i],
+                            ts,
+                        };
+                        self.preempted.push(taken);
+                        return Some(taken);
+                    }
+                }
+            }
         }
         None
     }
@@ -159,11 +194,34 @@ impl TimeslotAllocator {
         (0..n).map_while(|_| self.reserve_packet_data_slot(prefs)).collect()
     }
 
-    /// Traffic slots without an owner: (main carrier ts2..=4, every other carrier ts1..=4). For
-    /// the voice headroom of a packet-data channel of several slots.
+    /// A packet-data channel of up to `n` slots of `carrier`: the first free ones of `prefs`
+    /// (2..=4 on the main carrier, 1..=4 on any other), in that order.
+    pub fn reserve_packet_data_slots_on(&mut self, carrier: u16, prefs: &[u8], n: usize) -> Vec<CarrierSlot> {
+        let Ok(carrier_i) = self.carrier_idx(carrier) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for &ts in prefs {
+            if out.len() >= n {
+                break;
+            }
+            if self.slot_supported_for_carrier(carrier_i, ts) && self.owners[carrier_i][ts as usize - 1].is_none() {
+                self.owners[carrier_i][ts as usize - 1] = Some(TimeslotOwner::PacketData);
+                out.push(CarrierSlot { carrier_num: carrier, ts });
+            }
+        }
+        out
+    }
+
+    /// Traffic slots without an owner: (main carrier ts2..=4, every other carrier ts1..=4 but a
+    /// data-only one). For the voice headroom of a packet-data channel of several slots.
     pub fn free_traffic_slots(&self) -> (usize, usize) {
         let main = self.owners[0][1..].iter().filter(|owner| owner.is_none()).count();
-        let others = self.owners[1..].iter().flatten().filter(|owner| owner.is_none()).count();
+        let others = (1..self.carriers.len())
+            .filter(|i| !self.data_only(*i))
+            .flat_map(|i| self.owners[i].iter())
+            .filter(|owner| owner.is_none())
+            .count();
         (main, others)
     }
 
@@ -250,10 +308,12 @@ impl TimeslotAllocator {
         matches!(owner, None | Some(TimeslotOwner::PacketData))
     }
 
+    /// Traffic slots a call can get on any carrier (a data-only carrier is never one).
     pub fn free_slot_count(&self) -> usize {
         self.owners
             .iter()
             .enumerate()
+            .filter(|(carrier_i, _)| !self.data_only(*carrier_i))
             .flat_map(|(carrier_i, slots)| {
                 let slice = if carrier_i == 0 { &slots[1..] } else { &slots[..] };
                 slice.iter()
@@ -423,6 +483,65 @@ mod tests {
         );
         alloc.release_slot(TimeslotOwner::Cmce, pdch).unwrap();
         assert!(alloc.slot_is_free(pdch));
+    }
+
+    #[test]
+    fn packet_data_slots_on_another_carrier_may_take_ts1() {
+        let mut alloc = TimeslotAllocator::default();
+        alloc.configure_carriers(&[1584, 1585]);
+        let slots = alloc.reserve_packet_data_slots_on(1585, &[4, 3, 2, 1], 4);
+        assert_eq!(slots.iter().map(|s| s.ts).collect::<Vec<_>>(), vec![4, 3, 2, 1]);
+        assert!(slots.iter().all(|s| s.carrier_num == 1585));
+        assert!(
+            alloc.reserve_packet_data_slots_on(1584, &[1], 1).is_empty(),
+            "never ts1 of the main carrier"
+        );
+        assert!(alloc.reserve_packet_data_slots_on(1599, &[2], 1).is_empty(), "no such carrier");
+        assert_eq!(alloc.free_traffic_slots(), (3, 0));
+    }
+
+    #[test]
+    fn voice_preempts_a_carrier_packet_data_slot_last() {
+        let mut alloc = TimeslotAllocator::default();
+        alloc.configure_carriers(&[1584, 1585]);
+        for ts in 2..=4 {
+            alloc.reserve(TimeslotOwner::Cmce, ts).unwrap();
+        }
+        assert_eq!(alloc.reserve_packet_data_slots_on(1585, &[1, 2, 3, 4], 4).len(), 4);
+        let taken = alloc.allocate_any_slot(TimeslotOwner::Cmce).expect("a carrier packet-data slot");
+        assert_eq!(taken, CarrierSlot { carrier_num: 1585, ts: 1 });
+        assert_eq!(alloc.drain_preempted_packet_data(), vec![taken]);
+        assert!(alloc.drain_preempted_packet_data().is_empty(), "reported once");
+
+        // A main-carrier packet-data slot goes first.
+        let mut alloc = TimeslotAllocator::default();
+        alloc.configure_carriers(&[1584, 1585]);
+        alloc.reserve(TimeslotOwner::Cmce, 2).unwrap();
+        alloc.reserve(TimeslotOwner::Cmce, 3).unwrap();
+        let main = alloc.reserve_packet_data_slot(&[4]).unwrap();
+        assert_eq!(alloc.reserve_packet_data_slots_on(1585, &[1, 2, 3, 4], 4).len(), 4);
+        assert_eq!(alloc.allocate_any_slot(TimeslotOwner::Cmce), Some(main));
+        assert_eq!(
+            alloc.allocate_any_slot(TimeslotOwner::Cmce),
+            Some(CarrierSlot { carrier_num: 1585, ts: 1 })
+        );
+    }
+
+    #[test]
+    fn a_data_only_carrier_is_never_given_to_voice() {
+        let mut alloc = TimeslotAllocator::default();
+        alloc.configure_carriers(&[1584, 1585]);
+        alloc.set_data_only_carrier(Some(1585));
+        assert_eq!(alloc.free_slot_count(), 3);
+        assert_eq!(alloc.free_traffic_slots(), (3, 0));
+        let voice: Vec<_> = (0..3).map(|_| alloc.allocate_any_slot(TimeslotOwner::Cmce).unwrap()).collect();
+        assert!(voice.iter().all(|s| s.carrier_num == 1584), "{voice:?}");
+        assert_eq!(alloc.allocate_any_slot(TimeslotOwner::Cmce), None);
+        assert_eq!(alloc.free_slot_count(), 0);
+        assert_eq!(alloc.reserve_packet_data_slots_on(1585, &[4, 3, 2, 1], 4).len(), 4, "data still goes there");
+        assert_eq!(alloc.allocate_any_slot(TimeslotOwner::Brew), None, "and is never preempted");
+        alloc.configure_carriers(&[1584, 1585]);
+        assert_eq!(alloc.free_slot_count(), 0, "kept across a carrier reconfiguration");
     }
 
     #[test]

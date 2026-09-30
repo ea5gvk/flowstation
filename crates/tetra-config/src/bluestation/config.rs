@@ -386,6 +386,9 @@ impl SharedConfig {
             .map(|(carrier_num, _, _)| carrier_num)
             .collect::<Vec<_>>();
         state.timeslot_alloc.configure_carriers(&carriers);
+        state
+            .timeslot_alloc
+            .set_data_only_carrier(cfg.pdch_carrier().filter(|p| p.exclusive).map(|p| p.carrier));
 
         Self {
             cfg: Arc::new(cfg),
