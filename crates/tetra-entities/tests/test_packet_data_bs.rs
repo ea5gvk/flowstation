@@ -4748,6 +4748,46 @@ fn a_call_that_takes_the_carrier_channel_still_reaches_its_member() {
     );
 }
 
+/// A call took the member's carrier channel and the SNDCP has not given the channel back yet: a
+/// group PDU of the first four frames is repeated on the MCCH (the member may still be on its
+/// channel), a later one is not (the member hears the MCCH by then, and the members there would
+/// get it twice).
+#[test]
+fn only_the_group_pdus_just_after_a_preemption_are_repeated() {
+    debug::setup_logging_verbose();
+    let mut test = ComponentTest::from_config(carrier_config(false, 4, false), Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
+    grant_carrier_slots(&test.config, ISSI, &[4, 3, 2, 1], true);
+    {
+        let mut state = test.config.state_write();
+        state.subscribers.register(ISSI);
+        state.subscribers.affiliate(ISSI, GSSI);
+        for ts in 2..=4 {
+            state.timeslot_alloc.reserve(TimeslotOwner::Cmce, ts).unwrap();
+        }
+        assert_eq!(state.timeslot_alloc.allocate_any_slot(TimeslotOwner::Cmce), Some(carrier_slot(1)));
+    }
+    let mut to_group = Vec::new();
+    for tick in 0..80 {
+        if tick == 1 || tick == 30 {
+            test.submit_message(tl_data_to(TetraAddress::new(GSSI, SsiType::Gssi), false));
+        }
+        test.run_stack(Some(1));
+        for m in test.dump_sinks() {
+            if let SapMsgInner::TmaUnitdataReq(req) = &m.msg
+                && req.main_address.ssi == GSSI
+            {
+                to_group.push((tick, req.link_id));
+            }
+        }
+    }
+    assert!(test.config.state_read().pdch_preempted(ISSI), "the channel not given back yet");
+    assert!(to_group.iter().all(|g| g.1 == 0), "all on the MCCH: {to_group:?}");
+    let ticks: Vec<usize> = to_group.iter().map(|g| g.0).collect();
+    assert_eq!(ticks.len(), 3, "the first twice, the second once: {ticks:?}");
+    assert!(ticks[1] >= ticks[0] + 16 && ticks[2] >= 30, "{ticks:?}");
+}
+
 /// The radio's BL-ACK of its assignment is lost; its first uplink on the channel (its AL-SETUP)
 /// acknowledges it: no retransmission on the MCCH, no "never acknowledged" release, and the
 /// next acknowledged PDU to it leaves on the carrier at once.

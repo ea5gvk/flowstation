@@ -105,6 +105,12 @@ pub struct Llc {
     /// Group PDUs repeated on the MCCH a few frames later, for a member whose packet-data channel
     /// the call just took (due time, the copy).
     preempt_repeats: Vec<(TdmaTime, SapMsg)>,
+
+    /// Radios whose packet-data channel a call took (`StackState::pdch_preempted`, until the
+    /// SNDCP gives the channel back) and the time the LLC first saw it: only the group PDUs of the
+    /// first `PDCH_PREEMPT_REPEAT_FRAMES`, when the radio may still be on its channel, are
+    /// repeated.
+    preempted_since: HashMap<u32, TdmaTime>,
 }
 
 /// A group PDU is repeated on the MCCH this many frames after it went down, for a member whose
@@ -134,6 +140,7 @@ impl Llc {
             pdch_mode,
             pdch_carrier,
             preempt_repeats: Vec::new(),
+            preempted_since: HashMap::new(),
             dltime: TdmaTime::default(),
             config,
             scheduled_out_acks: VecDeque::new(),
@@ -221,9 +228,10 @@ impl Llc {
     ///
     /// With a packet-data carrier in use each copy names its member's carrier (and a channel
     /// allocation in it keeps the carrier of the original); and for a member whose channel a call
-    /// has just taken (it still listens there for a few AACHs) the PDU is repeated once on the
-    /// MCCH `PDCH_PREEMPT_REPEAT_FRAMES` later, so it joins that call at once rather than by late
-    /// entry.
+    /// has taken less than `PDCH_PREEMPT_REPEAT_FRAMES` ago (it may still listen there, for a few
+    /// AACHs) the PDU is repeated once on the MCCH that much later, so it joins that call at once
+    /// rather than by late entry. After that the member hears the MCCH: no repeat, which the
+    /// members already there would get twice (a group SDS shown twice).
     fn group_copies_for_pdchs(&mut self, msg: &SapMsg) -> Vec<SapMsg> {
         let SapMsgInner::TmaUnitdataReq(req) = &msg.msg else {
             return Vec::new();
@@ -259,6 +267,8 @@ impl Llc {
             };
             (members, preempted)
         };
+        let now = self.dltime;
+        preempted.retain(|issi| now.diff(*self.preempted_since.entry(*issi).or_insert(now)) < PDCH_PREEMPT_REPEAT_FRAMES * 4);
         members.sort_unstable();
         preempted.sort_unstable();
         if let Some(first) = preempted.first() {
@@ -1433,6 +1443,15 @@ impl TetraEntityTrait for Llc {
 
     fn tick_end(&mut self, queue: &mut MessageQueue, _ts: TdmaTime) -> bool {
         let mut had_activity = false;
+        // With a packet-data carrier: since when each radio's channel has been taken by a call.
+        if self.pdch_carrier.is_some() {
+            let now = self.dltime;
+            let state = self.config.state_read();
+            self.preempted_since.retain(|issi, _| state.pdch_preempted(*issi));
+            for issi in state.pdch_by_issi.keys().filter(|issi| state.pdch_preempted(**issi)) {
+                self.preempted_since.entry(*issi).or_insert(now);
+            }
+        }
         // `bearer = "pdch"`: where each radio is now, for the PDUs that go down this tick.
         let pdch_routes = (self.pdch_mode && !self.outbound_messages.is_empty()).then(|| self.pdch_routes());
 
