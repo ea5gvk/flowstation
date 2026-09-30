@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Chris YO3TCO / Nexus-BS Project
 // SPDX-License-Identifier: Apache-2.0 AND PolyForm-Noncommercial-1.0.0
 // SPDX-FileComment: Modified by Nexus-BS Project; see CHANGES-NEXUS.md for change notices.
-// SPDX-FileComment: Adapted for flowstation-miura (multislot PDCH on the main carrier, half-duplex guard) by EA5GVK.
+// SPDX-FileComment: Adapted for flowstation-miura (multislot PDCH on the main carrier and on a packet-data carrier, half-duplex guard) by EA5GVK.
 
 //! Packet-data channels of several slots (`[packet_data] pdch_max_slots` > 1) on the main
 //! carrier: what the scheduler does for them besides sharing one downlink queue.
@@ -39,12 +39,35 @@
 //! once the downlink slots around it went out, a reserved one is covered by G1.
 //!
 //! With one slot per radio none of this applies.
+//!
+//! On the packet-data carrier (`[packet_data] pdch_carrier`, a carrier without MCCH) a channel
+//! may also hold ts1, and has four slots at most:
+//!
+//! - its uplink never uses ts1 (the adjacent-channel copy of a burst there would land on the MCCH
+//!   uplink of the cell): ts1 is an opportunity the MS counts but never a granted slot, and its
+//!   AACH shows the uplink reserved;
+//! - the radio arrives from the main carrier's MCCH: it is sent nothing before the first downlink
+//!   slot of its channel after the assignment, and taken as transmitting (its linearisation
+//!   burst) in the first uplink slot (23.5.4.3.1 rule 1 a, 23.5.4.3.4);
+//! - on four slots frame 18 leaves four channel slots without a fragment, which may already be
+//!   N.203 (">= 4", annex B.2): no downlink fragmentation starts in frames 14 to 17 (G4), and the
+//!   reply slot of an acknowledgement request is four opportunities away.
 
 use super::*;
 
 /// Opportunities before a reply slot at the earliest: the MS decodes the segment and builds its
 /// AL-ACK meanwhile (on {3,4}, a segment in (f,4) is answered in (f+1,4) at the earliest).
 const PDCH_REPLY_MIN_OPPORTUNITIES: usize = 2;
+
+/// The same on a channel of four slots, where two opportunities are only two timeslots.
+const PDCH_REPLY_MIN_OPPORTUNITIES_FOUR: usize = 4;
+
+/// Frames in which no downlink fragmentation starts on a channel of four slots (G4): it would
+/// still run across frame 18, four channel slots without a fragment.
+const PDCH_FOUR_SLOT_NO_FRAG_FRAMES: std::ops::RangeInclusive<u8> = 14..=17;
+
+/// A radio arriving from another carrier's MCCH is waited for this long at most (a multiframe).
+const PDCH_ARRIVAL_WINDOW: i32 = 72;
 
 /// Uplink capacity owed to the radio of a packet-data channel of several slots.
 #[derive(Debug, Clone, Copy)]
@@ -73,7 +96,11 @@ impl BsChannelScheduler {
     /// Whether the radio of the packet-data channel `ts` belongs to hears downlink slot `ts`
     /// (G1). Always true for a channel of one slot and for any other slot.
     pub(super) fn pdch_radio_hears(&self, ts: TdmaTime) -> bool {
-        let Some(ssi) = self.multislot_owner(ts.t) else {
+        // On a carrier without MCCH a channel of one slot has its arrival rule too.
+        let owner = self
+            .multislot_owner(ts.t)
+            .or_else(|| self.pdch_owner(ts.t).filter(|_| !self.allow_mcch()));
+        let Some(ssi) = owner else {
             return true;
         };
         let deaf = self.pdch_ms_deaf(ts, ssi, self.pdch_timeslots_of(ssi), self.queue_index(ts.t));
@@ -87,9 +114,12 @@ impl BsChannelScheduler {
     /// downlink slot `d`: it is transmitting or switching (EN 300 392-2 9.3.9, 23.1.3.1.1,
     /// 23.3.1.2.2 NOTE 2), or `d` comes too soon after its channel assignment (23.5.4.3.1). A
     /// reservation on another slot, the MCCH's say, does not count: once on the channel the MS
-    /// does not use grants of the channel it left.
+    /// does not use grants of the channel it left. A radio sent here from the MCCH of another
+    /// carrier receives nothing before the first downlink slot of its channel, and not while it
+    /// sends its linearisation burst in the first uplink slot (23.5.4.3.4).
     fn pdch_ms_deaf(&self, d: TdmaTime, ssi: u32, channel: [bool; 4], q: usize) -> bool {
-        self.pdch_assigned_at[q].is_some_and(|a| a.add_timeslots(1) == d)
+        self.pdch_arrival[q].is_some_and(|(d1, u1)| (1..PDCH_ARRIVAL_WINDOW).contains(&d1.diff(d)) || (1..=3).contains(&d.diff(u1)))
+            || self.pdch_assigned_at[q].is_some_and(|a| a.add_timeslots(1) == d)
             || (1..=3).any(|k| {
                 let u = d.add_timeslots(-k);
                 channel[u.t as usize - 1] && self.ul_reserved_to(u, ssi)
@@ -97,7 +127,7 @@ impl BsChannelScheduler {
     }
 
     /// Whether uplink slot `u` is reserved to `ssi`.
-    fn ul_reserved_to(&self, u: TdmaTime, ssi: u32) -> bool {
+    pub fn ul_reserved_to(&self, u: TdmaTime, ssi: u32) -> bool {
         let e = &self.ulsched[u.t as usize - 1][self.ul_ts_to_sched_index(&u)];
         e.ul1 == Some(ssi) || e.ul2 == Some(ssi)
     }
@@ -127,8 +157,16 @@ impl BsChannelScheduler {
     /// this slot.
     pub(super) fn pdch_whole_only(&self, ts: TdmaTime) -> bool {
         self.multislot_owner(ts.t).is_some_and(|ssi| {
-            self.pdch_channel_debt[self.queue_index(ts.t)].is_some() || self.pdch_ul_ahead(ts, ssi, self.pdch_timeslots_of(ssi))
+            let channel = self.pdch_timeslots_of(ssi);
+            self.pdch_channel_debt[self.queue_index(ts.t)].is_some()
+                || self.pdch_ul_ahead(ts, ssi, channel)
+                || (Self::width(channel) == 4 && PDCH_FOUR_SLOT_NO_FRAG_FRAMES.contains(&ts.f))
         })
+    }
+
+    /// Number of slots of a channel.
+    fn width(channel: [bool; 4]) -> usize {
+        channel.iter().filter(|set| **set).count()
     }
 
     /// The last of the PDU `fragger` sends went out in downlink slot `ts`: if it assigns a
@@ -136,14 +174,51 @@ impl BsChannelScheduler {
     /// the MS receives is the first one starting at least one slot after the end of this one
     /// (23.5.4.3.1 rule 1, NOTE 7 ii). Not where it was first taken: with no room left there it
     /// waits for the next block, fragmented it moves the MS only once all out (23.4.2.1.1).
+    ///
+    /// On the main carrier with a packet-data carrier in use, an individual assignment to that
+    /// carrier is listed for the UMAC, which hands the radio over to the carrier's scheduler.
     pub(super) fn pdch_note_assignment(&mut self, ts: TdmaTime, fragger: &BsFragger) {
-        if let Some(c) = fragger.chan_alloc()
-            && c.carrier_num == self.carrier_num
+        let Some(c) = fragger.chan_alloc() else {
+            return;
+        };
+        if c.carrier_num == self.carrier_num
             && c.ts_assigned.iter().filter(|set| **set).count() > 1
             && let Some(lowest) = c.ts_assigned.iter().position(|set| *set)
         {
             self.pdch_assigned_at[lowest] = Some(ts);
+        } else if self.pdch_handoff_carrier == Some(c.carrier_num)
+            && c.ts_assigned.iter().any(|set| *set)
+            && !fragger.is_for_group()
+            && let Some(ssi) = fragger.ssi()
+        {
+            self.pdch_assignments_elsewhere.push((ssi, c.ts_assigned, ts));
         }
+    }
+
+    /// The radio `ssi` was assigned its packet-data channel `channel` of this carrier in downlink
+    /// slot `a` of another carrier's MCCH: the first downlink slot of the channel it receives is
+    /// the first one starting at least a slot after the end of `a`, and its first uplink slot the
+    /// first one of the channel starting then (EN 300 392-2 23.5.4.3.1 rule 1 a and NOTE 7; the
+    /// uplink slot labelled u is on air with downlink u+2, 9.3.9). It may send its linearisation
+    /// burst in that uplink slot (23.5.4.3.4).
+    pub fn pdch_note_assignment_from_mcch(&mut self, ssi: u32, channel: [bool; 4], a: TdmaTime) {
+        let Some(lowest) = channel.iter().position(|set| *set) else {
+            return;
+        };
+        let q = self.queue_index(lowest as u8 + 1);
+        let first = |from: TdmaTime| (0..8).map(|k| from.add_timeslots(k)).find(|t| channel[t.t as usize - 1]);
+        let (Some(d1), Some(u1)) = (first(a.add_timeslots(2)), first(a)) else {
+            return;
+        };
+        self.pdch_arrival[q] = Some((d1, u1));
+        tracing::debug!(
+            "UMAC: ISSI {} assigned its PDCH of carrier {} in {}: first downlink slot {}, first uplink slot {}",
+            ssi,
+            self.carrier_num,
+            a,
+            d1,
+            u1
+        );
     }
 
     /// A PDU of `ssi` came in uplink slot `label` (PHY block `block`) of its channel of several
@@ -198,7 +273,7 @@ impl BsChannelScheduler {
         if channel.iter().filter(|set| **set).count() < 2 {
             return;
         }
-        for ts in (2..=4u8).filter(|ts| channel[usize::from(*ts) - 1]) {
+        for ts in (1..=4u8).filter(|ts| channel[usize::from(*ts) - 1]) {
             let held: Vec<TdmaTime> = (0..=67)
                 .map(|k| self.cur_dltime.add_timeslots(k))
                 .filter(|u| u.t == ts && self.ul_reserved_to(*u, ssi))
@@ -230,8 +305,9 @@ impl BsChannelScheduler {
     /// successive channel slots of the first free run starting at position `min_pos` or later
     /// (EN 300 392-2 23.5.2.2.2). Every slot of the channel counts, frame 18 included; a run never
     /// starts in frame 18, jumps a common linearization slot there and ends at any other frame-18
-    /// slot (the MS would use it, and frame 18 is never granted). None when no run starts within
-    /// the largest delay.
+    /// slot (the MS would use it, and frame 18 is never granted). On a carrier without MCCH uplink
+    /// ts1 of the channel counts too but is never granted: a run ends there. None when no run
+    /// starts within the largest delay.
     fn ul_find_channel_opportunity(&self, from: TdmaTime, channel: [bool; 4], n: usize, min_pos: usize) -> Option<(usize, Vec<TdmaTime>)> {
         let (mut pos, mut start, mut run) = (0usize, 0usize, Vec::with_capacity(n));
         for dist in 0..(MACSCHED_NUM_FRAMES - 1) * NUM_TIMESLOTS {
@@ -248,6 +324,10 @@ impl BsChannelScheduler {
                 if !run.is_empty() && !c.is_mandatory_clch() {
                     run.clear();
                 }
+                continue;
+            }
+            if c.t == 1 && !self.allow_mcch() {
+                run.clear();
                 continue;
             }
             if run.is_empty() && i < min_pos {
@@ -327,6 +407,23 @@ impl BsChannelScheduler {
         }
     }
 
+    /// The radio `ssi` moved to its packet-data channel of another carrier in downlink slot
+    /// `label`: the uplink slots it holds here after it are freed (grants on the channel it left
+    /// cease to be valid, 23.5.4.3.1). Returns how many.
+    pub fn ul_release_for_handoff(&mut self, label: TdmaTime, ssi: u32) -> usize {
+        let held = self.ul_held_after(label, ssi, [true; 4]);
+        for u in &held {
+            let index = self.ul_ts_to_sched_index(u);
+            let e = &mut self.ulsched[u.t as usize - 1][index];
+            e.ul1 = e.ul1.filter(|s| *s != ssi);
+            e.ul2 = e.ul2.filter(|s| *s != ssi);
+            if e.ul1.is_none() && e.ul2.is_none() {
+                e.usage_marker = None;
+            }
+        }
+        held.len()
+    }
+
     /// An advanced link segment asking for an acknowledgement is queued to `ssi`, the radio of a
     /// channel of several slots (the LLC tags it `DATA_CATEGORY_AL_REPLY`): its reporter.
     pub fn pdch_want_reply(&mut self, ssi: u32, reporter: TxReporter) {
@@ -381,7 +478,11 @@ impl BsChannelScheduler {
                 addr: TetraAddress::issi(ssi),
                 slots: 1,
                 not_before: d.add_timeslots(-1),
-                min_pos: PDCH_REPLY_MIN_OPPORTUNITIES,
+                min_pos: if Self::width(self.pdch_timeslots_of(ssi)) == 4 {
+                    PDCH_REPLY_MIN_OPPORTUNITIES_FOUR
+                } else {
+                    PDCH_REPLY_MIN_OPPORTUNITIES
+                },
             });
         }
         let Some(debt) = self.pdch_channel_debt[q] else {
@@ -530,7 +631,7 @@ impl BsChannelScheduler {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{dl_pdus, finalize_slots, multislot_slotter};
+    use super::super::tests::{carrier_slotter, dl_pdus, finalize_slots, get_testing_slotter, multislot_slotter};
     use super::*;
 
     const RADIO: u32 = 2_145_007;
@@ -1216,5 +1317,473 @@ mod tests {
         sched.pdch_random_access(label.add_timeslots(1), PhyBlockNum::Block1, RADIO);
         assert!(!started(&sched));
         assert_eq!(reporter.get_state(), tetra_core::TxState::Discarded);
+    }
+
+    // The packet-data carrier (a carrier without MCCH) ------------------------------------------
+
+    const ALL: [bool; 4] = [true; 4];
+
+    /// The scheduler of the packet-data carrier with the radio's channel `channel`, its next slot
+    /// built (4,1).
+    fn carrier_sched(channel: &[u8]) -> BsChannelScheduler {
+        let mut sched = carrier_slotter(RADIO, channel);
+        sched.set_dl_time(at(3, 3));
+        sched
+    }
+
+    /// The AACH of a slot: (header, ACCESS-ASSIGN).
+    fn aach(slot: &TmvUnitdataReqSlot) -> (u8, AccessAssign) {
+        let mut bbk = slot.bbk.as_ref().unwrap().mac_block.clone();
+        bbk.seek(0);
+        let header = bbk.peek_bits(2).unwrap() as u8;
+        (header, AccessAssign::from_bitbuf(&mut bbk).unwrap())
+    }
+
+    fn one_slot_grant() -> BasicSlotgrant {
+        BasicSlotgrant {
+            capacity_allocation: BasicSlotgrantCapAlloc::Grant1Slot,
+            granting_delay: BasicSlotgrantGrantingDelay::CapAllocAtNextOpportunity,
+        }
+    }
+
+    /// Ts1 is a traffic slot of a carrier without MCCH: a channel may take it there, never on
+    /// the main carrier.
+    #[test]
+    fn test_a_carrier_without_mcch_takes_a_pdch_on_ts1() {
+        let sched = carrier_slotter(RADIO, &[1, 2, 3, 4]);
+        assert_eq!(sched.pdch_timeslots_of(RADIO), ALL);
+        assert_eq!((sched.pdch_anchor(3, RADIO), sched.queue_index(4)), (Some(1), 0));
+        let main = multislot_slotter(RADIO, &[1, 2]);
+        assert_eq!(
+            (main.pdch_owner(1), main.pdch_owner(2)),
+            (None, Some(RADIO)),
+            "ts1 of the main carrier is the MCCH"
+        );
+    }
+
+    /// Every slot of a carrier channel shows assigned control (Header 2); the uplink of ts1 always
+    /// shows reserved, so the radio never random-accesses there (23.5.1.4.2 b). Without a channel
+    /// ts1 is unallocated as always.
+    #[test]
+    fn test_carrier_pdch_ts1_aach_is_assigned_control_and_reserved() {
+        let mut sched = carrier_sched(&[1, 2, 3, 4]);
+        for slot in finalize_slots(&mut sched, 4 * 20).iter().filter(|s| s.ts.f != 18) {
+            let (header, a) = aach(slot);
+            assert_eq!(
+                (header, a.dl_usage, a.ul_usage),
+                (2, AccessAssignDlUsage::AssignedControl, AccessAssignUlUsage::AssignedOnly),
+                "{}",
+                slot.ts
+            );
+            let reserved = a.f2_af.map(|af| af.base_frame_len) == Some(0);
+            assert_eq!(reserved, slot.ts.t == 1, "{}", slot.ts);
+        }
+        let mut idle = carrier_sched(&[]);
+        for slot in finalize_slots(&mut idle, 8).iter().filter(|s| s.ts.t == 1) {
+            let (_, a) = aach(slot);
+            assert_eq!(
+                (a.dl_usage, a.ul_usage),
+                (AccessAssignDlUsage::Unallocated, AccessAssignUlUsage::Unallocated)
+            );
+        }
+    }
+
+    /// The uplink of a carrier channel never takes ts1: the MS counts it as an opportunity
+    /// (23.5.2.2.2), the BS never grants it, so a run ends there and a chunk has three slots at
+    /// most; the slots reserved are the ones the MS will use.
+    #[test]
+    fn test_no_uplink_grant_on_carrier_ts1() {
+        for (start, req, total) in [
+            (at(3, 3), ReservationRequirement::Req6Slots, 6),
+            (at(15, 3), ReservationRequirement::Req13Slots, 13),
+        ] {
+            assert_eq!(granted_on_a_carrier_channel(start, req).len(), total, "{start}");
+        }
+    }
+
+    /// The uplink slots the radio of a carrier channel {1,2,3,4} reads in the grants for `req`
+    /// asked just before `start`, each checked: never ts1, three at most per grant, every one
+    /// reserved to it by the BS.
+    fn granted_on_a_carrier_channel(start: TdmaTime, req: ReservationRequirement) -> Vec<TdmaTime> {
+        let mut sched = carrier_slotter(RADIO, &[1, 2, 3, 4]);
+        sched.set_dl_time(start);
+        assert!(sched.ul_defer_to_channel(start.add_timeslots(-1), radio(), &req));
+        let mut granted = Vec::new();
+        for _ in 0..4 * 40 {
+            let slot = finalize_slots(&mut sched, 1).remove(0);
+            if let Some((n, delay)) = grant_in(&slot) {
+                let labels = ms_granted_labels(slot.ts, delay, n, ALL);
+                assert!(n <= 3 && labels.iter().all(|u| u.t != 1), "{} {labels:?}", slot.ts);
+                for u in &labels {
+                    assert_eq!(sched.ul_get_slot_owner(*u, PhyBlockNum::Both), Some(RADIO), "{u}");
+                }
+                granted.extend(labels);
+            }
+        }
+        granted
+    }
+
+    /// Grants on four slots across frame 18, as the MS counts them (frame 18 included, its common
+    /// linearization slot jumped): in a multiframe where that slot is ts1 ((MN + 1) mod 4 = 3) and
+    /// in one where it is ts3, every slot the MS uses is the one reserved to it.
+    #[test]
+    fn test_multislot_grant_is_counted_over_four_slots() {
+        for m in [2u8, 4] {
+            let start = time(m, 15, 3);
+            let granted = granted_on_a_carrier_channel(start, ReservationRequirement::Req13Slots);
+            assert_eq!(granted.len(), 13, "{start}: {granted:?}");
+            assert!(granted.iter().all(|u| u.f != 18), "{start}: {granted:?}");
+        }
+    }
+
+    /// Downlink ts1 of a carrier channel carries its owner's grants, acknowledgements and PDUs;
+    /// another radio's are dropped there as before.
+    #[test]
+    fn test_grant_ra_ack_and_link_on_carrier_dl_ts1_for_its_owner() {
+        let mut sched = carrier_sched(&[1, 2, 3, 4]);
+        let other = TetraAddress::issi(RADIO + 1);
+        sched.dl_enqueue_random_access_ack(1, radio());
+        sched.dl_enqueue_random_access_ack(1, other);
+        sched.dl_enqueue_grant(1, other, one_slot_grant(), None);
+        let (pdu, sdu) = resource(64);
+        sched.dl_enqueue_tma_for_link(1, pdu, sdu, None);
+        let pdu = BsChannelScheduler::dl_make_minimal_resource(&other, None, false);
+        sched.dl_enqueue_tma_for_link(1, pdu, BitBuffer::from_bitstr("1010"), None);
+        assert_eq!(sched.dltx_queues[0].len(), 2, "the owner's only");
+        let slot = finalize_slots(&mut sched, 1).remove(0);
+        assert_eq!(slot.ts, at(4, 1));
+        assert!(dl_pdus(&slot).iter().all(|p| p.1 == Some(RADIO)), "{:?}", dl_pdus(&slot));
+        assert!(!dl_pdus(&slot).is_empty());
+    }
+
+    /// A radio assigned its carrier channel in main (4,1) (23.5.4.3.1 rule 1 a): on {1,2,3,4} its
+    /// first downlink slot is (4,3) and it linearises in uplink (4,1), deaf until (4,4), so the
+    /// first PDU goes in (5,1); on {3,4} in (4,3), then not in (4,4); on {2} in (5,2).
+    #[test]
+    fn test_the_channel_is_entered_per_rule_1a_with_linearisation() {
+        for (channel, first, silent) in [
+            (&[1u8, 2, 3, 4][..], at(5, 1), None),
+            (&[3u8, 4][..], at(4, 3), Some(at(4, 4))),
+            (&[2u8][..], at(5, 2), None),
+        ] {
+            let mut sched = carrier_sched(channel);
+            let mut bits = [false; 4];
+            for ts in channel {
+                bits[usize::from(*ts) - 1] = true;
+            }
+            sched.pdch_note_assignment_from_mcch(RADIO, bits, at(4, 1));
+            for _ in 0..8 {
+                let (pdu, sdu) = resource(64);
+                sched.dl_enqueue_tma_for_link(u32::from(channel[0]), pdu, sdu, None);
+            }
+            let carried: Vec<TdmaTime> = finalize_slots(&mut sched, 8)
+                .iter()
+                .filter(|s| dl_pdus(s).iter().any(|p| p.1 == Some(RADIO)))
+                .map(|s| s.ts)
+                .collect();
+            assert_eq!(carried.first(), Some(&first), "{channel:?}: {carried:?}");
+            assert!(silent.is_none_or(|t| !carried.contains(&t)), "{channel:?}: {carried:?}");
+        }
+    }
+
+    /// Frame 18 of a carrier channel (9.5.2): BSCH + BNCH only where (MN + TN) mod 4 = 3, SCH/HD
+    /// + BNCH where it is 1, SCH/F elsewhere. A main-carrier channel and an idle carrier slot keep
+    /// BSCH + BNCH.
+    #[test]
+    fn test_frame_18_on_a_carrier_pdch_follows_9_5_2() {
+        for m in 1..=4u8 {
+            let mut sched = carrier_slotter(RADIO, &[1, 2, 3, 4]);
+            sched.set_dl_time(TdmaTime { t: 3, f: 17, m, h: 0 });
+            let slots = finalize_slots(&mut sched, 6);
+            let f18: Vec<&TmvUnitdataReqSlot> = slots.iter().filter(|s| s.ts.f == 18).collect();
+            assert_eq!(f18.len(), 4);
+            for s in f18 {
+                let expected = match (s.ts.m + s.ts.t) % 4 {
+                    3 => LogicalChannel::Bsch,
+                    1 => LogicalChannel::SchHd,
+                    _ => LogicalChannel::SchF,
+                };
+                assert_eq!(s.blk1.as_ref().unwrap().logical_channel, expected, "{}", s.ts);
+                let second = s.blk2.as_ref().map(|b| b.logical_channel);
+                assert_eq!(
+                    second,
+                    (expected != LogicalChannel::SchF).then_some(LogicalChannel::Bnch),
+                    "{}",
+                    s.ts
+                );
+            }
+        }
+        let mut main = multislot_slotter(RADIO, &[2, 3, 4]);
+        let mut idle = carrier_slotter(RADIO, &[]);
+        for sched in [&mut main, &mut idle] {
+            sched.set_dl_time(TdmaTime { t: 3, f: 17, m: 1, h: 0 });
+            for s in finalize_slots(sched, 6).iter().filter(|s| s.ts.f == 18) {
+                assert_eq!(s.blk1.as_ref().unwrap().logical_channel, LogicalChannel::Bsch, "{}", s.ts);
+            }
+        }
+    }
+
+    /// With a packet-data carrier in use, no grant rides on an assignment to it (the move would
+    /// wait for the granted slots, 23.5.4.3.1 rule 1 b): it goes on its own, and the assignment is
+    /// listed for the hand-off. Without one the grant is merged as always and nothing is listed.
+    #[test]
+    fn test_no_grant_is_merged_into_a_cross_carrier_assignment() {
+        use tetra_pdus::umac::fields::channel_allocation::ChanAllocElement;
+        use tetra_saps::lcmc::enums::{alloc_type::ChanAllocType, ul_dl_assignment::UlDlAssignment};
+        for handoff in [None, Some(1002)] {
+            let mut sched = get_testing_slotter();
+            sched.set_pdch_handoff_carrier(handoff);
+            sched.set_pdch_handoff_owners([Some(RADIO); 4]);
+            sched.set_dl_time(at(3, 3));
+            let mut assignment = BsChannelScheduler::dl_make_minimal_resource(&radio(), None, false);
+            assignment.chan_alloc_element = Some(ChanAllocElement {
+                alloc_type: ChanAllocType::Replace,
+                ts_assigned: ALL,
+                ul_dl_assigned: UlDlAssignment::Both,
+                clch_permission: true,
+                cell_change_flag: false,
+                carrier_num: 1002,
+                ext: None,
+                mon_pattern: 1,
+                frame18_mon_pattern: None,
+            });
+            sched.dl_enqueue_tma_for_link(0, assignment, BitBuffer::from_bitstr("1011001110001111"), None);
+            sched.dl_enqueue_grant(1, radio(), one_slot_grant(), None);
+            let slot = finalize_slots(&mut sched, 1).remove(0);
+            assert_eq!(slot.ts, at(4, 1));
+            let mine: Vec<(bool, bool)> = resources(&slot)
+                .iter()
+                .filter(|r| r.addr.is_some_and(|a| a.ssi == RADIO))
+                .map(|r| (r.chan_alloc_element.is_some(), r.slot_granting_element.is_some()))
+                .collect();
+            let listed = sched.take_assignments_elsewhere();
+            match handoff {
+                None => {
+                    assert_eq!(mine, vec![(true, true)], "merged as always");
+                    assert!(listed.is_empty());
+                }
+                Some(_) => {
+                    assert_eq!(mine, vec![(true, false), (false, true)], "the grant on its own");
+                    assert_eq!(listed, vec![(RADIO, ALL, at(4, 1))]);
+                }
+            }
+        }
+    }
+
+    /// The hand-off: the radio's MCCH reservations after its assignment are freed (another
+    /// radio's stay), its grant dropped, its queued PDUs go to its channel queue on the carrier in
+    /// their order; the group's stay on the MCCH, and so does a copy of its assignment (told by
+    /// its channel allocation being the radio's channel on the carrier).
+    #[test]
+    fn test_the_handoff_frees_mcch_reservations_and_moves_items() {
+        use tetra_pdus::umac::fields::channel_allocation::ChanAllocElement;
+        use tetra_saps::lcmc::enums::{alloc_type::ChanAllocType, ul_dl_assignment::UlDlAssignment};
+        let mut main = get_testing_slotter();
+        main.set_pdch_handoff_carrier(Some(1002));
+        main.set_pdch_handoff_owners([Some(RADIO); 4]);
+        main.set_dl_time(at(3, 3));
+        let mut assignment = BsChannelScheduler::dl_make_minimal_resource(&radio(), None, false);
+        assignment.chan_alloc_element = Some(ChanAllocElement {
+            alloc_type: ChanAllocType::Replace,
+            ts_assigned: ALL,
+            ul_dl_assigned: UlDlAssignment::Both,
+            clch_permission: true,
+            cell_change_flag: false,
+            carrier_num: 1002,
+            ext: None,
+            mon_pattern: 1,
+            frame18_mon_pattern: None,
+        });
+        main.dl_enqueue_tma_for_link(0, assignment, BitBuffer::from_bitstr("1011001110001111"), None);
+        main.ul_reserve_grant(RADIO, vec![at(5, 1)], false, None);
+        main.ul_reserve_grant(RADIO + 1, vec![at(6, 1)], false, None);
+        let ack = BsChannelScheduler::dl_make_minimal_resource(&radio(), None, false);
+        main.dl_enqueue_tma_for_link(0, ack, BitBuffer::from_bitstr("0110"), None);
+        let (pdu, sdu) = resource(40);
+        main.dl_enqueue_tma_for_link(0, pdu, sdu, None);
+        main.dl_enqueue_grant(1, radio(), one_slot_grant(), None);
+        let group = TetraAddress::new(91, SsiType::Gssi);
+        let pdu = BsChannelScheduler::dl_make_minimal_resource(&group, None, false);
+        main.dl_enqueue_tma_for_link(0, pdu, BitBuffer::from_bitstr("1111"), None);
+        assert_eq!(main.ul_release_for_handoff(at(4, 1), RADIO), 1);
+        assert_eq!(main.ul_get_slot_owner(at(5, 1), PhyBlockNum::Both), None);
+        assert_eq!(main.ul_get_slot_owner(at(6, 1), PhyBlockNum::Both), Some(RADIO + 1));
+        let (items, dropped) = main.take_individual_items(RADIO);
+        assert_eq!((items.len(), dropped), (2, 1));
+        assert_eq!(main.dltx_queues[0].len(), 2, "the assignment and the group's stay");
+        let mut carrier = carrier_sched(&[1, 2, 3, 4]);
+        carrier.enqueue_on_pdch(RADIO, items);
+        let sizes: Vec<usize> = carrier.dltx_queues[0]
+            .iter()
+            .map(|e| match e {
+                DlSchedElem::Resource(_, sdu, ..) => sdu.get_len(),
+                _ => 0,
+            })
+            .collect();
+        assert_eq!(sizes, vec![4, 40]);
+    }
+
+    /// A channel allocation that is not a packet-data channel assignment (a call's, say) still
+    /// carries the radio's grant with a packet-data carrier in use.
+    #[test]
+    fn test_a_call_allocation_to_the_carrier_still_carries_the_grant() {
+        use tetra_pdus::umac::fields::channel_allocation::ChanAllocElement;
+        use tetra_saps::lcmc::enums::{alloc_type::ChanAllocType, ul_dl_assignment::UlDlAssignment};
+        let mut sched = get_testing_slotter();
+        sched.set_pdch_handoff_carrier(Some(1002));
+        sched.set_pdch_handoff_owners([None, Some(RADIO), Some(RADIO), Some(RADIO)]);
+        sched.set_dl_time(at(3, 3));
+        let mut setup = BsChannelScheduler::dl_make_minimal_resource(&radio(), None, false);
+        setup.chan_alloc_element = Some(ChanAllocElement {
+            alloc_type: ChanAllocType::Replace,
+            ts_assigned: [true, false, false, false],
+            ul_dl_assigned: UlDlAssignment::Both,
+            clch_permission: true,
+            cell_change_flag: false,
+            carrier_num: 1002,
+            ext: None,
+            mon_pattern: 1,
+            frame18_mon_pattern: None,
+        });
+        sched.dl_enqueue_tma_for_link(0, setup, BitBuffer::from_bitstr("1011001110001111"), None);
+        sched.dl_enqueue_grant(1, radio(), one_slot_grant(), None);
+        let slot = finalize_slots(&mut sched, 1).remove(0);
+        let mine: Vec<(bool, bool)> = resources(&slot)
+            .iter()
+            .filter(|r| r.addr.is_some_and(|a| a.ssi == RADIO))
+            .map(|r| (r.chan_alloc_element.is_some(), r.slot_granting_element.is_some()))
+            .collect();
+        assert_eq!(mine, vec![(true, true)]);
+    }
+
+    /// Only the main carrier's scheduler with a packet-data carrier lists assignments to it:
+    /// without one, and on a carrier without MCCH, channel allocations to the other carrier
+    /// (calls, a quit to the MCCH) leave nothing to drain.
+    #[test]
+    fn test_assignments_elsewhere_stay_empty_without_a_carrier() {
+        use tetra_pdus::umac::fields::channel_allocation::ChanAllocElement;
+        use tetra_saps::lcmc::enums::{alloc_type::ChanAllocType, ul_dl_assignment::UlDlAssignment};
+        let alloc_to = |carrier_num: u16, alloc_type: ChanAllocType, ts_assigned: [bool; 4]| {
+            let mut pdu = BsChannelScheduler::dl_make_minimal_resource(&radio(), None, false);
+            pdu.chan_alloc_element = Some(ChanAllocElement {
+                alloc_type,
+                ts_assigned,
+                ul_dl_assigned: UlDlAssignment::Both,
+                clch_permission: true,
+                cell_change_flag: false,
+                carrier_num,
+                ext: None,
+                mon_pattern: 1,
+                frame18_mon_pattern: None,
+            });
+            pdu
+        };
+        let mut main = get_testing_slotter();
+        main.set_dl_time(at(3, 3));
+        let mut carrier = carrier_sched(&[2, 3]);
+        for _ in 0..25 {
+            let pdu = alloc_to(1002, ChanAllocType::Replace, [false, true, false, false]);
+            main.dl_enqueue_tma_for_link(0, pdu, BitBuffer::from_bitstr("1011001110001111"), None);
+            let pdu = alloc_to(main.carrier_num, ChanAllocType::QuitAndGo, [false; 4]);
+            carrier.dl_enqueue_tma_for_link(2, pdu, BitBuffer::from_bitstr("1011001110001111"), None);
+            finalize_slots(&mut main, 4);
+            finalize_slots(&mut carrier, 4);
+        }
+        assert!(main.take_assignments_elsewhere().is_empty());
+        assert!(carrier.take_assignments_elsewhere().is_empty());
+    }
+
+    /// PDUs queued outside a build for the next slot are moved to the MCCH queue before a main
+    /// channel slot is built; on a carrier without MCCH queue 0 is a channel's queue and they
+    /// stay where they are.
+    #[test]
+    fn test_out_of_build_items_stay_off_a_carrier_channel() {
+        for (mut sched, moved) in [(channel_sched(&[2, 3]), 1), (carrier_sched(&[2, 3]), 0)] {
+            let (pdu, sdu) = resource(40);
+            sched.dl_enqueue_tma_next_frame(pdu, sdu, None);
+            sched.pdch_route_out_of_build_items(at(4, 2));
+            assert_eq!(
+                (sched.dltx_queues[0].len(), sched.dltx_next_slot_queue.len()),
+                (moved, 1 - moved),
+                "carrier {}",
+                sched.carrier_num
+            );
+        }
+    }
+
+    /// G4: on four slots no downlink fragmentation starts in frames 14 to 17 (it would meet the
+    /// four empty slots of frame 18); one started before frame 14 ends before frame 18. On three
+    /// slots nothing changes.
+    #[test]
+    fn test_no_fragmentation_across_frame_18_on_four_slots() {
+        let run = |channel: &[u8], carrier: bool, first: TdmaTime| -> (TdmaTime, TdmaTime) {
+            let mut sched = if carrier {
+                carrier_slotter(RADIO, channel)
+            } else {
+                multislot_slotter(RADIO, channel)
+            };
+            sched.set_dl_time(first.add_timeslots(-2));
+            let (pdu, sdu) = resource(2000);
+            sched.dl_enqueue_packet_data_for_link(u32::from(channel[0]), pdu, sdu, None);
+            let slots = finalize_slots(&mut sched, 4 * 10);
+            let start = slots.iter().find(|s| dl_pdus(s).iter().any(|p| p.0 == 0 && p.2 == 0b111111));
+            let end = slots.iter().find(|s| dl_pdus(s).iter().any(|p| p.0 == 3));
+            (start.expect("started").ts, end.expect("ended").ts)
+        };
+        assert_eq!(run(&[1, 2, 3, 4], true, at(14, 1)).0, time(2, 1, 1));
+        let (start, end) = run(&[1, 2, 3, 4], true, at(13, 1));
+        assert!(start == at(13, 1) && end.f < 18, "{start} {end}");
+        assert_eq!(run(&[2, 3, 4], false, at(14, 2)).0, at(14, 2), "three slots: as before");
+    }
+
+    /// On four slots the reply slot of a segment asking for an acknowledgement is four
+    /// opportunities away at least, never on ts1 (there, the next opportunity).
+    #[test]
+    fn test_reply_slot_on_four_slots_is_four_opportunities_away() {
+        let mut sched = carrier_sched(&[1, 2, 3, 4]);
+        let reporter = TxReporter::new_unacked();
+        let (pdu, sdu) = resource(200);
+        sched.dl_enqueue_tma_for_link(2, pdu, sdu, Some(reporter.clone()));
+        sched.pdch_want_reply(RADIO, reporter);
+        let slot = finalize_slots(&mut sched, 4)
+            .into_iter()
+            .find(|s| grant_in(s).is_some())
+            .expect("a reply slot");
+        let (n, delay) = grant_in(&slot).unwrap();
+        let labels = ms_granted_labels(slot.ts, delay, n, ALL);
+        assert_eq!((slot.ts, n, delay), (at(4, 1), 1, 5), "(5,1) is ts1: (5,2)");
+        assert_eq!(held_by_radio(&sched, slot.ts), labels);
+        assert_eq!(labels, vec![at(5, 2)]);
+    }
+
+    /// A carrier slot that stops being a channel sends SCH/F with the AACH unallocated for a
+    /// multiframe (9.5.1b NOTE), its previous owner known meanwhile; then BSCH again. On the main
+    /// carrier the slot sends what it did (the previous owner is known there too).
+    #[test]
+    fn test_a_released_carrier_pdch_slot_shows_unallocated_for_a_multiframe() {
+        let mut sched = carrier_sched(&[2, 3]);
+        finalize_slots(&mut sched, 4);
+        let t0 = sched.cur_dltime;
+        sched.set_pdch(2, None);
+        sched.set_pdch(3, None);
+        assert_eq!((sched.pdch_released_owner(2), sched.pdch_released_owner(4)), (Some(RADIO), None));
+        for s in finalize_slots(&mut sched, 4 * 20)
+            .iter()
+            .filter(|s| matches!(s.ts.t, 2 | 3) && s.ts.f != 18)
+        {
+            let lchan = s.blk1.as_ref().unwrap().logical_channel;
+            if s.ts.diff(t0) <= PDCH_RELEASED_UNALLOCATED_SLOTS {
+                assert_eq!(lchan, LogicalChannel::SchF, "{}", s.ts);
+                assert_eq!(aach(s).1.dl_usage, AccessAssignDlUsage::Unallocated, "{}", s.ts);
+            } else {
+                assert_eq!(lchan, LogicalChannel::Bsch, "{}", s.ts);
+            }
+        }
+        assert_eq!(sched.pdch_released_owner(2), None, "a multiframe later");
+        let mut main = channel_sched(&[2, 3]);
+        main.set_pdch(2, None);
+        assert_eq!(main.pdch_released_owner(2), Some(RADIO));
+        let next_ts2 = finalize_slots(&mut main, 4).into_iter().find(|s| s.ts.t == 2).unwrap();
+        assert_eq!(next_ts2.blk1.unwrap().logical_channel, LogicalChannel::Bsch);
     }
 }

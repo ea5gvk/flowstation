@@ -62,6 +62,12 @@ pub const TCH_S_CAP: usize = 274;
 /// Number of timeslots the scheduler operates on. May become larger when secondary carriers are supported.
 pub const NUM_TIMESLOTS: usize = 4;
 
+/// A slot of a carrier without MCCH that stops being a packet-data channel sends SCH/F with the
+/// AACH unallocated for this long (one multiframe) instead of BSCH + BNCH, whose AACH a radio on
+/// an assigned channel does not read (EN 300 392-2 9.5.1b NOTE): a radio still there leaves after
+/// N.208 adverse AACHs (23.5.6.1.1) rather than T.208.
+pub const PDCH_RELEASED_UNALLOCATED_SLOTS: i32 = 72;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CarrierDownlinkMode {
     PrimaryMcch,
@@ -156,8 +162,32 @@ pub struct BsChannelScheduler {
     next_usage_marker: [u8; 4],
 
     /// Packet-data channel per timeslot: the ISSI it is assigned to (`[packet_data] bearer =
-    /// "pdch"`, main carrier ts 2..=4 only). The UMAC sets it from the shared state every tick.
+    /// "pdch"`: main carrier ts 2..=4, packet-data carrier ts 1..=4). The UMAC sets it from the
+    /// shared state every tick.
     pdch: [Option<u32>; 4],
+
+    /// When each slot stopped being a packet-data channel, and whose it was. For a multiframe
+    /// after that the previous owner's uplink there is not taken for an adjacent-channel copy,
+    /// and on a carrier without MCCH the slot sends SCH/F with the AACH unallocated (a radio still
+    /// there leaves, see `PDCH_RELEASED_UNALLOCATED_SLOTS`).
+    pdch_released_at: [Option<TdmaTime>; 4],
+    pdch_released_owner: [Option<u32>; 4],
+
+    /// Main carrier only, with a packet-data carrier in use: that carrier. The packet-data channel
+    /// assignments to it built here are listed for the UMAC (`take_assignments_elsewhere`), and no
+    /// grant rides on them.
+    pdch_handoff_carrier: Option<u16>,
+    /// The packet-data channels of `pdch_handoff_carrier` (owner per timeslot), as the UMAC last
+    /// set them: what tells a packet-data channel assignment to that carrier from a call's
+    /// channel allocation there (see `is_handoff_assignment`).
+    pdch_handoff_owners: [Option<u32>; 4],
+    /// Channel assignments to `pdch_handoff_carrier` that went out: (ISSI, timeslots, downlink
+    /// slot that carried it).
+    pdch_assignments_elsewhere: Vec<(u32, [bool; 4], TdmaTime)>,
+    /// A radio sent here from another carrier's MCCH, by its channel's queue: the first downlink
+    /// slot and the first uplink slot of its channel (EN 300 392-2 23.5.4.3.1 rule 1 a), see
+    /// `multislot`.
+    pdch_arrival: [Option<(TdmaTime, TdmaTime)>; 4],
 
     /// Uplink capacity still owed on a packet-data channel after a chunked grant: the radio, the
     /// slots left and the last slot of the chunk already granted.
@@ -245,6 +275,12 @@ impl BsChannelScheduler {
             // Start each timeslot's marker cursor at 4 (first valid value).
             next_usage_marker: [4, 4, 4, 4],
             pdch: [None; 4],
+            pdch_released_at: [None; 4],
+            pdch_released_owner: [None; 4],
+            pdch_handoff_carrier: None,
+            pdch_handoff_owners: [None; 4],
+            pdch_assignments_elsewhere: Vec::new(),
+            pdch_arrival: [None; 4],
             pdch_ul_debt: [None; 4],
             pdch_assigned_at: [None; 4],
             pdch_channel_debt: [None; 4],
@@ -360,12 +396,13 @@ impl BsChannelScheduler {
         }
     }
 
-    /// Make `ts` (2..=4) the packet-data channel of `owner`, or no packet-data channel. When it
-    /// stops being one radio's PDCH, the signalling still queued there for that radio is dropped:
-    /// the radio goes back to the MCCH on its own when the AACH no longer shows assigned control
-    /// (EN 300 392-2 23.5.6.1.1), and the LLC sends again what it must.
+    /// Make `ts` (2..=4, and 1 on a carrier without MCCH) the packet-data channel of `owner`, or
+    /// no packet-data channel. When it stops being one radio's PDCH, the signalling still queued
+    /// there for that radio is dropped: the radio goes back to the MCCH on its own when the AACH
+    /// no longer shows assigned control (EN 300 392-2 23.5.6.1.1), and the LLC sends again what
+    /// it must.
     pub fn set_pdch(&mut self, ts: u8, owner: Option<u32>) {
-        if !(2..=4).contains(&ts) {
+        if !self.supports_assigned_traffic_ts(ts) {
             return;
         }
         let idx = ts as usize - 1;
@@ -381,11 +418,22 @@ impl BsChannelScheduler {
         self.pdch_ul_debt[idx] = None;
         self.pdch_assigned_at[idx] = None;
         self.pdch_channel_debt[idx] = None;
+        self.pdch_arrival[idx] = None;
+        // On a carrier without MCCH the slot then shows itself unallocated for a while (9.5.1b).
+        let other_carrier = !self.allow_mcch();
+        self.pdch_released_at[idx] = old.filter(|_| owner.is_none()).map(|_| self.cur_dltime);
+        self.pdch_released_owner[idx] = old.filter(|_| owner.is_none());
+        let of_carrier = if other_carrier {
+            format!(" of carrier {}", self.carrier_num)
+        } else {
+            String::new()
+        };
         if let Some(old) = old {
             let dropped = self.dl_drop_queued_for_ssi(ts, old);
             tracing::info!(
-                "UMAC: ts {} is no longer the PDCH of ISSI {} ({}; {} queued PDU(s) dropped)",
+                "UMAC: ts {}{} is no longer the PDCH of ISSI {} ({}; {} queued PDU(s) dropped)",
                 ts,
+                of_carrier,
                 old,
                 if self.circuits.is_active(Direction::Dl, self.carrier_num, ts) {
                     "taken by a call"
@@ -396,8 +444,120 @@ impl BsChannelScheduler {
             );
         }
         if let Some(issi) = owner {
-            tracing::info!("UMAC: ts {} is the PDCH of ISSI {} (AACH assigned control)", ts, issi);
+            tracing::info!("UMAC: ts {}{} is the PDCH of ISSI {} (AACH assigned control)", ts, of_carrier, issi);
         }
+    }
+
+    /// Whether this scheduler holds a packet-data channel.
+    pub fn has_pdch(&self) -> bool {
+        self.pdch.iter().any(Option::is_some)
+    }
+
+    /// The radio whose packet-data channel `ts` stopped being less than
+    /// `PDCH_RELEASED_UNALLOCATED_SLOTS` ago (its last bursts there are its own).
+    pub fn pdch_released_owner(&self, ts: u8) -> Option<u32> {
+        let idx = usize::from(ts).checked_sub(1).filter(|i| *i < 4)?;
+        let at = self.pdch_released_at[idx]?;
+        (0..=PDCH_RELEASED_UNALLOCATED_SLOTS)
+            .contains(&self.cur_dltime.diff(at))
+            .then_some(self.pdch_released_owner[idx])
+            .flatten()
+    }
+
+    /// Whether downlink slot `ts` stopped being a packet-data channel of this carrier without
+    /// MCCH less than `PDCH_RELEASED_UNALLOCATED_SLOTS` ago.
+    fn pdch_recently_released(&self, ts: TdmaTime) -> bool {
+        self.pdch_released_at[ts.t as usize - 1].is_some_and(|at| (0..=PDCH_RELEASED_UNALLOCATED_SLOTS).contains(&ts.diff(at)))
+    }
+
+    /// Main carrier, with a packet-data carrier in use: `carrier` (see `pdch_handoff_carrier`).
+    pub fn set_pdch_handoff_carrier(&mut self, carrier: Option<u16>) {
+        self.pdch_handoff_carrier = carrier;
+    }
+
+    /// Main carrier, with a packet-data carrier in use: the packet-data channels of that carrier
+    /// (owner per timeslot), set by the UMAC every tick before the slot is built.
+    pub fn set_pdch_handoff_owners(&mut self, owners: [Option<u32>; 4]) {
+        self.pdch_handoff_owners = owners;
+    }
+
+    /// Whether `pdu` assigns its radio its packet-data channel of the packet-data carrier
+    /// `carrier` (whose channels are `owners`): an individual channel allocation to that carrier
+    /// whose timeslots are that radio's channel there. miura does not mark a packet-data channel
+    /// assignment in the queue; a call's channel allocation to that carrier is never a radio's
+    /// channel there (a call that takes a slot of one takes the whole channel).
+    fn is_handoff_assignment(pdu: &MacResource, carrier: Option<u16>, owners: [Option<u32>; 4]) -> bool {
+        let (Some(c), Some(addr)) = (pdu.chan_alloc_element.as_ref(), pdu.addr) else {
+            return false;
+        };
+        addr.ssi_type != SsiType::Gssi
+            && Some(c.carrier_num) == carrier
+            && c.ts_assigned.iter().any(|set| *set)
+            && c.ts_assigned == owners.map(|o| o == Some(addr.ssi))
+    }
+
+    /// The packet-data channel assignments to `pdch_handoff_carrier` that went out since the
+    /// last call: (ISSI, timeslots, downlink slot that carried it).
+    pub fn take_assignments_elsewhere(&mut self) -> Vec<(u32, [bool; 4], TdmaTime)> {
+        std::mem::take(&mut self.pdch_assignments_elsewhere)
+    }
+
+    /// Downlink PDUs queued on the packet-data channels of this scheduler.
+    pub fn pdch_queue_depth(&self) -> usize {
+        (1..=4u8)
+            .filter(|ts| self.pdch_owner(*ts).is_some() && self.queue_index(*ts) == usize::from(*ts) - 1)
+            .map(|ts| self.dltx_queues[usize::from(ts) - 1].len())
+            .sum()
+    }
+
+    /// The radio `ssi` moves to its packet-data channel of another carrier: what is queued here
+    /// for it alone (MCCH and deferred items). Grants and random-access acknowledgements are void
+    /// there and dropped, a fragmentation under way is dropped (the MS discards a partial TM-SDU
+    /// when it moves, EN 300 392-2 23.5.4.3.1; the LLC retransmits an acknowledged one), a
+    /// packet-data channel assignment stays; everything else is returned, in order, for the
+    /// channel's queue. Returns the items and how many were dropped.
+    pub fn take_individual_items(&mut self, ssi: u32) -> (Vec<DlSchedElem>, usize) {
+        let (handoff, owners) = (self.pdch_handoff_carrier, self.pdch_handoff_owners);
+        let mine = |e: &DlSchedElem| match e {
+            DlSchedElem::Resource(pdu, _, _) => {
+                !Self::is_handoff_assignment(pdu, handoff, owners)
+                    && pdu.addr.is_some_and(|a| a.ssi == ssi && a.ssi_type != SsiType::Gssi)
+            }
+            DlSchedElem::FragBuf(f) => f.ssi() == Some(ssi) && !f.is_for_group(),
+            DlSchedElem::Grant(addr, ..) | DlSchedElem::RandomAccessAck(addr) => addr.ssi == ssi,
+            DlSchedElem::Broadcast(_) | DlSchedElem::Stealing(..) => false,
+        };
+        let mut taken = Vec::new();
+        let mut dropped = 0;
+        let mut queue = std::mem::take(&mut self.dltx_next_slot_queue);
+        queue.append(&mut self.dltx_queues[0]);
+        let mut kept = Vec::with_capacity(queue.len());
+        for e in queue {
+            if !mine(&e) {
+                kept.push(e);
+                continue;
+            }
+            match e {
+                DlSchedElem::Grant(..) | DlSchedElem::RandomAccessAck(_) => dropped += 1,
+                // Dropping a started fragger reports its TM-SDU discarded.
+                DlSchedElem::FragBuf(f) if f.is_started() => dropped += 1,
+                e => taken.push(e),
+            }
+        }
+        self.dltx_queues[0] = kept;
+        (taken, dropped)
+    }
+
+    /// The items `take_individual_items` took from the MCCH, first in the queue of the
+    /// packet-data channel of `ssi` here, in their order. Nothing when it has none here.
+    pub fn enqueue_on_pdch(&mut self, ssi: u32, items: Vec<DlSchedElem>) {
+        let Some(ts) = (1..=4u8).find(|ts| self.is_pdch_of(*ts, ssi)) else {
+            return;
+        };
+        let q = self.queue_index(ts);
+        let rest = std::mem::take(&mut self.dltx_queues[q]);
+        self.dltx_queues[q] = items;
+        self.dltx_queues[q].extend(rest);
     }
 
     /// ISSI whose packet-data channel `ts` is.
@@ -410,8 +570,8 @@ impl BsChannelScheduler {
         self.pdch_owner(ts) == Some(ssi)
     }
 
-    /// Timeslots (2..=4) of the packet-data channel of `ssi` on this carrier.
-    fn pdch_timeslots_of(&self, ssi: u32) -> [bool; 4] {
+    /// Timeslots of the packet-data channel of `ssi` on this carrier.
+    pub fn pdch_timeslots_of(&self, ssi: u32) -> [bool; 4] {
         [1u8, 2, 3, 4].map(|ts| self.is_pdch_of(ts, ssi))
     }
 
@@ -427,7 +587,7 @@ impl BsChannelScheduler {
         if !self.is_pdch_of(ts, ssi) {
             return None;
         }
-        (2..=4u8).find(|t| self.is_pdch_of(*t, ssi))
+        (1..=4u8).find(|t| self.is_pdch_of(*t, ssi))
     }
 
     /// Index of the downlink queue slot `ts` takes from and fills: its channel's lowest slot on a
@@ -442,8 +602,13 @@ impl BsChannelScheduler {
 
     /// Before a slot of a packet-data channel of several slots is built: PDUs queued outside a
     /// build for the next slot (`dl_enqueue_tma_next_frame`, the MCCH channel-allocation deferral)
-    /// are meant for ts1, where the radios they are for listen, not for this channel.
+    /// are meant for ts1, where the radios they are for listen, not for this channel. (On a
+    /// carrier without MCCH queue 0 may be a channel's queue: nothing is built outside a build
+    /// there.)
     fn pdch_route_out_of_build_items(&mut self, ts: TdmaTime) {
+        if !self.allow_mcch() {
+            return;
+        }
         if self.dltx_next_slot_queue.is_empty() || self.multislot_owner(ts.t).is_none() {
             return;
         }
@@ -887,7 +1052,7 @@ impl BsChannelScheduler {
     /// `usage_marker` is set when the grant covers >1 slot — the MS uses it to identify the reservation
     /// when continuing the burst on the second slot (per ETSI §21.4.3.2). Single-slot grants pass None.
     pub fn dl_enqueue_grant(&mut self, ts: u8, addr: TetraAddress, grant: BasicSlotgrant, usage_marker: Option<u8>) {
-        if ts == 1 && !self.allow_mcch() && !self.circuits.is_active(Direction::Dl, self.carrier_num, ts) {
+        if ts == 1 && !self.allow_mcch() && !self.circuits.is_active(Direction::Dl, self.carrier_num, ts) && !self.is_pdch_of(1, addr.ssi) {
             tracing::debug!(
                 "dl_enqueue_grant: carrier={} ignoring TS1 grant for {} because MCCH is disabled in mode {:?}",
                 self.carrier_num,
@@ -909,7 +1074,7 @@ impl BsChannelScheduler {
     }
 
     pub fn dl_enqueue_random_access_ack(&mut self, ts: u8, addr: TetraAddress) {
-        if ts == 1 && !self.allow_mcch() && !self.circuits.is_active(Direction::Dl, self.carrier_num, ts) {
+        if ts == 1 && !self.allow_mcch() && !self.circuits.is_active(Direction::Dl, self.carrier_num, ts) && !self.is_pdch_of(1, addr.ssi) {
             tracing::debug!(
                 "dl_enqueue_random_access_ack: carrier={} ignoring TS1 random-access ack for {} because MCCH is disabled in mode {:?}",
                 self.carrier_num,
@@ -1002,7 +1167,8 @@ impl BsChannelScheduler {
             return [link_ts, 0, 0, 0];
         }
 
-        if !self.allow_mcch() && link_ts == 1 {
+        // Downlink ts1 of a packet-data channel of this carrier is its owner's.
+        if !self.allow_mcch() && link_ts == 1 && !self.is_pdch_of(1, addr.ssi) {
             tracing::debug!(
                 "identify_timeslots_for_ssi: carrier={} has no MCCH and link_ts=1 for {}, dropping",
                 self.carrier_num,
@@ -1376,7 +1542,14 @@ impl BsChannelScheduler {
                 DlSchedElem::RandomAccessAck(addr) => addr,
                 _ => unreachable!("BUG: unhandled match variant -- should never be reached"),
             };
-            let mac_resource = self.dl_get_scheduled_resource_for_ssi(ts, addr);
+            // No grant or acknowledgement rides on a packet-data channel assignment to the
+            // packet-data carrier: it would be one on the channel the MS leaves, and delay the
+            // move (EN 300 392-2 23.5.4.3.1 rule 1 b); it goes on its own. (Calls are not
+            // concerned: their channel allocations merge as always.)
+            let (handoff, owners) = (self.pdch_handoff_carrier, self.pdch_handoff_owners);
+            let mac_resource = self
+                .dl_get_scheduled_resource_for_ssi(ts, addr)
+                .filter(|e| !matches!(e, DlSchedElem::Resource(pdu, ..) if Self::is_handoff_assignment(pdu, handoff, owners)));
             match mac_resource {
                 Some(DlSchedElem::Resource(pdu, _sdu, _repeat)) => {
                     // Integrate grant into the resource
@@ -1859,8 +2032,13 @@ impl BsChannelScheduler {
                     bbk: None,
                     ul_phy_chan: ul_phy,
                 }
-            } else if ts.f != 18 && !dl_circuit_active && self.pdch_owner(ts.t).is_some() {
-                // An idle packet-data channel keeps sending SCH/F (a Null PDU) for its radio.
+            } else if ts.f != 18
+                && !dl_circuit_active
+                && (self.pdch_owner(ts.t).is_some() || (!self.allow_mcch() && self.pdch_recently_released(ts)))
+            {
+                // An idle packet-data channel keeps sending SCH/F (a Null PDU) for its radio. On a
+                // carrier without MCCH a slot that has just stopped being one does too, with the
+                // AACH unallocated, which a radio still there reads (EN 300 392-2 9.5.1b NOTE).
                 TmvUnitdataReqSlot {
                     carrier_num,
                     ts,
@@ -1998,61 +2176,37 @@ impl BsChannelScheduler {
             let mut aach = AccessAssign::default();
 
             match ts.t {
-                1 => {
-                    if self.allow_common_control_aach() {
-                        // TS1 (MCCH) DL is always CommonControl — that doesn't
-                        // change for individual reservations.
-                        aach.dl_usage = AccessAssignDlUsage::CommonControl;
+                1 if self.allow_common_control_aach() => {
+                    // TS1 (MCCH) DL is always CommonControl — that doesn't
+                    // change for individual reservations.
+                    aach.dl_usage = AccessAssignDlUsage::CommonControl;
 
-                        let ul_usage_for_slot = self.ul_get_usage(ts);
-                        match ul_usage_for_slot {
-                            AccessAssignUlUsage::Traffic(_) => {
-                                aach.ul_usage = ul_usage_for_slot;
-                            }
-                            _ => {
-                                aach.ul_usage = AccessAssignUlUsage::CommonOnly;
-                                aach.f1_af1 = Some(AccessField {
-                                    access_code: 0,
-                                    base_frame_len: 4,
-                                });
-                                aach.f2_af2 = Some(AccessField {
-                                    access_code: 0,
-                                    base_frame_len: 4,
-                                });
-                            }
+                    let ul_usage_for_slot = self.ul_get_usage(ts);
+                    match ul_usage_for_slot {
+                        AccessAssignUlUsage::Traffic(_) => {
+                            aach.ul_usage = ul_usage_for_slot;
                         }
-                    } else {
-                        let in_hangtime = self.supports_assigned_traffic_ts(ts.t) && self.hangtime[ts.t as usize - 1];
-
-                        if in_hangtime && (dl_traffic_usage.is_some() || ul_traffic_usage.is_some()) {
-                            aach.dl_usage = AccessAssignDlUsage::AssignedControl;
-                            aach.ul_usage = AccessAssignUlUsage::AssignedOnly;
-                            aach.f2_af = Some(AccessField {
+                        _ => {
+                            aach.ul_usage = AccessAssignUlUsage::CommonOnly;
+                            aach.f1_af1 = Some(AccessField {
                                 access_code: 0,
                                 base_frame_len: 4,
                             });
-                        } else {
-                            aach.dl_usage = if let Some(usage) = dl_traffic_usage {
-                                AccessAssignDlUsage::Traffic(usage)
-                            } else {
-                                AccessAssignDlUsage::Unallocated
-                            };
-                            aach.ul_usage = if let Some(usage) = ul_traffic_usage {
-                                AccessAssignUlUsage::Traffic(usage)
-                            } else {
-                                AccessAssignUlUsage::Unallocated
-                            };
+                            aach.f2_af2 = Some(AccessField {
+                                access_code: 0,
+                                base_frame_len: 4,
+                            });
                         }
                     }
                 }
-                2..=4 => {
-                    // Additional channels (TS2..TS4).
+                1..=4 => {
+                    // Additional channels (TS2..TS4, and TS1 of a carrier without MCCH).
                     // Normal operation: Traffic(usage) when a circuit is active, else Unallocated.
                     // Hangtime: immediately switch AACH to AssignedControl so radios
                     // detect the end of traffic in the same frame as D-TX CEASED.
                     // The timeslot may still be in traffic mode (for STCH delivery) but
                     // the AACH reflects the new channel state.
-                    let in_hangtime = (2..=4).contains(&ts.t) && self.hangtime[ts.t as usize - 1];
+                    let in_hangtime = self.supports_assigned_traffic_ts(ts.t) && self.hangtime[ts.t as usize - 1];
 
                     if in_hangtime && (dl_traffic_usage.is_some() || ul_traffic_usage.is_some()) {
                         aach.dl_usage = AccessAssignDlUsage::AssignedControl;
@@ -2067,12 +2221,16 @@ impl BsChannelScheduler {
                         // Assigned packet-data channel: DL assigned control, UL for the assigned MS
                         // (Header 2). Never Header 3 with an uplink usage marker >= 4: the MS
                         // would take the channel as gone (EN 300 392-2 23.5.6.1.1 c).
+                        // The uplink of ts1 of a carrier without MCCH is never used by a channel (its
+                        // adjacent-channel copy would land on the MCCH uplink): shown reserved, so no
+                        // random access there (23.5.1.4.2 b).
                         let ul = &self.ulsched[ts.t as usize - 1][self.ul_ts_to_sched_index(&ts)];
+                        let reserved = ul.ul1.is_some() || ul.ul2.is_some() || ts.t == 1;
                         aach.dl_usage = AccessAssignDlUsage::AssignedControl;
                         aach.ul_usage = AccessAssignUlUsage::AssignedOnly;
                         aach.f2_af = Some(AccessField {
                             access_code: 0,
-                            base_frame_len: if ul.ul1.is_some() || ul.ul2.is_some() { 0 } else { 4 },
+                            base_frame_len: if reserved { 0 } else { 4 },
                         });
                     } else {
                         aach.dl_usage = if let Some(usage) = dl_traffic_usage {
@@ -2140,6 +2298,31 @@ impl BsChannelScheduler {
     }
 
     fn generate_default_blks(&self, ts: TdmaTime) -> TmvUnitdataReq {
+        // Frame 18 of a packet-data channel of a carrier without MCCH is its control frame: BSCH
+        // only where (MN + TN) mod 4 = 3, BNCH (after an SCH/HD) where it is 1, normal SCH/F
+        // bursts elsewhere (EN 300 392-2 9.5.2), so its radio never meets a synchronization burst
+        // where it expects an SCH block (which would cost it a downlink TM-SDU, 23.4.3.1.1 ii).
+        if ts.f == 18 && !self.allow_mcch() && self.pdch_owner(ts.t).is_some() {
+            match (ts.m + ts.t) % 4 {
+                3 => {}
+                1 => {
+                    let mut buf = BitBuffer::new(SCH_HD_CAP);
+                    MacResource::null_pdu().to_bitbuf(&mut buf);
+                    return TmvUnitdataReq {
+                        logical_channel: LogicalChannel::SchHd,
+                        mac_block: buf,
+                        scrambling_code: self.scrambling_code,
+                    };
+                }
+                _ => {
+                    return TmvUnitdataReq {
+                        logical_channel: LogicalChannel::SchF,
+                        mac_block: self.generate_hangtime_idle_schf(),
+                        scrambling_code: self.scrambling_code,
+                    };
+                }
+            }
+        }
         match (ts.f, ts.t) {
             (1..=17, 1) => {
                 // Primary TS1 alternates between SCH/HD+BNCH and SCH/F null.
@@ -3028,6 +3211,18 @@ mod tests {
     /// A scheduler whose packet-data channel of `owner` is `slots` of the main carrier.
     pub(super) fn multislot_slotter(owner: u32, slots: &[u8]) -> BsChannelScheduler {
         let mut sched = get_testing_slotter();
+        for ts in slots {
+            sched.set_pdch(*ts, Some(owner));
+        }
+        sched
+    }
+
+    /// A scheduler of a carrier without MCCH (1002) whose packet-data channel of `owner` is
+    /// `slots`.
+    pub(super) fn carrier_slotter(owner: u32, slots: &[u8]) -> BsChannelScheduler {
+        let mut sched = get_testing_slotter();
+        sched.set_carrier_num(1002);
+        sched.set_downlink_mode(CarrierDownlinkMode::SecondaryBcchNoMcch);
         for ts in slots {
             sched.set_pdch(*ts, Some(owner));
         }

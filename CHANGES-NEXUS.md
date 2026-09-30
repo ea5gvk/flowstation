@@ -85,4 +85,6 @@ The sections above are copied verbatim from Nexus-BS. In this repository:
   four slots, frame 18 counted but never granted, the half-duplex guard of a
   radio without fast switching (nothing sent in the downlink slots it cannot
   hear, no downlink fragmentation across its uplink), a reply slot on advanced
-  link segments that ask for an acknowledgement.
+  link segments that ask for an acknowledgement. 2026-09: extended to
+  packet-data channels on a carrier without MCCH (ts1 downlink, no ts1 uplink,
+  four slots, frame-18 rules, cross-carrier arrival and hand-off).
