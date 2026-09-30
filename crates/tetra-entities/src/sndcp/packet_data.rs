@@ -956,6 +956,7 @@ impl PacketDataRuntime {
                 }
             }
             let main_gives = n.min(prefs.iter().filter(|ts| state.timeslot_alloc.is_free(**ts)).count());
+            let carrier_had_nothing = on_carrier.is_none();
             let slots = match on_carrier {
                 Some((c, free, n_c, hr)) if n_c >= main_gives => {
                     headroom = hr;
@@ -978,9 +979,10 @@ impl PacketDataRuntime {
                 }
                 state.pdch_heard_on_channel.remove(&issi);
             }
+            // Only when the carrier offered nothing (not when the main carrier simply offered more).
             let carrier_busy = carrier
                 .as_ref()
-                .filter(|_| !refused && slots.first().is_some_and(|s| s.carrier_num == main_carrier));
+                .filter(|_| !refused && carrier_had_nothing && slots.first().is_some_and(|s| s.carrier_num == main_carrier));
             (slots, headroom, carrier_busy.map(|c| c.0))
         };
         if slots.is_empty() {
