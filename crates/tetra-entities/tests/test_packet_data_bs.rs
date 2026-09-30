@@ -5447,6 +5447,119 @@ fn the_dashboard_shows_the_carrier_pdch() {
     );
 }
 
+/// The dashboard sees every slot of a four-slot channel of the packet-data carrier, each on that
+/// carrier: PDCH active and inactive on ts 1 to 4, and the downlink to the radio on each (they
+/// all carry it). Nothing is reported on the main carrier.
+#[test]
+fn the_dashboard_shows_every_slot_of_a_carrier_pdch() {
+    use tetra_entities::net_telemetry::{TelemetryEvent, telemetry_channel};
+    let (sink, source) = telemetry_channel();
+    let mut test = ComponentTest::from_config(carrier_config(false, 4, false), Some(TdmaTime::default()));
+    test.populate_entities(vec![], vec![TetraEntity::Llc, TetraEntity::Lmac]);
+    test.register_entity(tetra_entities::umac::umac_bs::UmacBs::new(test.get_shared_config(), Some(sink)));
+    let slots = grant_carrier_slots(&test.config, ISSI, &[4, 3, 2, 1], true);
+    test.run_stack(Some(2));
+    let changed = |events: &[TelemetryEvent], active: bool| -> Vec<(u16, u8)> {
+        let mut on: Vec<(u16, u8)> = events
+            .iter()
+            .filter_map(|e| match e {
+                TelemetryEvent::PdchChanged {
+                    carrier_num,
+                    ts,
+                    issi: ISSI,
+                    active: a,
+                } if *a == active => Some((*carrier_num, *ts)),
+                _ => None,
+            })
+            .collect();
+        on.sort_unstable();
+        on
+    };
+    let all: Vec<(u16, u8)> = (1..=4).map(|ts| (SECONDARY_CARRIER, ts)).collect();
+    assert_eq!(changed(&pdch_telemetry(&source), true), all);
+
+    let mut pdu = BitBuffer::new_autoexpand(32);
+    BlUdata { has_fcs: false }.to_bitbuf(&mut pdu);
+    append_bits(&mut pdu, "0101010101");
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+            carrier_num: Some(SECONDARY_CARRIER),
+            req_handle: 0,
+            pdu,
+            main_address: TetraAddress::issi(ISSI),
+            link_id: 4,
+            endpoint_id: 0,
+            stealing_permission: false,
+            subscriber_class: 0,
+            air_interface_encryption: None,
+            stealing_repeats_flag: None,
+            data_category: None,
+            chan_alloc: None,
+            tx_reporter: None,
+        }),
+    });
+    test.run_stack(Some(1));
+    let mut down: Vec<(u16, u8)> = pdch_telemetry(&source)
+        .iter()
+        .filter_map(|e| match e {
+            TelemetryEvent::TsDataActivity {
+                carrier_num,
+                ts,
+                issi: ISSI,
+                uplink: false,
+            } => Some((*carrier_num, *ts)),
+            _ => None,
+        })
+        .collect();
+    down.sort_unstable();
+    assert_eq!(down, all);
+
+    {
+        let mut state = test.config.state_write();
+        state.pdch_by_issi.remove(&ISSI);
+        state.pdch_timeslots_by_issi.remove(&ISSI);
+        for s in slots {
+            state.timeslot_alloc.release_slot(TimeslotOwner::PacketData, s).unwrap();
+        }
+    }
+    test.run_stack(Some(1));
+    assert_eq!(changed(&pdch_telemetry(&source), false), all);
+}
+
+/// The WAP gateway through a channel of the packet-data carrier: the radio is sent to four slots
+/// of the carrier, its WSP GET goes up on one of them and the gateway's answer comes down there,
+/// on its channel, never stolen.
+#[test]
+fn the_wap_gateway_answers_on_the_carrier() {
+    debug::setup_logging_verbose();
+    let mut air = Air::new(carrier_config(true, 4, false));
+    air.send(ISSI, &demand(1, None, true));
+    let ip = accept_ip(&air.next_sn(8).unwrap());
+    air.send(ISSI, &transmit_request_full(1, 4, 4));
+    let response = air.next_sn(8).unwrap();
+    assert_eq!(
+        response.alloc.as_ref().map(|a| (a.carrier, ts_of(a))),
+        Some((Some(SECONDARY_CARRIER), vec![1, 2, 3, 4]))
+    );
+    air.run(2);
+    assert!(air.test.config.state_read().pdch_by_issi[&ISSI].on_air);
+    air.take_sn();
+    let mut pdu = BitBuffer::new_autoexpand(64);
+    BlUdata { has_fcs: false }.to_bitbuf(&mut pdu);
+    let get = unitdata(1, &datagram(ip, GATEWAY, 9201, &wtp_get(0x51, "/status.wml")));
+    append_bits(&mut pdu, &format!("100{get}"));
+    air.uplink_on_carrier(ISSI, pdu, 3);
+    let answer = air.next_sn(300).expect("the answer");
+    assert_eq!(
+        (answer.sn_type(), answer.carrier, answer.link_id, answer.stealing),
+        (Some(4), Some(SECONDARY_CARRIER), 4, false)
+    );
+    wtp_down(&answer, ip);
+}
+
 /// `pdch_carrier` with the secondary carrier off (the dashboard switch): the main carrier as
 /// before.
 #[test]
