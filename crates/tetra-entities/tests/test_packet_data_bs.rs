@@ -5607,6 +5607,96 @@ fn heard_at(air: &mut UmacAir, u: TdmaTime, msgs: Vec<SapMsg>) -> Vec<u16> {
     air.up.iter().map(|u| u.carrier_num).collect()
 }
 
+/// A radio moved from its carrier channel to a call on main ts3 while it still holds uplink slots
+/// of its channel there (granted capacity is not withdrawn, 23.5.2.2.2): its random access and
+/// its stolen block on main ts3 in one of those slots are its own (it sends only SCH/F in a
+/// granted slot, 23.5.2.3.1), taken, and their copies on the carrier dropped. A lone SCH/F there
+/// is still the copy of its carrier grant.
+#[test]
+fn a_radio_in_a_main_call_is_heard_in_the_slots_it_still_holds_on_the_carrier() {
+    use tetra_core::PhyBlockNum;
+    use tetra_pdus::umac::enums::reservation_requirement::ReservationRequirement;
+    use tetra_saps::tmv::enums::logical_chans::LogicalChannel;
+    debug::setup_logging_verbose();
+    // In the first carrier ts3 slot it holds, with main ts3 in hangtime or the radio talking there.
+    let heard = |talking: bool, msgs: &dyn Fn() -> Vec<SapMsg>| {
+        let air = UmacAir::new(carrier_config(false, 4, false));
+        let (mut air, held) = in_a_main_call_holding_carrier_slots(air, &[4, 3, 2], ReservationRequirement::Req4Slots, talking);
+        heard_at(&mut air, held[0], msgs())
+    };
+    let access = |carrier, rssi| from_lmac_as(mac_access_of(ISSI, None), carrier, rssi, LogicalChannel::SchHu, PhyBlockNum::Block1);
+    let stolen = |carrier, rssi| from_lmac_as(stch_mac_data_of(ISSI), carrier, rssi, LogicalChannel::Stch, PhyBlockNum::Block1);
+    assert_eq!(
+        [
+            heard(false, &|| vec![access(MAIN_CARRIER, -40.0), access(SECONDARY_CARRIER, -75.0)]),
+            heard(true, &|| vec![stolen(MAIN_CARRIER, -40.0), stolen(SECONDARY_CARRIER, -75.0)]),
+            heard(false, &|| vec![from_lmac_on(mac_data_of(ISSI), MAIN_CARRIER, -40.0)]),
+        ],
+        [vec![MAIN_CARRIER], vec![MAIN_CARRIER], vec![]],
+        "SCH/HU in hangtime, STCH while it talks, a lone SCH/F"
+    );
+}
+
+/// A radio in hangtime of a call on main ts3, granted uplink slots there, then granted uplink
+/// slots of its carrier channel too: in a slot it holds on both, the SCH/F it sends on main ts3
+/// in its grant there is taken (one of the two is stale, the burst handed over first is the
+/// real one) and its copy on the carrier dropped.
+#[test]
+fn a_radio_in_a_main_call_uses_its_main_grant_in_a_slot_it_still_holds_on_the_carrier() {
+    use tetra_core::PhyBlockNum;
+    use tetra_pdus::umac::enums::reservation_requirement::ReservationRequirement;
+    use tetra_saps::tmv::enums::logical_chans::LogicalChannel;
+    debug::setup_logging_verbose();
+    let mut air = UmacAir::new(carrier_config(false, 4, false));
+    grant_carrier_slots(&air.test.config, ISSI, &[4, 3, 2], true);
+    call_on(&mut air, MAIN_CARRIER, 3, None);
+    // Grants of the radio on `carrier` from slot `from` on, read as the MS does on `channel`.
+    let granted = |air: &UmacAir, from: usize, carrier: u16, channel: &[u8]| -> Vec<TdmaTime> {
+        air.slots[from..]
+            .iter()
+            .filter(|s| s.carrier_num == carrier)
+            .filter_map(|s| grant_for(s, ISSI).map(|(n, delay)| ms_granted_labels(s.ts, delay, n, channel)))
+            .flatten()
+            .collect()
+    };
+
+    let first = TdmaTime { t: 3, f: 3, m: 1, h: 0 };
+    let access = mac_access_of(ISSI, Some(ReservationRequirement::Req8Slots));
+    let from = air.slots.len();
+    air.uplink_at(
+        first,
+        from_lmac_as(access, MAIN_CARRIER, -40.0, LogicalChannel::SchHu, PhyBlockNum::Block1),
+    );
+    for _ in 0..16 {
+        air.tick();
+    }
+    let on_main = granted(&air, from, MAIN_CARRIER, &[3]);
+    assert!(!on_main.is_empty(), "granted on main ts3");
+
+    let request = air.next_time().forward_to_timeslot(4);
+    let header = format!("001000{:024b}10{:04b}0", ISSI, ReservationRequirement::Req8Slots as u64);
+    let from = air.slots.len();
+    air.uplink_at(
+        request,
+        from_lmac_on(uplink_block(&header, &"1100".repeat(20)), SECONDARY_CARRIER, -40.0),
+    );
+    let v = (0..32)
+        .find_map(|_| {
+            air.tick();
+            let now = air.next_time();
+            granted(&air, from, SECONDARY_CARRIER, &[2, 3, 4])
+                .into_iter()
+                .find(|l| l.t == 3 && on_main.contains(l) && l.add_timeslots(2).diff(now) >= 0)
+        })
+        .expect("a ts3 slot held on both carriers");
+
+    let data = |carrier, rssi| from_lmac_on(mac_data_of(ISSI), carrier, rssi);
+    assert_eq!(
+        heard_at(&mut air, v, vec![data(MAIN_CARRIER, -40.0), data(SECONDARY_CARRIER, -75.0)]),
+        vec![MAIN_CARRIER]
+    );
+}
+
 /// The copy on main ts3 of a burst the radio sends in a carrier slot it holds, handed over first
 /// (another burst on the main carrier was stronger), is still dropped, and the real burst after
 /// it taken: in a full slot, and in a subslot of a channel of one slot.

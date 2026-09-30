@@ -309,13 +309,14 @@ impl UmacBs {
     ///      last bursts, 23.5.2.2.4 NOTE 2): the carrier has no MCCH;
     ///
     /// and while a channel of the packet-data carrier exists:
-    ///   2. a radio holding this uplink slot on the other carrier cannot be transmitting here too;
+    ///   2. a radio holding this uplink slot on the other carrier in the form of this burst, unless
+    ///      it holds it here too, cannot be transmitting here too;
     ///   3. on main ts2-4 only a circuit, its hangtime or a packet-data channel's radio transmits
     ///      (the mirror of 1).
     ///
     /// A copy whose original passed its CRC too is the same block bit for bit, already dropped
     /// in `rx_tmv_unitdata_ind`.
-    fn is_adjacent_channel_copy(&self, carrier_num: u16, msg_dltime: TdmaTime, issi: u32) -> bool {
+    fn is_adjacent_channel_copy(&self, carrier_num: u16, msg_dltime: TdmaTime, issi: u32, lchan: LogicalChannel) -> bool {
         let Some(pdch_carrier) = self.pdch_carrier else {
             return false;
         };
@@ -339,7 +340,26 @@ impl UmacBs {
             return false;
         }
         let other = if carrier_num == main { pdch_carrier } else { main };
-        if self.scheduler_for(other).ul_reserved_to(msg_dltime, issi) {
+        let there = self.scheduler_for(other);
+        // On a slot of its packet-data channel there (or of the one it gave back less than a
+        // multiframe ago) that carries no call, a reserved uplink slot is closed to random access
+        // by its AACH (23.5.1.4.2 b), or shown unallocated: the radio sends there only what it was
+        // granted, a slot as SCH/F and a subslot as SCH/HU (23.5.2.3.1), and so does its copy
+        // here. A random access or a stolen block here is its own, sent after it left that channel
+        // (the slots it holds there are void, 23.5.4.3.1). On the MCCH, a call or its hangtime a
+        // reserved slot stays open to random access: any burst.
+        let pdch_slot = (there.is_pdch_of(t, issi) || there.pdch_released_owner(t) == Some(issi))
+            && !(there.circuit_is_active(Direction::Dl, t) || there.circuit_is_active(Direction::Ul, t) || there.is_hangtime(t));
+        let reserved_there = there.ul_reserved_to(msg_dltime, issi);
+        let held_there = if pdch_slot {
+            there.ul_reserved_as(msg_dltime, issi, lchan)
+        } else {
+            reserved_there
+        };
+        // Reserved to it on both carriers, one reservation is stale (it left that carrier): the
+        // burst handed over first is taken, the copy after it is a bit copy.
+        let held_here = self.scheduler_for(carrier_num).ul_reserved_to(msg_dltime, issi);
+        if held_there && !held_here {
             tracing::debug!(
                 "UmacBs: dropping uplink from ISSI {} on carrier {} ts {}: that slot is reserved to it on carrier {}, adjacent-channel copy",
                 issi,
@@ -348,6 +368,21 @@ impl UmacBs {
                 other
             );
             return true;
+        }
+        if reserved_there {
+            tracing::debug!(
+                "UmacBs: uplink from ISSI {} on carrier {} ts {} ({:?}) taken although that slot is reserved to it on carrier {}: {}",
+                issi,
+                carrier_num,
+                t,
+                lchan,
+                other,
+                if held_here {
+                    "reserved to it here too"
+                } else {
+                    "not what it was granted there"
+                }
+            );
         }
         let sched = &self.channel_scheduler;
         if carrier_num == main
@@ -928,6 +963,7 @@ impl UmacBs {
         };
         assert!(prim.pdu.get_pos() == 0); // We should be at the start of the MAC PDU
         let carrier_num = prim.carrier_num;
+        let lchan = prim.logical_channel;
 
         let pdu = match MacData::from_bitbuf(&mut prim.pdu) {
             Ok(pdu) => {
@@ -952,7 +988,7 @@ impl UmacBs {
             tracing::warn!("UMAC: rx_mac_data: PDU has neither addr nor event_label; dropping");
             return;
         };
-        if self.is_adjacent_channel_copy(carrier_num, self.dltime.add_timeslots(-2), addr.ssi) {
+        if self.is_adjacent_channel_copy(carrier_num, self.dltime.add_timeslots(-2), addr.ssi, lchan) {
             self.ul_block_copy = true;
             return;
         }
@@ -1129,6 +1165,7 @@ impl UmacBs {
         };
         assert!(prim.pdu.get_pos() == 0); // We should be at the start of the MAC PDU
         let carrier_num = prim.carrier_num;
+        let lchan = prim.logical_channel;
 
         let pdu = match MacAccess::from_bitbuf(&mut prim.pdu) {
             Ok(pdu) => {
@@ -1153,7 +1190,7 @@ impl UmacBs {
             tracing::error!("BUG: unexpected message or state -- routing error");
             return;
         };
-        if self.is_adjacent_channel_copy(carrier_num, self.dltime.add_timeslots(-2), addr.ssi) {
+        if self.is_adjacent_channel_copy(carrier_num, self.dltime.add_timeslots(-2), addr.ssi, lchan) {
             self.ul_block_copy = true;
             return;
         }
