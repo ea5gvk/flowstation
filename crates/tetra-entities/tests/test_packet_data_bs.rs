@@ -169,6 +169,8 @@ struct Down {
     issi: u32,
     llc: LlcPduType,
     link_id: u32,
+    /// `TmaUnitdataReq::carrier_num`.
+    carrier: Option<u16>,
     stealing: bool,
     chan_alloc: bool,
     alloc: Option<CmceChanAllocReq>,
@@ -318,6 +320,7 @@ impl Air {
                 issi,
                 llc: LlcPduType::AlDataAlFinal,
                 link_id: 0,
+                carrier: None,
                 stealing: false,
                 chan_alloc: false,
                 alloc: None,
@@ -538,6 +541,7 @@ fn parse_down(req: &TmaUnitdataReq) -> Down {
             issi: req.main_address.ssi,
             llc,
             link_id: req.link_id,
+            carrier: req.carrier_num,
             stealing: req.stealing_permission,
             chan_alloc: req.chan_alloc.is_some(),
             alloc: req.chan_alloc.clone(),
@@ -566,6 +570,7 @@ fn parse_down(req: &TmaUnitdataReq) -> Down {
         issi: req.main_address.ssi,
         llc,
         link_id: req.link_id,
+        carrier: req.carrier_num,
         stealing: req.stealing_permission,
         chan_alloc: req.chan_alloc.is_some(),
         alloc: req.chan_alloc.clone(),
@@ -3402,12 +3407,18 @@ fn width1_identity_fragmented_datagram() {
 
 #[test]
 fn dual_identity_voice_before_the_pdch() {
-    assert_eq!(fingerprint(with_two_carriers_voice_uses_the_secondary_before_the_pdch), 0x92be_16fd_a974_2435);
+    assert_eq!(
+        fingerprint(with_two_carriers_voice_uses_the_secondary_before_the_pdch),
+        0x92be_16fd_a974_2435
+    );
 }
 
 #[test]
 fn dual_identity_duplex_calls() {
-    assert_eq!(fingerprint(duplex_calls_on_two_carriers_are_the_same_with_packet_data_on), 0xdb61_bf54_cae9_5f0b);
+    assert_eq!(
+        fingerprint(duplex_calls_on_two_carriers_are_the_same_with_packet_data_on),
+        0xdb61_bf54_cae9_5f0b
+    );
 }
 
 #[test]
@@ -3422,7 +3433,10 @@ fn multislot_identity_uplink_across_the_channel() {
 
 #[test]
 fn multislot_identity_voice_releases_the_channel() {
-    assert_eq!(fingerprint(voice_taking_one_slot_releases_the_whole_multislot_pdch), 0xb5f2_aab5_94b2_7a8c);
+    assert_eq!(
+        fingerprint(voice_taking_one_slot_releases_the_whole_multislot_pdch),
+        0xb5f2_aab5_94b2_7a8c
+    );
 }
 
 #[test]
@@ -4298,6 +4312,1065 @@ fn two_radios_never_share_a_slot() {
         .expect("the UMAC");
     let owners: Vec<Option<u32>> = (2..=4).map(|ts| umac.channel_scheduler.pdch_owner(ts)).collect();
     assert_eq!(owners, vec![Some(ISSI2), Some(ISSI), Some(ISSI)]);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Packet-data carrier (`pdch_carrier`): channels of up to four slots on the secondary carrier
+// ---------------------------------------------------------------------------------------------
+
+/// `multislot_config` with the secondary carrier as the packet-data carrier.
+fn carrier_config(wap: bool, n: u8, exclusive: bool) -> StackConfig {
+    let mut cfg = multislot_config(wap, n);
+    cfg.cell.secondary_carrier = Some(SECONDARY_CARRIER);
+    cfg.packet_data.pdch_carrier = Some(SECONDARY_CARRIER);
+    cfg.packet_data.pdch_carrier_exclusive = exclusive;
+    cfg
+}
+
+fn carrier_slot(ts: u8) -> CarrierSlot {
+    CarrierSlot {
+        carrier_num: SECONDARY_CARRIER,
+        ts,
+    }
+}
+
+/// Give `issi` the channel of `slots` of the packet-data carrier (the first one its grant's) in
+/// the shared state, as the SNDCP runtime does.
+fn grant_carrier_slots(config: &SharedConfig, issi: u32, slots: &[u8], on_air: bool) -> Vec<CarrierSlot> {
+    let mut state = config.state_write();
+    let reserved = state
+        .timeslot_alloc
+        .reserve_packet_data_slots_on(SECONDARY_CARRIER, slots, slots.len());
+    assert_eq!(reserved.len(), slots.len(), "slots free");
+    state.pdch_by_issi.insert(issi, PdchGrant { slot: reserved[0], on_air });
+    if reserved.len() > 1 {
+        let mut bits = [false; 4];
+        for s in &reserved {
+            bits[usize::from(s.ts) - 1] = true;
+        }
+        state.pdch_timeslots_by_issi.insert(issi, bits);
+    }
+    reserved
+}
+
+fn tma_ind_on(issi: u32, pdu: BitBuffer, carrier: u16, ts: u32) -> SapMsg {
+    let mut msg = tma_ind(issi, pdu, ts);
+    if let SapMsgInner::TmaUnitdataInd(ind) = &mut msg.msg {
+        ind.carrier_num = carrier;
+    }
+    msg
+}
+
+/// `from_lmac` on `carrier`, with the burst's RSSI.
+fn from_lmac_on(pdu: BitBuffer, carrier: u16, rssi_dbfs: f32) -> SapMsg {
+    let mut msg = from_lmac(pdu);
+    if let SapMsgInner::TmvUnitdataInd(ind) = &mut msg.msg {
+        ind.carrier_num = carrier;
+        ind.rssi_dbfs = rssi_dbfs;
+    }
+    msg
+}
+
+/// A MAC-DATA of `issi` in the clear with a TM-SDU of 24 bits (8 octets with its fill bits),
+/// in a full uplink slot.
+fn mac_data_of(issi: u32) -> BitBuffer {
+    let mut b = format!("001000{:024b}0{:06b}{}", issi, 8, "1011".repeat(6));
+    b.push('1');
+    while b.len() < 268 {
+        b.push('0');
+    }
+    let mut buf = BitBuffer::from_bitstr(&b);
+    buf.seek(0);
+    buf
+}
+
+impl Air {
+    /// An LLC PDU from `issi` on timeslot `ts` of the packet-data carrier.
+    fn uplink_on_carrier(&mut self, issi: u32, llc_pdu: BitBuffer, ts: u8) {
+        while self.ticks % 4 != (usize::from(ts) + 1) % 4 {
+            self.step();
+        }
+        self.test
+            .submit_message(tma_ind_on(issi, llc_pdu, SECONDARY_CARRIER, u32::from(ts)));
+        self.step();
+    }
+
+    /// An SN-PDU on the acknowledged basic link on timeslot `ts` of the packet-data carrier.
+    fn send_on_carrier(&mut self, issi: u32, sn: &str, ts: u8) {
+        let ns = self.ns.entry(issi).or_insert(0);
+        let mut pdu = BitBuffer::new_autoexpand(64);
+        BlData { has_fcs: false, ns: *ns }.to_bitbuf(&mut pdu);
+        *ns ^= 1;
+        append_bits(&mut pdu, &format!("100{sn}"));
+        self.uplink_on_carrier(issi, pdu, ts);
+    }
+}
+
+/// The radio's first uplink on its channel of the packet-data carrier: its AL-SETUP on `ts`.
+fn al_setup_on_carrier(air: &mut Air, issi: u32, ts: u8) {
+    air.uplink_on_carrier(issi, al_pdu(|b| radio_al_setup().to_bitbuf(b)), ts);
+}
+
+/// PDP context and the TRANSMIT REQUEST of a radio that can take 4 slots: the channel assigned
+/// (carrier, timeslots), None when the data stays on the MCCH.
+fn onto_carrier(air: &mut Air, issi: u32) -> Option<(Option<u16>, Vec<u8>)> {
+    air.send(issi, &demand(1, None, false));
+    air.next_sn(8).expect("ACCEPT");
+    air.send(issi, &transmit_request_full(1, 4, 4));
+    let response = air.next_sn(8).expect("RESPONSE");
+    assert_eq!(
+        decode_data_transmit_response(&response.sn_buf()).unwrap().result,
+        SndcpDataTransmitResponseResult::Accepted
+    );
+    air.run(2);
+    air.take_sn();
+    response.alloc.as_ref().map(|a| (a.carrier, ts_of(a)))
+}
+
+/// A radio that can take 4 slots is sent to the packet-data carrier: the RESPONSE on the MCCH
+/// with a channel allocation Replace, both ways, carrier 1522, all four slots; the grant on ts4
+/// (the first of ts 2-4 preferred), the main carrier's traffic slots left to voice.
+#[test]
+fn a_request_is_assigned_the_packet_data_carrier() {
+    debug::setup_logging_verbose();
+    let mut air = Air::new(carrier_config(false, 4, false));
+    air.send(ISSI, &demand(1, None, false));
+    air.next_sn(8).expect("ACCEPT");
+    air.send(ISSI, &transmit_request_full(1, 4, 4));
+    let response = air.next_sn(8).expect("RESPONSE");
+    assert_eq!(response.link_id, 0, "sent on the MCCH, where the radio still is");
+    let alloc = response.alloc.clone().expect("an assignment");
+    assert_eq!(
+        (alloc.alloc_type, alloc.ul_dl_assigned, alloc.carrier, alloc.timeslots),
+        (ChanAllocType::Replace, UlDlAssignment::Both, Some(SECONDARY_CARRIER), [true; 4])
+    );
+    let state = air.test.config.state_read();
+    assert_eq!(state.pdch_by_issi[&ISSI].slot, carrier_slot(4));
+    assert_eq!(state.pdch_timeslots_by_issi.get(&ISSI), Some(&[true; 4]));
+    for ts in 1..=4 {
+        assert_eq!(state.timeslot_alloc.slot_owner(carrier_slot(ts)), Some(TimeslotOwner::PacketData));
+    }
+    assert!(
+        (2..=4).all(|ts| state.timeslot_alloc.is_free(ts)),
+        "main traffic slots left to voice"
+    );
+}
+
+/// The width on the carrier: `pdch_max_slots`, what is free there (never ts1 alone), one slot
+/// left for voice when the main carrier is full (shared), none left when data only.
+#[test]
+fn the_width_on_the_carrier() {
+    let case = |max: u8, exclusive: bool, busy: &[CarrierSlot], full: u8| {
+        let mut air = Air::new(carrier_config(false, max, exclusive));
+        for slot in busy {
+            air.test
+                .config
+                .state_write()
+                .timeslot_alloc
+                .reserve_slot(TimeslotOwner::Cmce, *slot)
+                .unwrap();
+        }
+        air.send(ISSI, &demand(1, None, false));
+        air.next_sn(8).expect("ACCEPT");
+        air.send(ISSI, &transmit_request_full(1, full, full));
+        let response = air.next_sn(8).expect("RESPONSE");
+        let grant = air.test.config.state_read().pdch_by_issi.get(&ISSI).map(|g| g.slot);
+        (response.alloc.map(|a| (a.carrier, ts_of(&a))), grant)
+    };
+    let main = |ts: u8| CarrierSlot {
+        carrier_num: MAIN_CARRIER,
+        ts,
+    };
+    let main_full = [main(2), main(3), main(4)];
+    assert_eq!(
+        case(2, false, &[], 4),
+        (Some((Some(SECONDARY_CARRIER), vec![3, 4])), Some(carrier_slot(4)))
+    );
+    assert_eq!(
+        case(4, false, &main_full, 4).0,
+        Some((Some(SECONDARY_CARRIER), vec![2, 3, 4])),
+        "voice headroom"
+    );
+    assert_eq!(
+        case(4, true, &main_full, 4).0,
+        Some((Some(SECONDARY_CARRIER), vec![1, 2, 3, 4])),
+        "data only"
+    );
+    assert_eq!(
+        case(4, false, &[carrier_slot(4)], 4),
+        (Some((Some(SECONDARY_CARRIER), vec![1, 2, 3])), Some(carrier_slot(3)))
+    );
+    assert_eq!(case(4, false, &[], 1).0, Some((Some(SECONDARY_CARRIER), vec![4])));
+    assert_eq!(
+        case(4, false, &[carrier_slot(2), carrier_slot(3), carrier_slot(4)], 4).0,
+        Some((Some(MAIN_CARRIER), vec![2, 3, 4])),
+        "never ts1 alone: the main carrier"
+    );
+}
+
+/// The carrier or the main carrier, whichever gives more slots; the carrier on a tie.
+#[test]
+fn a_busy_carrier_falls_back_to_the_main_pdch_timeslots() {
+    let case = |busy: &[CarrierSlot]| {
+        let mut air = Air::new(carrier_config(false, 2, false));
+        for slot in busy {
+            air.test
+                .config
+                .state_write()
+                .timeslot_alloc
+                .reserve_slot(TimeslotOwner::Cmce, *slot)
+                .unwrap();
+        }
+        onto_carrier(&mut air, ISSI)
+    };
+    let main2 = CarrierSlot {
+        carrier_num: MAIN_CARRIER,
+        ts: 2,
+    };
+    let all = [carrier_slot(1), carrier_slot(2), carrier_slot(3), carrier_slot(4)];
+    assert_eq!(case(&all), Some((Some(MAIN_CARRIER), vec![3, 4])), "carrier full of voice");
+    assert_eq!(
+        case(&[main2, carrier_slot(1), carrier_slot(2), carrier_slot(4)]),
+        Some((Some(MAIN_CARRIER), vec![3, 4])),
+        "one there, two on the main carrier"
+    );
+    assert_eq!(
+        case(&[main2, carrier_slot(1), carrier_slot(2)]),
+        Some((Some(SECONDARY_CARRIER), vec![3, 4])),
+        "a tie: the carrier"
+    );
+}
+
+/// A radio on its carrier channel gets its PDUs there: individual signalling (MM following the
+/// uplink too), SN-UNITDATA, and the BL-ACK of an uplink on a slot of the channel; never stolen.
+#[test]
+fn pdus_follow_the_radio_to_the_carrier() {
+    debug::setup_logging_verbose();
+    let mut air = Air::new(carrier_config(false, 4, false));
+    grant_carrier_slots(&air.test.config, ISSI, &[4, 3, 2, 1], true);
+    air.test.submit_message(tl_data_to(TetraAddress::issi(ISSI), false));
+    air.test.submit_message(tl_data_to(TetraAddress::issi(ISSI), true));
+    air.test.submit_message(tl_unitdata_to(TetraAddress::issi(ISSI), 10, None));
+    air.run(40);
+    let mut data = BitBuffer::new_autoexpand(32);
+    BlData { has_fcs: false, ns: 0 }.to_bitbuf(&mut data);
+    append_bits(&mut data, "0101010101");
+    air.uplink_on_carrier(ISSI, data, 3);
+    air.run(2);
+    let mine: Vec<&Down> = air.down.iter().filter(|d| d.issi == ISSI).collect();
+    assert!(mine.len() >= 4, "{mine:?}");
+    for d in &mine {
+        assert_eq!((d.carrier, d.stealing), (Some(SECONDARY_CARRIER), false), "{d:?}");
+    }
+    assert_eq!(mine.iter().filter(|d| d.link_id == 4).count(), mine.len() - 1, "{mine:?}");
+    assert!(
+        mine.iter().any(|d| d.llc == LlcPduType::BlAck && d.link_id == 3),
+        "the BL-ACK on the slot of the uplink: {mine:?}"
+    );
+}
+
+/// Data for a radio on its channel of the packet-data carrier goes out there, never on the main
+/// carrier. (miura: in place of tea2's test of the carrier's ECK, no encryption here.)
+#[test]
+fn the_data_on_the_carrier_goes_out_there() {
+    debug::setup_logging_verbose();
+    let mut mac = MacAir::with(carrier_config(false, 4, false));
+    grant_carrier_slots(&mac.test.config, ISSI, &[4, 3, 2, 1], true);
+    mac.run(4);
+    mac.test.submit_message(tl_unitdata_to(TetraAddress::issi(ISSI), 120, None));
+    mac.test.submit_message(tl_data_to(TetraAddress::issi(ISSI), false));
+    let mine: Vec<(u16, u8)> = mac
+        .run(4 * 30)
+        .iter()
+        .filter(|b| b.3.iter().any(|r| r.0 == ISSI))
+        .map(|b| (b.1, b.2))
+        .collect();
+    assert!(mine.len() >= 2, "{mine:?}");
+    assert!(mine.iter().all(|m| m.0 == SECONDARY_CARRIER), "{mine:?}");
+}
+
+/// A TM-SDU of 400 bits sent up on the radio's carrier channel {1,2,3,4}: MAC-DATA opening the
+/// fragmentation on ts3 asking for 2 slots, then MAC-FRAG and MAC-END in the slots the grant
+/// gives (read as the MS does, ts1 counted).
+fn uplink_on_the_carrier(cfg: StackConfig) -> (Vec<TmaUnitdataInd>, Vec<TdmaTime>, String) {
+    use tetra_pdus::umac::enums::reservation_requirement::ReservationRequirement;
+    let mut air = UmacAir::new(cfg);
+    grant_carrier_slots(&air.test.config, ISSI, &[4, 3, 2, 1], true);
+    let sdu: String = (0..400).map(|i| if (i * 7) % 3 == 0 { '1' } else { '0' }).collect();
+    let (first, frag, end) = (&sdu[..150], &sdu[150..300], &sdu[300..]);
+    let start = TdmaTime { t: 3, f: 3, m: 1, h: 0 };
+    let header = format!("001000{:024b}11{:04b}0", ISSI, ReservationRequirement::Req2Slots as u64);
+    let on_carrier = |b: BitBuffer| from_lmac_on(b, SECONDARY_CARRIER, -40.0);
+    air.uplink_at(start, on_carrier(uplink_block(&header, first)));
+    let (at, slots, delay) = air.next_grant(ISSI, 16);
+    assert_eq!(slots, 2);
+    let labels = ms_granted_labels(at, delay, slots, &[1, 2, 3, 4]);
+    assert!(labels.iter().all(|l| l.t != 1), "never uplink ts1 of the carrier: {labels:?}");
+    air.uplink_at(labels[0], on_carrier(uplink_block("0101", frag)));
+    let end_octets = (10 + end.len() + 1).div_ceil(8);
+    air.uplink_at(labels[1], on_carrier(uplink_block(&format!("0111{end_octets:06b}"), end)));
+    for _ in 0..4 {
+        air.tick();
+    }
+    (air.up, labels, sdu)
+}
+
+/// Uplink on the carrier: granted over its channel, reassembled across its slots; up once, from
+/// the radio, on the carrier.
+#[test]
+fn uplink_on_the_carrier_is_reassembled() {
+    debug::setup_logging_verbose();
+    let (up, labels, sdu) = uplink_on_the_carrier(carrier_config(false, 4, false));
+    assert_eq!(up.len(), 1, "{up:?}");
+    assert_eq!(
+        (
+            up[0].carrier_num,
+            up[0].main_address.ssi,
+            up[0].link_id,
+            up[0].pdu.as_ref().unwrap().to_bitstr()
+        ),
+        (SECONDARY_CARRIER, ISSI, u32::from(labels[1].t), sdu)
+    );
+}
+
+/// A MAC-DATA of the radio on uplink ts1 of the carrier is not its (its channel never transmits
+/// there): dropped as an adjacent-channel copy; on ts3 it is delivered.
+#[test]
+fn no_uplink_on_carrier_ts1() {
+    let up = |ts: u8| {
+        let mut air = UmacAir::new(carrier_config(false, 4, false));
+        grant_carrier_slots(&air.test.config, ISSI, &[4, 3, 2, 1], true);
+        let label = TdmaTime { t: ts, f: 3, m: 1, h: 0 };
+        air.uplink_at(label, from_lmac_on(mac_data_of(ISSI), SECONDARY_CARRIER, -40.0));
+        air.tick();
+        air.up
+    };
+    assert!(up(1).is_empty(), "ts1: dropped");
+    assert_eq!(up(3).len(), 1, "ts3: delivered");
+}
+
+/// A group PDU goes on the MCCH and, for each member on a channel, a copy there: on the carrier
+/// for a member there (its channel allocation keeping the original's carrier), on the main
+/// carrier for a member there.
+#[test]
+fn a_group_call_setup_copy_reaches_a_member_on_the_carrier() {
+    debug::setup_logging_verbose();
+    let mut air = Air::new(carrier_config(false, 4, false));
+    grant_carrier_slots(&air.test.config, ISSI, &[4, 3, 2, 1], true);
+    grant_pdch(&air.test.config, ISSI2, 3, true);
+    {
+        let mut state = air.test.config.state_write();
+        for issi in [ISSI, ISSI2] {
+            state.subscribers.register(issi);
+            state.subscribers.affiliate(issi, GSSI);
+        }
+    }
+    let mut msg = tl_data_to(TetraAddress::new(GSSI, SsiType::Gssi), false);
+    if let SapMsgInner::TlaTlDataReqBl(req) = &mut msg.msg {
+        req.chan_alloc = Some(CmceChanAllocReq {
+            usage: Some(4),
+            carrier: None,
+            timeslots: [false, true, false, false],
+            alloc_type: ChanAllocType::Replace,
+            ul_dl_assigned: UlDlAssignment::Both,
+        });
+    }
+    air.test.submit_message(msg);
+    air.run(2);
+    let mut to_group: Vec<(u32, Option<u16>, Option<u16>)> = air
+        .down
+        .iter()
+        .filter(|d| d.issi == GSSI)
+        .map(|d| (d.link_id, d.carrier, d.alloc.as_ref().and_then(|a| a.carrier)))
+        .collect();
+    to_group.sort_unstable();
+    assert_eq!(
+        to_group,
+        vec![
+            (0, Some(MAIN_CARRIER), None),
+            (3, Some(MAIN_CARRIER), Some(MAIN_CARRIER)),
+            (4, Some(SECONDARY_CARRIER), Some(MAIN_CARRIER)),
+        ]
+    );
+}
+
+/// A call that takes a slot of a member's carrier channel (main full, shared): no copy on the
+/// channel it is losing, the D-SETUP on the MCCH, and the same D-SETUP again on the MCCH four
+/// frames later, when the member has left the channel; its channel goes.
+#[test]
+fn a_call_that_takes_the_carrier_channel_still_reaches_its_member() {
+    debug::setup_logging_verbose();
+    let mut cfg = voice_config(Some(PacketDataBearer::Pdch), true);
+    cfg.packet_data.pdch_carrier = Some(SECONDARY_CARRIER);
+    let mut v = Voice::new(cfg, false);
+    v.register(DATA_RADIO, Some(104));
+    grant_carrier_slots(&v.test.config, DATA_RADIO, &[4, 3, 2, 1], true);
+    let opens = three_group_calls(&mut v, false);
+    assert_eq!(opens, vec![(MAIN_CARRIER, 2), (MAIN_CARRIER, 3), (MAIN_CARRIER, 4)]);
+    v.msgs.clear();
+    let mut seen: Vec<(usize, u32, String)> = Vec::new();
+    v.cmce(3_000_004, u_setup(104, true, false, 0));
+    for _ in 0..30 {
+        for m in v.msgs.drain(..) {
+            if let SapMsgInner::TmaUnitdataReq(req) = &m.msg
+                && req.main_address.ssi == 104
+            {
+                seen.push((v.ticks, req.link_id, req.pdu.to_bitstr()));
+            }
+        }
+        v.run(1);
+    }
+    assert!(seen.iter().all(|s| s.1 == 0), "nothing on the channel the call took: {seen:?}");
+    let first = seen.first().expect("the D-SETUP").clone();
+    assert!(
+        seen.iter().any(|s| s.2 == first.2 && s.0 >= first.0 + 16),
+        "the same PDU again on the MCCH 4 frames later: {seen:?}"
+    );
+    assert!(
+        v.test.config.state_read().pdch_channel(DATA_RADIO).is_none(),
+        "its channel went to the call"
+    );
+}
+
+/// The radio's BL-ACK of its assignment is lost; its first uplink on the channel (its AL-SETUP)
+/// acknowledges it: no retransmission on the MCCH, no "never acknowledged" release, and the
+/// next acknowledged PDU to it leaves on the carrier at once.
+#[test]
+fn the_assignment_is_acknowledged_by_the_first_uplink_on_the_carrier() {
+    debug::setup_logging_verbose();
+    let mut air = Air::new(carrier_config(false, 4, false));
+    air.send(ISSI, &demand(1, None, false));
+    air.next_sn(8).expect("ACCEPT");
+    air.run(4);
+    air.send(ISSI, &transmit_request_full(1, 4, 4));
+    let mut responses = 0;
+    for _ in 0..3 {
+        air.acks.retain(|a| a.0 != ISSI);
+        responses += air.take_sn().iter().filter(|d| d.sn_type() == Some(7)).count();
+        air.step();
+    }
+    air.acks.retain(|a| a.0 != ISSI);
+    responses += air.take_sn().iter().filter(|d| d.sn_type() == Some(7)).count();
+    assert_eq!(responses, 1, "the RESPONSE went");
+    al_setup_on_carrier(&mut air, ISSI, 4);
+    for _ in 0..200 {
+        air.step();
+        responses += air.take_sn().iter().filter(|d| d.sn_type() == Some(7)).count();
+    }
+    assert_eq!(responses, 1, "not sent again");
+    assert!(air.test.config.state_read().pdch_by_issi[&ISSI].on_air, "the channel is kept");
+    air.down.clear();
+    air.test.submit_message(tl_data_to(TetraAddress::issi(ISSI), false));
+    air.run(2);
+    let d = air.down.iter().find(|d| d.issi == ISSI).expect("a PDU went down");
+    assert_eq!((d.carrier, d.link_id), (Some(SECONDARY_CARRIER), 4));
+}
+
+/// A radio taken off its carrier channel by a false or stale MCCH flag is put back on it by its
+/// next uplink there: its TRANSMIT REQUEST on the carrier is "already on its PDCH", and its
+/// group's PDUs are copied to its channel again.
+#[test]
+fn a_false_mcch_flag_is_undone_by_the_next_uplink_on_the_carrier() {
+    debug::setup_logging_verbose();
+    let mut air = Air::new(carrier_config(false, 4, false));
+    assert_eq!(onto_carrier(&mut air, ISSI).map(|a| a.0), Some(Some(SECONDARY_CARRIER)));
+    al_setup_on_carrier(&mut air, ISSI, 4);
+    air.run(8);
+    air.test.config.state_write().pdch_by_issi.get_mut(&ISSI).unwrap().on_air = false;
+    air.run(4);
+    air.take_sn();
+    air.send_on_carrier(ISSI, &transmit_request_full(1, 4, 4), 3);
+    let response = air.next_sn(8).expect("RESPONSE");
+    assert_eq!(
+        (response.carrier, response.link_id, response.chan_alloc),
+        (Some(SECONDARY_CARRIER), 4, false),
+        "already on its PDCH, answered there"
+    );
+    assert!(air.test.config.state_read().pdch_by_issi[&ISSI].on_air);
+    {
+        let mut state = air.test.config.state_write();
+        state.subscribers.register(ISSI);
+        state.subscribers.affiliate(ISSI, GSSI);
+    }
+    air.down.clear();
+    air.test.submit_message(tl_data_to(TetraAddress::new(GSSI, SsiType::Gssi), false));
+    air.run(2);
+    assert!(
+        air.down
+            .iter()
+            .any(|d| d.issi == GSSI && d.carrier == Some(SECONDARY_CARRIER) && d.link_id == 4),
+        "the copy on its channel"
+    );
+}
+
+/// A radio that stays on the MCCH after its carrier assignment (it acknowledges it there, then
+/// sends an SN-PDU there before anything on its channel) loses the channel and gets main-carrier
+/// channels from then on; another radio still gets the carrier.
+#[test]
+fn a_radio_that_does_not_move_gets_the_main_carrier_from_then_on() {
+    debug::setup_logging_verbose();
+    let mut air = Air::new(carrier_config(false, 4, false));
+    assert_eq!(onto_carrier(&mut air, ISSI).map(|a| a.0), Some(Some(SECONDARY_CARRIER)));
+    air.send(ISSI, &transmit_request_full(1, 4, 4));
+    let response = air.next_sn(8).expect("RESPONSE");
+    assert_eq!(
+        response.alloc.as_ref().map(|a| a.carrier),
+        Some(Some(MAIN_CARRIER)),
+        "main carrier from now on"
+    );
+    assert_eq!(air.test.config.state_read().pdch_by_issi[&ISSI].slot.carrier_num, MAIN_CARRIER);
+    air.run(80);
+    assert_eq!(
+        onto_carrier(&mut air, ISSI2).map(|a| a.0),
+        Some(Some(SECONDARY_CARRIER)),
+        "another radio: the carrier"
+    );
+}
+
+/// The radio back on the MCCH (a TRANSMIT REQUEST there, after it was heard on its channel) is
+/// off its channel, which it is assigned again; a request on a slot of its channel is answered
+/// there.
+#[test]
+fn the_radio_back_on_the_mcch_is_flagged_by_link_1() {
+    let mut air = Air::new(carrier_config(false, 4, false));
+    assert_eq!(onto_carrier(&mut air, ISSI).map(|a| a.0), Some(Some(SECONDARY_CARRIER)));
+    al_setup_on_carrier(&mut air, ISSI, 4);
+    air.run(8);
+    air.take_sn();
+    air.send(ISSI, &transmit_request_full(1, 4, 4));
+    let again = air.next_sn(8).expect("RESPONSE");
+    assert_eq!(again.link_id, 0, "on the MCCH");
+    assert_eq!(
+        again.alloc.as_ref().map(|a| (a.carrier, ts_of(a))),
+        Some((Some(SECONDARY_CARRIER), vec![1, 2, 3, 4])),
+        "assigned again"
+    );
+    air.run(2);
+    air.take_sn();
+    air.send_on_carrier(ISSI, &transmit_request_full(1, 4, 4), 3);
+    let there = air.next_sn(8).expect("RESPONSE");
+    assert_eq!(
+        (there.carrier, there.link_id, there.chan_alloc),
+        (Some(SECONDARY_CARRIER), 4, false)
+    );
+}
+
+/// A BL-ACK of the radio on the MCCH (where it may acknowledge its assignment) does not take it
+/// off its carrier channel once it was heard there: its PDUs still go to the carrier.
+#[test]
+fn a_bl_ack_on_the_mcch_does_not_take_it_off_air() {
+    let mut air = Air::new(carrier_config(false, 4, false));
+    assert_eq!(onto_carrier(&mut air, ISSI).map(|a| a.0), Some(Some(SECONDARY_CARRIER)));
+    al_setup_on_carrier(&mut air, ISSI, 4);
+    air.run(8);
+    let mut ack = BitBuffer::new_autoexpand(8);
+    BlAck { has_fcs: false, nr: 0 }.to_bitbuf(&mut ack);
+    ack.seek(0);
+    air.test.submit_message(tma_ind(ISSI, ack, 1));
+    air.run(8);
+    assert!(air.test.config.state_read().pdch_by_issi[&ISSI].on_air);
+    air.down.clear();
+    air.test.submit_message(tl_data_to(TetraAddress::issi(ISSI), false));
+    air.run(2);
+    let d = air.down.iter().find(|d| d.issi == ISSI).expect("a PDU went down");
+    assert_eq!((d.carrier, d.link_id), (Some(SECONDARY_CARRIER), 4));
+}
+
+/// Idle for `pdch_idle_release_secs`: SN-END OF DATA with "quit and go" to the main carrier on the
+/// carrier channel; its slots free, and given to a channel again only after a multiframe.
+#[test]
+fn an_idle_carrier_pdch_ends_with_end_of_data_on_the_carrier() {
+    debug::setup_logging_verbose();
+    let mut cfg = carrier_config(false, 4, false);
+    cfg.packet_data.ready_timer_code = 11;
+    cfg.packet_data.pdch_idle_release_secs = 2;
+    let mut air = Air::new(cfg);
+    assert_eq!(onto_carrier(&mut air, ISSI).map(|a| a.0), Some(Some(SECONDARY_CARRIER)));
+    // Until the quit went out and the channel was given back.
+    for _ in 0..400 {
+        air.step();
+        if air.test.config.state_read().pdch_by_issi.is_empty() {
+            break;
+        }
+    }
+    let sent = air.take_sn();
+    let eod: Vec<&Down> = sent.iter().filter(|d| d.sn_type() == Some(8)).collect();
+    assert_eq!(eod.len(), 1, "{sent:?}");
+    assert_eq!((eod[0].carrier, eod[0].link_id), (Some(SECONDARY_CARRIER), 4), "on its channel");
+    let quit = eod[0].alloc.clone().expect("quit");
+    assert_eq!(
+        (quit.alloc_type, quit.carrier, ts_of(&quit)),
+        (ChanAllocType::QuitAndGo, Some(MAIN_CARRIER), vec![])
+    );
+    {
+        let state = air.test.config.state_read();
+        assert!(state.pdch_by_issi.is_empty());
+        assert!((1..=4).all(|ts| state.timeslot_alloc.slot_is_free(carrier_slot(ts))));
+    }
+    assert_eq!(
+        onto_carrier(&mut air, ISSI2).map(|a| a.0),
+        Some(Some(MAIN_CARRIER)),
+        "the carrier's slots wait a multiframe"
+    );
+    air.run(80);
+    assert_eq!(onto_carrier(&mut air, 3_000_001).map(|a| a.0), Some(Some(SECONDARY_CARRIER)));
+}
+
+/// Voice taking a slot of a carrier channel (nothing else free) takes the whole channel: the PDU
+/// queued for its radio is dropped at once, and its other slots show "unallocated" (SCH/F) so the
+/// radio leaves (N.208).
+#[test]
+fn voice_taking_a_carrier_slot_releases_the_whole_channel() {
+    use tetra_core::Direction;
+    use tetra_saps::control::call_control::{CallControl, Circuit, CircuitDlMediaSource};
+    use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
+    debug::setup_logging_verbose();
+    let mut mac = MacAir::with(carrier_config(false, 4, false));
+    grant_carrier_slots(&mac.test.config, ISSI, &[4, 3, 2, 1], true);
+    mac.run(4);
+    let reporter = TxReporter::new_unacked();
+    mac.test
+        .submit_message(tl_unitdata_to(TetraAddress::issi(ISSI), 2000, Some(reporter.clone())));
+    mac.run(2);
+    let taken = {
+        let mut state = mac.test.config.state_write();
+        for ts in 2..=4 {
+            state.timeslot_alloc.reserve(TimeslotOwner::Cmce, ts).unwrap();
+        }
+        state.timeslot_alloc.allocate_any_slot(TimeslotOwner::Cmce).expect("a carrier slot")
+    };
+    assert_eq!(taken, carrier_slot(1));
+    mac.test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Cmce,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::CmceCallControl(CallControl::Open(Circuit {
+            direction: Direction::Both,
+            carrier_num: SECONDARY_CARRIER,
+            ts: 1,
+            peer_carrier_num: None,
+            peer_ts: None,
+            usage: 6,
+            circuit_mode: CircuitModeType::TchS,
+            speech_service: Some(0),
+            etee_encrypted: false,
+            dl_media_source: CircuitDlMediaSource::SwMI,
+        })),
+    });
+    let mut after = Vec::new();
+    for _ in 0..8 {
+        mac.test.run_stack(Some(1));
+        for msg in mac.test.dump_sinks() {
+            if let SapMsgInner::TmvUnitdataReqSlots(slots) = msg.msg {
+                after.extend(
+                    slots
+                        .slots
+                        .into_iter()
+                        .filter(|s| s.carrier_num == SECONDARY_CARRIER && s.ts.f != 18),
+                );
+            }
+        }
+    }
+    assert_eq!(reporter.get_state(), TxState::Discarded);
+    let others: Vec<_> = after.iter().skip(4).filter(|s| s.ts.t != 1).collect();
+    assert!(!others.is_empty());
+    for s in others {
+        assert_eq!(
+            aach_of(s).1.dl_usage,
+            tetra_pdus::umac::enums::access_assign_dl_usage::AccessAssignDlUsage::Unallocated,
+            "{}",
+            s.ts
+        );
+        assert_eq!(
+            s.blk1.as_ref().unwrap().logical_channel,
+            tetra_saps::tmv::enums::logical_chans::LogicalChannel::SchF
+        );
+    }
+}
+
+/// Data only (`pdch_carrier_exclusive`): with the main carrier full a fourth call gets nothing on
+/// the carrier, whose channel stays.
+#[test]
+fn the_exclusive_carrier_is_never_given_to_voice() {
+    let mut cfg = voice_config(Some(PacketDataBearer::Pdch), true);
+    cfg.packet_data.pdch_carrier = Some(SECONDARY_CARRIER);
+    cfg.packet_data.pdch_carrier_exclusive = true;
+    let mut v = Voice::new(cfg, false);
+    grant_carrier_slots(&v.test.config, DATA_RADIO, &[4, 3], true);
+    three_group_calls(&mut v, false);
+    v.register(2_000_104, Some(104));
+    v.cmce(3_000_004, u_setup(104, true, false, 0));
+    v.run(40);
+    let opens: Vec<(u16, u8)> = v
+        .msgs
+        .iter()
+        .filter_map(|m| match &m.msg {
+            SapMsgInner::CmceCallControl(tetra_saps::control::call_control::CallControl::Open(c)) => Some((c.carrier_num, c.ts)),
+            _ => None,
+        })
+        .collect();
+    assert!(opens.len() >= 3 && opens.iter().all(|o| o.0 == MAIN_CARRIER), "{opens:?}");
+    assert!(v.test.config.state_read().pdch_channel(DATA_RADIO).is_some(), "the channel stays");
+}
+
+/// Data only, main carrier full of ordinary calls: an emergency call pre-empts one of them (the
+/// carrier is not counted free), never the data channel.
+#[test]
+fn exclusive_mode_with_priority_preemption() {
+    let mut cfg = voice_config(Some(PacketDataBearer::Pdch), true);
+    cfg.packet_data.pdch_carrier = Some(SECONDARY_CARRIER);
+    cfg.packet_data.pdch_carrier_exclusive = true;
+    let mut v = Voice::new(cfg, false);
+    grant_carrier_slots(&v.test.config, DATA_RADIO, &[4, 3, 2, 1], true);
+    assert_eq!(v.test.config.state_read().timeslot_alloc.free_slot_count(), 3);
+    for (i, g) in [101u32, 102, 103, 199].into_iter().enumerate() {
+        v.register(2_000_001 + i as u32, Some(g));
+    }
+    for (i, g) in [101u32, 102, 103].into_iter().enumerate() {
+        v.cmce(3_000_001 + i as u32, u_setup(g, true, false, 0));
+        v.run(4);
+    }
+    v.run(40);
+    assert_eq!(v.test.config.state_read().timeslot_alloc.free_slot_count(), 0);
+    v.cmce(3_000_099, u_setup(199, true, false, 15));
+    v.run(40);
+    assert!(count(&v.log, "CallEnded") >= 1, "the emergency call pre-empted a call");
+    assert!(
+        v.test.config.state_read().pdch_channel(DATA_RADIO).is_some(),
+        "the data channel stays"
+    );
+}
+
+/// The carrier channel of `ISSI` given back (as after its quit went out), in a UMAC ticking.
+fn released_carrier_channel() -> UmacAir {
+    let mut air = UmacAir::new(carrier_config(false, 4, false));
+    let slots = grant_carrier_slots(&air.test.config, ISSI, &[4, 3, 2, 1], true);
+    for _ in 0..4 {
+        air.tick();
+    }
+    {
+        let mut state = air.test.config.state_write();
+        state.pdch_by_issi.remove(&ISSI);
+        state.pdch_timeslots_by_issi.remove(&ISSI);
+        for s in slots {
+            state.timeslot_alloc.release_slot(TimeslotOwner::PacketData, s).unwrap();
+        }
+    }
+    air.tick();
+    air
+}
+
+/// The last bursts of a radio after its carrier channel went (the BL-ACK of its quit) are its own,
+/// not adjacent-channel copies; another radio's there are. A quit sent again after the release
+/// goes on the MCCH without its channel allocation.
+#[test]
+fn the_last_uplink_after_the_quit_is_accepted() {
+    debug::setup_logging_verbose();
+    for (who, expected) in [(ISSI, 1), (ISSI2, 0)] {
+        let mut air = released_carrier_channel();
+        let label = air.next_time().add_timeslots(8).forward_to_timeslot(4);
+        air.uplink_at(label, from_lmac_on(mac_data_of(who), SECONDARY_CARRIER, -40.0));
+        air.tick();
+        assert_eq!(air.up.len(), expected, "ISSI {who}");
+    }
+
+    let mut air = released_carrier_channel();
+    air.test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+            req_handle: 0,
+            pdu: BitBuffer::from_bitstr("0000100110011000"),
+            main_address: TetraAddress::issi(ISSI),
+            link_id: 4,
+            endpoint_id: 0,
+            stealing_permission: false,
+            subscriber_class: 0,
+            air_interface_encryption: None,
+            stealing_repeats_flag: None,
+            data_category: None,
+            carrier_num: Some(SECONDARY_CARRIER),
+            chan_alloc: Some(CmceChanAllocReq {
+                usage: None,
+                carrier: Some(MAIN_CARRIER),
+                timeslots: [false; 4],
+                alloc_type: ChanAllocType::QuitAndGo,
+                ul_dl_assigned: UlDlAssignment::Both,
+            }),
+            tx_reporter: None,
+        }),
+    });
+    for _ in 0..8 {
+        air.tick();
+    }
+    let quit: Vec<(u16, u8, bool)> = air
+        .slots
+        .iter()
+        .flat_map(|s| mac_resources(s).into_iter().map(move |r| (s.carrier_num, s.ts.t, r)))
+        .filter(|(_, _, r)| r.addr.is_some_and(|a| a.ssi == ISSI))
+        .map(|(c, t, r)| (c, t, r.chan_alloc_element.is_some()))
+        .collect();
+    assert_eq!(quit, vec![(MAIN_CARRIER, 1, false)], "on the MCCH, without the allocation");
+}
+
+/// A PDU queued for the radio on the MCCH when its carrier assignment goes out follows it to its
+/// channel. (miura: here the assignment fills its block, so the PDU behind it cannot share it;
+/// tea2 used an encrypted PDU, which must open its block.)
+#[test]
+fn the_mcch_items_follow_the_radio_to_the_carrier() {
+    debug::setup_logging_verbose();
+    let mut air = UmacAir::new(carrier_config(false, 4, false));
+    grant_carrier_slots(&air.test.config, ISSI, &[4, 3, 2, 1], false);
+    air.tick();
+    let req = |chan_alloc: Option<CmceChanAllocReq>, bits: &str| SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+            req_handle: 0,
+            pdu: BitBuffer::from_bitstr(bits),
+            main_address: TetraAddress::issi(ISSI),
+            link_id: 0,
+            endpoint_id: 0,
+            stealing_permission: false,
+            subscriber_class: 0,
+            air_interface_encryption: None,
+            stealing_repeats_flag: None,
+            data_category: None,
+            carrier_num: Some(SECONDARY_CARRIER),
+            chan_alloc,
+            tx_reporter: None,
+        }),
+    };
+    air.test.submit_message(req(
+        Some(CmceChanAllocReq {
+            usage: None,
+            carrier: Some(SECONDARY_CARRIER),
+            timeslots: [true; 4],
+            alloc_type: ChanAllocType::Replace,
+            ul_dl_assigned: UlDlAssignment::Both,
+        }),
+        &"0000100110011000".repeat(12),
+    ));
+    air.test.submit_message(req(None, &"0010".repeat(12)));
+    for _ in 0..24 {
+        air.tick();
+    }
+    let mine: Vec<(u16, u8, bool)> = air
+        .slots
+        .iter()
+        .flat_map(|s| mac_resources(s).into_iter().map(move |r| (s.carrier_num, s.ts.t, r)))
+        .filter(|(_, _, r)| r.addr.is_some_and(|a| a.ssi == ISSI))
+        .map(|(c, t, r)| (c, t, r.chan_alloc_element.is_some()))
+        .collect();
+    assert_eq!(mine.first(), Some(&(MAIN_CARRIER, 1, true)), "the assignment on the MCCH: {mine:?}");
+    assert!(
+        mine.len() >= 2 && mine[1..].iter().all(|m| m.0 == SECONDARY_CARRIER),
+        "the rest on its channel: {mine:?}"
+    );
+}
+
+/// The advanced link of a radio on four carrier slots: its segments go on all four, in S(S)
+/// order, whole, in well under half the time of one slot; the reply slot of a segment asking for
+/// an acknowledgement is four opportunities away at least, never on ts1.
+#[test]
+fn al_segments_spread_over_four_carrier_slots() {
+    debug::setup_logging_verbose();
+    let (_, one_done) = al_transfer_on(pdch_config(false), &[4], 300);
+    let mut mac = MacAir::with(carrier_config(false, 4, false));
+    grant_carrier_slots(&mac.test.config, ISSI, &[4, 3, 2, 1], true);
+    let reporter = mac.transfer(300);
+    let mut segments = Vec::new();
+    let mut done = None;
+    for tick in 0..4 * 40 {
+        mac.test.run_stack(Some(1));
+        for msg in mac.test.dump_sinks() {
+            let SapMsgInner::TmvUnitdataReqSlots(slots) = msg.msg else {
+                continue;
+            };
+            for slot in slots.slots.iter().filter(|s| s.carrier_num == SECONDARY_CARRIER) {
+                for (header, grant) in al_data_in(slot, ISSI) {
+                    segments.push((slot.ts, header, grant));
+                }
+            }
+        }
+        if done.is_none() && reporter.get_state() == TxState::Transmitted {
+            done = Some(tick);
+        }
+    }
+    let done = done.expect("the TL-SDU went out");
+    let first: Vec<u8> = segments.iter().take(13).map(|s| s.1.ss).collect();
+    assert_eq!(first, (0..13).collect::<Vec<u8>>(), "in S(S) order");
+    for ts in 1..=4 {
+        assert!(segments.iter().any(|s| s.0.t == ts), "on ts{ts}: {segments:?}");
+    }
+    assert!(done * 2 <= one_done, "four slots {done} ticks, one slot {one_done} ticks");
+    for (t, header, grant) in &segments {
+        if let Some((n, delay)) = grant {
+            assert!(header.acknowledgement_requested && *n == 1 && *delay >= 4, "{t}: {grant:?}");
+            let label = ms_granted_labels(*t, *delay, 1, &[1, 2, 3, 4]);
+            assert_ne!(label[0].t, 1, "{t}: {label:?}");
+        }
+    }
+}
+
+/// The adjacent-channel copy of an uplink is dropped: the same bits on the main carrier after
+/// the real burst on the carrier (the PHY hands the stronger over first); a lone copy on a main
+/// slot where the radio has neither call nor channel; the reverse (the radio back on the MCCH).
+/// Without a carrier channel nothing is dropped.
+#[test]
+fn a_copy_of_a_carrier_uplink_is_dropped() {
+    debug::setup_logging_verbose();
+    let setup = |grant: bool| {
+        let mut air = UmacAir::new(carrier_config(false, 4, false));
+        if grant {
+            grant_carrier_slots(&air.test.config, ISSI, &[4, 3, 2, 1], true);
+        }
+        air.tick();
+        air
+    };
+    // Both received in the same uplink slot `ts`, `first` handed over first.
+    let both = |ts: u8, first: (u16, f32), second: (u16, f32)| {
+        let mut air = setup(true);
+        let label = air.next_time().add_timeslots(4).forward_to_timeslot(ts);
+        let at = label.add_timeslots(2);
+        while air.next_time() != at {
+            air.tick();
+        }
+        air.test.submit_message(from_lmac_on(mac_data_of(ISSI), first.0, first.1));
+        air.test.submit_message(from_lmac_on(mac_data_of(ISSI), second.0, second.1));
+        air.tick();
+        air.up.iter().map(|u| u.carrier_num).collect::<Vec<_>>()
+    };
+    assert_eq!(both(3, (SECONDARY_CARRIER, -40.0), (MAIN_CARRIER, -75.0)), vec![SECONDARY_CARRIER]);
+    assert_eq!(
+        both(1, (MAIN_CARRIER, -40.0), (SECONDARY_CARRIER, -75.0)),
+        vec![MAIN_CARRIER],
+        "back on the MCCH"
+    );
+    for grant in [true, false] {
+        let mut air = setup(grant);
+        let label = air.next_time().add_timeslots(4).forward_to_timeslot(2);
+        air.uplink_at(label, from_lmac_on(mac_data_of(ISSI), MAIN_CARRIER, -75.0));
+        air.tick();
+        assert_eq!(air.up.len(), usize::from(!grant), "a lone main ts2 burst, carrier channel {grant}");
+    }
+}
+
+/// ISSI2 on its main-carrier channel (ts3) has an uplink fragmentation open and one slot granted
+/// for its MAC-END; in that same uplink slot the radio of a carrier channel sends a MAC-END on the
+/// carrier, received first, and the main carrier gets either that block's adjacent-channel copy
+/// (weaker) or ISSI2's own MAC-END. What reaches the LLC, and ISSI2's TM-SDU.
+fn with_an_addressless_copy(own_end: bool) -> (Vec<TmaUnitdataInd>, String) {
+    use tetra_pdus::umac::enums::reservation_requirement::ReservationRequirement;
+    let mut air = UmacAir::new(carrier_config(false, 4, false));
+    grant_pdch(&air.test.config, ISSI2, 3, true);
+    grant_carrier_slots(&air.test.config, ISSI, &[4, 3, 2], true);
+    let sdu: String = (0..250).map(|i| if (i * 5) % 3 == 0 { '1' } else { '0' }).collect();
+    let (first, end) = (&sdu[..150], &sdu[150..]);
+    let start = TdmaTime { t: 3, f: 3, m: 1, h: 0 };
+    let header = format!("001000{:024b}11{:04b}0", ISSI2, ReservationRequirement::Req1Slot as u64);
+    air.uplink_at(start, from_lmac(uplink_block(&header, first)));
+    let (at, slots, delay) = air.next_grant(ISSI2, 16);
+    assert_eq!(slots, 1);
+    let label = ms_granted_labels(at, delay, slots, &[3])[0];
+    let end_block = |bits: &str| uplink_block(&format!("0111{:06b}", (10 + bits.len() + 1).div_ceil(8)), bits);
+    let other_end = "1100".repeat(25);
+    while air.next_time() != label.add_timeslots(2) {
+        air.tick();
+    }
+    air.test
+        .submit_message(from_lmac_on(end_block(&other_end), SECONDARY_CARRIER, -40.0));
+    let on_main = if own_end {
+        from_lmac_on(end_block(end), MAIN_CARRIER, -45.0)
+    } else {
+        from_lmac_on(end_block(&other_end), MAIN_CARRIER, -75.0)
+    };
+    air.test.submit_message(on_main);
+    for _ in 0..4 {
+        air.tick();
+    }
+    (air.up, sdu)
+}
+
+/// An addressless copy (a MAC-END of the carrier) is not appended to the reassembly of the main
+/// channel's radio that holds the slot: dropped as a bit copy before attribution; that radio's
+/// own, different MAC-END in the same slot is taken.
+#[test]
+fn an_addressless_copy_is_not_appended_to_another_radios_reassembly() {
+    debug::setup_logging_verbose();
+    let (up, _) = with_an_addressless_copy(false);
+    assert!(up.is_empty(), "{up:?}");
+    let (up, sdu) = with_an_addressless_copy(true);
+    assert_eq!(up.len(), 1, "{up:?}");
+    assert_eq!(
+        (up[0].carrier_num, up[0].main_address.ssi, up[0].pdu.as_ref().unwrap().to_bitstr()),
+        (MAIN_CARRIER, ISSI2, sdu)
+    );
+}
+
+/// The carrier channel on the dashboard: its slot active on carrier 1522, its downlink data too.
+#[test]
+fn the_dashboard_shows_the_carrier_pdch() {
+    use tetra_entities::net_telemetry::{TelemetryEvent, telemetry_channel};
+    debug::setup_logging_verbose();
+    let (sink, source) = telemetry_channel();
+    let mut cfg = voice_config(Some(PacketDataBearer::Pdch), true);
+    cfg.packet_data.pdch_carrier = Some(SECONDARY_CARRIER);
+    let mut v = Voice::with_telemetry(cfg, true, Some(sink));
+    voice_onto_pdch(&mut v);
+    let onto = pdch_telemetry(&source);
+    let active = TelemetryEvent::PdchChanged {
+        carrier_num: SECONDARY_CARRIER,
+        ts: 4,
+        issi: DATA_RADIO,
+        active: true,
+    };
+    assert_eq!(format!("{onto:?}"), format!("{:?}", [active]));
+    v.test.submit_message(tl_unitdata_to(TetraAddress::issi(DATA_RADIO), 16, None));
+    v.run(8);
+    let traffic = pdch_telemetry(&source);
+    assert!(
+        traffic.iter().any(|e| matches!(
+            e,
+            TelemetryEvent::TsDataActivity {
+                carrier_num: SECONDARY_CARRIER,
+                ts: 4,
+                issi: DATA_RADIO,
+                uplink: false
+            }
+        )),
+        "{traffic:?}"
+    );
+}
+
+/// `pdch_carrier` with the secondary carrier off (the dashboard switch): the main carrier as
+/// before.
+#[test]
+fn no_carrier_without_the_secondary() {
+    let mut cfg = carrier_config(false, 4, false);
+    cfg.cell.secondary_carrier = None;
+    let mut air = Air::new(cfg);
+    assert_eq!(
+        onto_carrier(&mut air, ISSI),
+        Some((Some(MAIN_CARRIER), vec![3, 4])),
+        "voice headroom"
+    );
+}
+
+/// With the packet-data carrier N.264 may be 4: an AL-SETUP proposing 4 slots is answered 4.
+#[test]
+fn al_setup_answers_four_with_the_carrier() {
+    let mut setup = radio_al_setup();
+    setup.connection_width = true;
+    setup.uplink_timeslots = Some(3);
+    let mut air = Air::new(carrier_config(false, 4, false));
+    let a = air.al_setup_with(ISSI, setup);
+    assert_eq!(
+        (a.setup_report, a.uplink_timeslots.map(|s| s + 1)),
+        (AlSetup::SETUP_REPORT_SUCCESS, Some(4))
+    );
 }
 
 /// With `pdch_carrier` set and no data session, two duplex calls on two carriers are what they
