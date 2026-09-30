@@ -83,10 +83,13 @@ pub struct UmacBs {
     pdch_carrier: Option<u16>,
     /// The same as `pdch_conflict` on the packet-data carrier.
     pdch_carrier_conflict: Option<(u8, u32, u32)>,
-    /// While a channel of the packet-data carrier exists: the uplink MAC blocks received in the
+    /// While a channel of the packet-data carrier exists: the uplink MAC blocks taken in the
     /// current uplink label (carrier, label, PHY block, bits). A bit-exact copy of one on the other
     /// carrier is the adjacent-channel copy of the same burst (see `rx_tmv_unitdata_ind`).
     ul_label_blocks: Vec<(u16, TdmaTime, PhyBlockNum, String)>,
+    /// The uplink MAC block being read was dropped as an adjacent-channel copy: it is not kept in
+    /// `ul_label_blocks`, so the real burst on the other carrier, equal to it, is still taken.
+    ul_block_copy: bool,
     /// The uplink MAC block being read: a PDU in it said its radio has nothing more to send (its
     /// carrier, uplink slot and ISSI), and whether a PDU in it carried a reservation requirement.
     /// With association the requirement is in the last PDU (23.5.2.1) and 23.5.2.3.1 judges the
@@ -164,6 +167,7 @@ impl UmacBs {
             pdch_carrier: pdch_carrier.map(|p| p.carrier),
             pdch_carrier_conflict: None,
             ul_label_blocks: Vec::new(),
+            ul_block_copy: false,
             ul_block_release: None,
             ul_block_requirement: false,
         }
@@ -718,12 +722,17 @@ impl UmacBs {
         tracing::trace!("rx_tmv_unitdata_ind: {:?}", prim.logical_channel);
         self.ul_block_release = None;
         self.ul_block_requirement = false;
+        self.ul_block_copy = false;
 
         // While a channel of the packet-data carrier exists, one burst is often received on both
         // carriers (adjacent channels, the PHY hands the stronger over first): demodulated from the
         // same burst, with the cell's scrambling, a copy that passes its CRC is bit for bit the
         // same, in the clear or encrypted. Dropped before anything attributes, decrypts or
-        // reassembles it; a different radio's block in the same slot is never equal.
+        // reassembles it; a different radio's block in the same slot is never equal. Only blocks
+        // taken are kept: a copy handed over first and dropped by the other rules (the PHY orders
+        // the carriers by their strongest burst in the slot, not by this one) must not drop the
+        // real burst after it.
+        let mut label_block = None;
         if self.pdch_carrier_active() {
             let label = self.dltime.add_timeslots(-2);
             let bits = prim.pdu.to_bitstr();
@@ -741,7 +750,7 @@ impl UmacBs {
                 );
                 return;
             }
-            self.ul_label_blocks.push((prim.carrier_num, label, prim.block_num, bits));
+            label_block = Some((prim.carrier_num, label, prim.block_num, bits));
         } else if !self.ul_label_blocks.is_empty() {
             self.ul_label_blocks.clear();
         }
@@ -778,6 +787,11 @@ impl UmacBs {
             other => {
                 tracing::warn!("rx_tmv_unitdata_ind: unhandled logical channel {:?}, dropping", other);
             }
+        }
+        if let Some(block) = label_block
+            && !self.ul_block_copy
+        {
+            self.ul_label_blocks.push(block);
         }
         // A radio on its packet-data channel of several slots with nothing more to send (no
         // reservation requirement in the block) no longer uses the slots it holds there
@@ -937,6 +951,7 @@ impl UmacBs {
             return;
         };
         if self.is_adjacent_channel_copy(carrier_num, self.dltime.add_timeslots(-2), addr.ssi) {
+            self.ul_block_copy = true;
             return;
         }
 
@@ -1137,6 +1152,7 @@ impl UmacBs {
             return;
         };
         if self.is_adjacent_channel_copy(carrier_num, self.dltime.add_timeslots(-2), addr.ssi) {
+            self.ul_block_copy = true;
             return;
         }
 

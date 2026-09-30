@@ -5258,7 +5258,8 @@ fn al_segments_spread_over_four_carrier_slots() {
 /// The adjacent-channel copy of an uplink is dropped: the same bits on the main carrier after
 /// the real burst on the carrier (the PHY hands the stronger over first); a lone copy on a main
 /// slot where the radio has neither call nor channel; the reverse (the radio back on the MCCH).
-/// Without a carrier channel nothing is dropped.
+/// A copy handed over first (another burst on its carrier was stronger) and dropped there does
+/// not drop the real burst after it. Without a carrier channel nothing is dropped.
 #[test]
 fn a_copy_of_a_carrier_uplink_is_dropped() {
     debug::setup_logging_verbose();
@@ -5288,6 +5289,11 @@ fn a_copy_of_a_carrier_uplink_is_dropped() {
         both(1, (MAIN_CARRIER, -40.0), (SECONDARY_CARRIER, -75.0)),
         vec![MAIN_CARRIER],
         "back on the MCCH"
+    );
+    assert_eq!(
+        both(3, (MAIN_CARRIER, -60.0), (SECONDARY_CARRIER, -40.0)),
+        vec![SECONDARY_CARRIER],
+        "the copy first"
     );
     for grant in [true, false] {
         let mut air = setup(grant);
