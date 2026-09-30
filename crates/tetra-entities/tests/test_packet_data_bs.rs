@@ -4634,19 +4634,35 @@ fn uplink_on_the_carrier_is_reassembled() {
 }
 
 /// A MAC-DATA of the radio on uplink ts1 of the carrier is not its (its channel never transmits
-/// there): dropped as an adjacent-channel copy; on ts3 it is delivered.
+/// there): dropped as an adjacent-channel copy; on ts3 it is delivered. The same for a
+/// MAC-U-BLCK, which names no radio and would otherwise be taken for the channel's.
 #[test]
 fn no_uplink_on_carrier_ts1() {
-    let up = |ts: u8| {
+    let up = |ts: u8, msg: SapMsg| {
         let mut air = UmacAir::new(carrier_config(false, 4, false));
         grant_carrier_slots(&air.test.config, ISSI, &[4, 3, 2, 1], true);
         let label = TdmaTime { t: ts, f: 3, m: 1, h: 0 };
-        air.uplink_at(label, from_lmac_on(mac_data_of(ISSI), SECONDARY_CARRIER, -40.0));
+        air.uplink_at(label, msg);
         air.tick();
         air.up
     };
-    assert!(up(1).is_empty(), "ts1: dropped");
-    assert_eq!(up(3).len(), 1, "ts3: delivered");
+    let mac_data = || from_lmac_on(mac_data_of(ISSI), SECONDARY_CARRIER, -40.0);
+    assert!(up(1, mac_data()).is_empty(), "ts1: dropped");
+    assert_eq!(up(3, mac_data()).len(), 1, "ts3: delivered");
+    let u_blck = || {
+        let mut msg = mac_u_blck(5, 15);
+        if let SapMsgInner::TmvUnitdataInd(ind) = &mut msg.msg {
+            ind.carrier_num = SECONDARY_CARRIER;
+        }
+        msg
+    };
+    assert!(up(1, u_blck()).is_empty(), "MAC-U-BLCK on ts1: dropped");
+    let up3 = up(3, u_blck());
+    assert_eq!(
+        up3.iter().map(|u| (u.main_address.ssi, u.link_id)).collect::<Vec<_>>(),
+        vec![(ISSI, 3)],
+        "MAC-U-BLCK on ts3: the channel's"
+    );
 }
 
 /// A group PDU goes on the MCCH and, for each member on a channel, a copy there: on the carrier

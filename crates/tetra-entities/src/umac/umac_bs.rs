@@ -1801,6 +1801,17 @@ impl UmacBs {
             return;
         }
         let carrier = prim.carrier_num;
+        // A channel of a carrier without MCCH never transmits on uplink ts1 (its AACH keeps it
+        // reserved): a block there is the adjacent-channel copy of an MCCH block whose original
+        // failed its CRC, another radio's, not the channel's.
+        if msg_dltime.t == 1 && !self.scheduler_for(carrier).allow_mcch() {
+            tracing::debug!(
+                "UmacBs: dropping MAC-U-BLCK on carrier {} ts 1: no uplink of its channel there, adjacent-channel copy",
+                carrier
+            );
+            self.ul_block_copy = true;
+            return;
+        }
         let Some(ssi) = self
             .scheduler_for(carrier)
             .ul_get_slot_owner(msg_dltime, PhyBlockNum::Both)
