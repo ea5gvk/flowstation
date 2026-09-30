@@ -597,6 +597,10 @@ pub struct StackState {
     /// entry here. Written only together with `pdch_by_issi`, and never changed while its grant
     /// lives; read through `pdch_channel`.
     pub pdch_timeslots_by_issi: HashMap<u32, [bool; 4]>,
+    /// Radios heard on a slot of their packet-data channel of the packet-data carrier since that
+    /// channel was last assigned to them (written by the LLC, cleared by the SNDCP at each
+    /// assignment).
+    pub pdch_heard_on_channel: HashSet<u32>,
 }
 
 impl StackState {
@@ -621,6 +625,12 @@ impl StackState {
             }) == Some(TimeslotOwner::PacketData)
         });
         all_ours.then_some((grant, timeslots))
+    }
+
+    /// Whether `issi` was on its packet-data channel and a call has just taken a slot of it (the
+    /// SNDCP has not given the rest back yet).
+    pub fn pdch_preempted(&self, issi: u32) -> bool {
+        self.pdch_by_issi.get(&issi).is_some_and(|g| g.on_air) && self.pdch_channel(issi).is_none()
     }
 }
 
@@ -861,6 +871,7 @@ impl Default for StackState {
             ee_monitoring_windows: std::collections::HashMap::new(),
             pdch_by_issi: HashMap::new(),
             pdch_timeslots_by_issi: HashMap::new(),
+            pdch_heard_on_channel: HashSet::new(),
         }
     }
 }

@@ -98,26 +98,42 @@ pub struct Llc {
 
     /// `[packet_data] bearer = "pdch"` (BS): a radio on its packet-data channel gets its PDUs there.
     pdch_mode: bool,
+
+    /// `[packet_data] pdch_carrier` in use (with `pdch_mode`).
+    pdch_carrier: Option<u16>,
+
+    /// Group PDUs repeated on the MCCH a few frames later, for a member whose packet-data channel
+    /// the call just took (due time, the copy).
+    preempt_repeats: Vec<(TdmaTime, SapMsg)>,
 }
+
+/// A group PDU is repeated on the MCCH this many frames after it went down, for a member whose
+/// packet-data channel a call took: by then the member has left it (N.208 adverse AACHs,
+/// EN 300 392-2 23.5.6.1.1) and listens to the MCCH.
+const PDCH_PREEMPT_REPEAT_FRAMES: i32 = 4;
 
 impl Llc {
     pub fn new(config: SharedConfig) -> Self {
-        let (al, pdch_mode) = {
+        let (al, pdch_mode, pdch_carrier) = {
             let cfg = config.config();
             let on = cfg.packet_data.enabled && cfg.stack_mode == StackMode::Bs;
+            let pdch_mode = on && cfg.packet_data.bearer == PacketDataBearer::Pdch;
             (
                 on.then(|| {
                     let mut al = AdvancedLinkEngine::new();
                     // N.264: at most the slots of the packet-data channel a radio may get.
-                    al.set_max_timeslots(cfg.packet_data.pdch_slots_per_radio());
+                    al.set_max_timeslots(cfg.pdch_slots_per_radio());
                     al
                 }),
-                on && cfg.packet_data.bearer == PacketDataBearer::Pdch,
+                pdch_mode,
+                cfg.pdch_carrier().filter(|_| pdch_mode).map(|p| p.carrier),
             )
         };
         Self {
             al,
             pdch_mode,
+            pdch_carrier,
+            preempt_repeats: Vec::new(),
             dltime: TdmaTime::default(),
             config,
             scheduled_out_acks: VecDeque::new(),
@@ -202,7 +218,13 @@ impl Llc {
     /// `bearer = "pdch"`: a group PDU (not stolen) goes also on the packet-data channel of each
     /// member on one, which listens there and not to the MCCH: it hears its group's call set-up
     /// or SDS at once. The copies carry no report.
-    fn group_copies_for_pdchs(&self, msg: &SapMsg) -> Vec<SapMsg> {
+    ///
+    /// With a packet-data carrier in use each copy names its member's carrier (and a channel
+    /// allocation in it keeps the carrier of the original); and for a member whose channel a call
+    /// has just taken (it still listens there for a few AACHs) the PDU is repeated once on the
+    /// MCCH `PDCH_PREEMPT_REPEAT_FRAMES` later, so it joins that call at once rather than by late
+    /// entry.
+    fn group_copies_for_pdchs(&mut self, msg: &SapMsg) -> Vec<SapMsg> {
         let SapMsgInner::TmaUnitdataReq(req) = &msg.msg else {
             return Vec::new();
         };
@@ -210,25 +232,81 @@ impl Llc {
             return Vec::new();
         }
         let gssi = req.main_address.ssi;
-        let mut members: Vec<(u32, u8)> = {
+        let main = self.main_carrier();
+        let (mut members, mut preempted): (Vec<(u32, u16, u8)>, Vec<u32>) = {
             let state = self.config.state_read();
-            state
+            let members = state
                 .pdch_by_issi
                 .keys()
                 .filter_map(|issi| {
                     let (grant, _) = state.pdch_channel(*issi)?;
-                    (grant.on_air && state.subscribers.attached_groups_of(*issi).contains(&gssi)).then_some((*issi, grant.slot.ts))
+                    (grant.on_air && state.subscribers.attached_groups_of(*issi).contains(&gssi)).then_some((
+                        *issi,
+                        grant.slot.carrier_num,
+                        grant.slot.ts,
+                    ))
                 })
-                .collect()
+                .collect();
+            let preempted = if self.pdch_carrier.is_some() {
+                state
+                    .pdch_by_issi
+                    .keys()
+                    .filter(|issi| state.pdch_preempted(**issi) && state.subscribers.attached_groups_of(**issi).contains(&gssi))
+                    .copied()
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (members, preempted)
         };
         members.sort_unstable();
+        preempted.sort_unstable();
+        if let Some(first) = preempted.first() {
+            tracing::info!(
+                "LLC: group {} PDU repeated on the MCCH in {} frames for ISSI {} (a call took its PDCH)",
+                gssi,
+                PDCH_PREEMPT_REPEAT_FRAMES,
+                first
+            );
+            let mut repeat = req.clone();
+            repeat.link_id = 0;
+            repeat.carrier_num = Some(req.carrier_num.unwrap_or(main));
+            repeat.tx_reporter = None;
+            let due = self.dltime.add_timeslots(PDCH_PREEMPT_REPEAT_FRAMES * 4);
+            self.preempt_repeats.push((
+                due,
+                SapMsg {
+                    sap: Sap::TmaSap,
+                    src: TetraEntity::Llc,
+                    dest: TetraEntity::Umac,
+                    msg: SapMsgInner::TmaUnitdataReq(repeat),
+                },
+            ));
+        }
+        let carrier_aware = self.pdch_carrier.is_some();
         members
             .into_iter()
-            .map(|(issi, ts)| {
-                tracing::info!("LLC: group {} PDU also on the PDCH ts {} of member ISSI {}", gssi, ts, issi);
+            .map(|(issi, carrier, ts)| {
                 let mut copy = req.clone();
                 copy.link_id = u32::from(ts);
                 copy.tx_reporter = None;
+                if carrier_aware {
+                    if let Some(ca) = copy.chan_alloc.as_mut() {
+                        ca.carrier = ca.carrier.or(req.carrier_num).or(Some(main));
+                    }
+                    copy.carrier_num = Some(carrier);
+                }
+                if carrier == main {
+                    tracing::info!("LLC: group {} PDU also on the PDCH ts {} of member ISSI {}", gssi, ts, issi);
+                } else {
+                    tracing::info!(
+                        "LLC: group {} PDU also on the PDCH ts {} of carrier {} of member ISSI {}",
+                        gssi,
+                        ts,
+                        carrier,
+                        issi
+                    );
+                }
                 SapMsg {
                     sap: Sap::TmaSap,
                     src: TetraEntity::Llc,
@@ -732,6 +810,56 @@ impl Llc {
         tracing::trace!("rx_tma_report_ind, ignoring");
     }
 
+    /// An uplink PDU (any LLC type) of `addr` on a slot of its channel of the packet-data carrier:
+    /// the radio is on that channel. Its PDUs go there again (a false or stale "back on the MCCH"
+    /// is undone), and the assignment of that channel still waiting for its acknowledgement is
+    /// taken as acknowledged: the radio evidently got it, so its V(R) moved (a late BL-ACK for it
+    /// is then only an unexpected ACK). A BL-ACK or BL-ADATA acknowledges by its own N(R).
+    fn heard_on_carrier_channel(&mut self, addr: TetraAddress, carrier: u16, link_id: u32, pdu_type: LlcPduType) {
+        if addr.ssi_type == SsiType::Gssi || carrier == self.main_carrier() {
+            return;
+        }
+        let Ok(ts) = u8::try_from(link_id) else { return };
+        if !self.on_pdch_of(addr.ssi, carrier, ts) {
+            return;
+        }
+        let Some((_, channel)) = self.pdch_channel(addr.ssi) else { return };
+        {
+            let mut state = self.config.state_write();
+            state.pdch_heard_on_channel.insert(addr.ssi);
+            if let Some(grant) = state.pdch_by_issi.get_mut(&addr.ssi)
+                && !grant.on_air
+            {
+                grant.on_air = true;
+                tracing::info!(
+                    "LLC: ISSI {} transmitted on its PDCH ts {} of carrier {}: its PDUs go there again",
+                    addr.ssi,
+                    grant.slot.ts,
+                    carrier
+                );
+            }
+        }
+        if matches!(
+            pdu_type,
+            LlcPduType::BlAck | LlcPduType::BlAckFcs | LlcPduType::BlAdata | LlcPduType::BlAdataFcs
+        ) {
+            return;
+        }
+        let assignment = self.outbound_messages.iter().position(|m| {
+            m.addr.ssi == addr.ssi
+                && m.t_submitted_to_umac.is_some()
+                && matches!(&m.retransmission_buf.msg, SapMsgInner::TmaUnitdataReq(req) if req.chan_alloc.as_ref().is_some_and(|ca| {
+                    ca.alloc_type == ChanAllocType::Replace && ca.carrier == Some(carrier) && ca.timeslots == channel
+                }))
+        });
+        if let Some(i) = assignment
+            && let Some(m) = self.outbound_messages.remove(i)
+        {
+            m.tx_reporter.mark_acknowledged();
+            tracing::debug!("LLC: ISSI {} assignment acknowledged by its uplink on the channel", addr.ssi);
+        }
+    }
+
     /// Clause 20.4.1.1.4 TMA-UNITDATA primitive
     /// TMA-UNITDATA indication: this primitive shall be used by the MAC to deliver a received TM-SDU. This primitive
     /// may also be used with no TM-SDU if the MAC needs to inform the higher layers of a channel allocation received
@@ -759,6 +887,12 @@ impl Llc {
             tracing::error!("BUG: unexpected message or state -- routing error");
             return;
         };
+
+        if self.pdch_carrier.is_some()
+            && let SapMsgInner::TmaUnitdataInd(prim) = &message.msg
+        {
+            self.heard_on_carrier_channel(prim.main_address, prim.carrier_num, prim.link_id, pdu_type);
+        }
 
         // Call handler function
         match pdu_type {
@@ -1181,12 +1315,10 @@ impl Llc {
             // unless that is the main carrier's MCCH (TS1). On a secondary carrier TS1 is a
             // traffic slot too: deciding by slot number alone sent those ACKs to the main MCCH,
             // where the radio in the call never heard them.
-            // An uplink on the radio's packet-data channel (any slot of it) is acknowledged there,
-            // not stolen.
-            let on_pdch = self.pdch_mode
-                && (2..=4).contains(&ack.ts)
-                && ack.carrier_num == self.main_carrier()
-                && self.on_pdch_of(ack.addr.ssi, ack.carrier_num, ack.ts);
+            // An uplink on the radio's packet-data channel (any slot of it, on the main carrier or
+            // on the packet-data carrier) is acknowledged there, not stolen. A main-carrier channel
+            // never holds ts1.
+            let on_pdch = self.pdch_mode && self.on_pdch_of(ack.addr.ssi, ack.carrier_num, ack.ts);
             let steal = !on_pdch && (1..=4).contains(&ack.ts) && !(ack.carrier_num == self.main_carrier() && ack.ts == 1);
             let mut pdu_buf = BitBuffer::new_autoexpand(5);
             let pdu = BlAck {
@@ -1316,7 +1448,15 @@ impl TetraEntityTrait for Llc {
         // Take oldest element from scheduled_out_acks, and remove it from the list
         had_activity |= self.submit_ack_replies_to_umac(queue);
 
-        // Step 4 / 4: Send any U-DATA messages
+        // Step 4 / 4: Send any U-DATA messages (group PDUs repeated for a preempted PDCH included)
+        if !self.preempt_repeats.is_empty() {
+            let now = self.dltime;
+            let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.preempt_repeats)
+                .into_iter()
+                .partition(|(t, _)| now.diff(*t) >= 0);
+            self.preempt_repeats = later;
+            self.outbound_udata_messages.extend(due.into_iter().map(|(_, msg)| msg));
+        }
         had_activity |= self.submit_udata_msgs_to_umac(queue);
 
         // Advanced links ([packet_data] only): timers and the next data segment for the MCCH
