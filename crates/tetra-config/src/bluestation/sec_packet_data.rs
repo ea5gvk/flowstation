@@ -12,8 +12,8 @@ pub const PACKET_DATA_MAX_POOL: u32 = 1024;
 pub enum PacketDataBearer {
     /// On the common control channel, no channel assigned (clause 28.3.4.2 NOTE 2).
     Mcch,
-    /// On a packet-data channel of the main carrier (`pdch_max_slots` timeslots at most per
-    /// radio), which voice takes back.
+    /// On a packet-data channel of the main carrier or of the packet-data carrier
+    /// (`pdch_max_slots` timeslots at most per radio), which voice takes back.
     Pdch,
 }
 
@@ -37,9 +37,18 @@ pub struct CfgPacketData {
     pub pdch_idle_release_secs: u32,
     /// Timeslots one radio's PDCH may have (1..=4), within the full capability the radio declares
     /// in its resource request: at most the distinct slots of `pdch_timeslots` (the main carrier's
-    /// ts1 is the MCCH), one main traffic slot is left for voice when no other carrier has a free
-    /// one, and 1 with the bearer on the MCCH. See `pdch_slots_per_radio`.
+    /// ts1 is the MCCH), or of `pdch_carrier_timeslots` when a packet-data carrier is in use, one
+    /// traffic slot is left for voice when no other carrier has a free one, and 1 with the bearer
+    /// on the MCCH. See `StackConfig::pdch_slots_per_radio`.
     pub pdch_max_slots: u8,
+    /// The packet-data carrier: packet-data channels on this carrier too (all four slots), which
+    /// must be the secondary carrier in use (`cell_info.secondary_carrier`); otherwise ignored.
+    pub pdch_carrier: Option<u16>,
+    /// Timeslots of the packet-data carrier a PDCH may take, in order of preference (1..=4, one of
+    /// 2..=4 at least: a PDCH never transmits uplink on ts1 of that carrier).
+    pub pdch_carrier_timeslots: Vec<u8>,
+    /// Voice never goes to the packet-data carrier (a carrier for data only).
+    pub pdch_carrier_exclusive: bool,
 }
 
 impl Default for CfgPacketData {
@@ -53,6 +62,9 @@ impl Default for CfgPacketData {
             pdch_timeslots: vec![4, 3, 2],
             pdch_idle_release_secs: 10,
             pdch_max_slots: 1,
+            pdch_carrier: None,
+            pdch_carrier_timeslots: vec![4, 3, 2, 1],
+            pdch_carrier_exclusive: false,
         }
     }
 }
@@ -68,9 +80,9 @@ impl CfgPacketData {
         (2..=4u8).filter(|ts| self.pdch_timeslots.contains(ts)).count() as u8
     }
 
-    /// Timeslots a radio's packet-data channel may have here: `pdch_max_slots` within the
-    /// distinct slots of `pdch_timeslots` (a PDCH on a secondary carrier is not supported), 1 with
-    /// the bearer on the MCCH.
+    /// Timeslots a radio's packet-data channel of the main carrier may have: `pdch_max_slots`
+    /// within the distinct slots of `pdch_timeslots`, 1 with the bearer on the MCCH. With a
+    /// packet-data carrier in use, `StackConfig::pdch_slots_per_radio` counts its slots too.
     pub fn pdch_slots_per_radio(&self) -> u8 {
         match self.bearer {
             PacketDataBearer::Pdch => self.pdch_max_slots.min(self.pdch_timeslot_count()).max(1),
@@ -118,6 +130,12 @@ pub struct CfgPacketDataDto {
     pub pdch_idle_release_secs: u32,
     #[serde(default = "default_pdch_max_slots")]
     pub pdch_max_slots: u8,
+    #[serde(default)]
+    pub pdch_carrier: Option<u16>,
+    #[serde(default = "default_pdch_carrier_timeslots")]
+    pub pdch_carrier_timeslots: Vec<u8>,
+    #[serde(default)]
+    pub pdch_carrier_exclusive: bool,
 
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
@@ -143,6 +161,9 @@ fn default_pdch_idle_release_secs() -> u32 {
 }
 fn default_pdch_max_slots() -> u8 {
     CfgPacketData::default().pdch_max_slots
+}
+fn default_pdch_carrier_timeslots() -> Vec<u8> {
+    CfgPacketData::default().pdch_carrier_timeslots
 }
 
 fn parse_ipv4(key: &str, s: &str) -> Result<Ipv4Addr, String> {
@@ -179,6 +200,20 @@ pub fn apply_packet_data_patch(dto: CfgPacketDataDto) -> Result<CfgPacketData, S
     if !(1..=4).contains(&dto.pdch_max_slots) {
         return Err("packet_data: pdch_max_slots must be within 1..=4".to_string());
     }
+    // Carrier number: 12 bits (EN 300 392-2 table 21.87).
+    if dto.pdch_carrier.is_some_and(|c| c > 4095) {
+        return Err("packet_data: pdch_carrier must be a carrier number 0..=4095".to_string());
+    }
+    let cts = &dto.pdch_carrier_timeslots;
+    if cts.is_empty() || cts.iter().any(|t| !(1..=4).contains(t)) || (1..cts.len()).any(|i| cts[..i].contains(&cts[i])) {
+        return Err("packet_data: pdch_carrier_timeslots must list timeslots 1, 2, 3 or 4 of the packet-data carrier, each once".to_string());
+    }
+    if !cts.iter().any(|t| (2..=4).contains(t)) {
+        return Err(
+            "packet_data: pdch_carrier_timeslots must include timeslot 2, 3 or 4 (a packet-data channel never transmits uplink on ts1 of that carrier)"
+                .to_string(),
+        );
+    }
     Ok(CfgPacketData {
         enabled: dto.enabled,
         pool_first,
@@ -188,6 +223,9 @@ pub fn apply_packet_data_patch(dto: CfgPacketDataDto) -> Result<CfgPacketData, S
         pdch_timeslots: dto.pdch_timeslots,
         pdch_idle_release_secs: dto.pdch_idle_release_secs,
         pdch_max_slots: dto.pdch_max_slots,
+        pdch_carrier: dto.pdch_carrier,
+        pdch_carrier_timeslots: dto.pdch_carrier_timeslots,
+        pdch_carrier_exclusive: dto.pdch_carrier_exclusive,
     })
 }
 
@@ -267,6 +305,43 @@ pdch_idle_release_secs = 300"))
                 apply_packet_data_patch(dto(bad)),
                 Err("packet_data: pdch_max_slots must be within 1..=4".to_string())
             );
+        }
+    }
+
+    #[test]
+    fn pdch_carrier_keys() {
+        let default = apply_packet_data_patch(dto("")).unwrap();
+        assert_eq!(
+            (default.pdch_carrier, default.pdch_carrier_timeslots, default.pdch_carrier_exclusive),
+            (None, vec![4, 3, 2, 1], false)
+        );
+        let on = apply_packet_data_patch(dto("pdch_carrier = 1598
+pdch_carrier_timeslots = [4, 3, 2, 1]
+pdch_carrier_exclusive = true"))
+        .unwrap();
+        assert_eq!(
+            (on.pdch_carrier, on.pdch_carrier_timeslots, on.pdch_carrier_exclusive),
+            (Some(1598), vec![4, 3, 2, 1], true)
+        );
+        assert_eq!(
+            apply_packet_data_patch(dto("pdch_carrier = 4096")),
+            Err("packet_data: pdch_carrier must be a carrier number 0..=4095".to_string())
+        );
+        for bad in ["[]", "[0]", "[5]", "[1, 1]"] {
+            assert_eq!(
+                apply_packet_data_patch(dto(&format!("pdch_carrier_timeslots = {bad}"))),
+                Err("packet_data: pdch_carrier_timeslots must list timeslots 1, 2, 3 or 4 of the packet-data carrier, each once".to_string()),
+                "{bad}"
+            );
+        }
+        assert!(
+            apply_packet_data_patch(dto("pdch_carrier_timeslots = [1]"))
+                .unwrap_err()
+                .contains("must include timeslot 2, 3 or 4"),
+            "never ts1 alone"
+        );
+        for good in ["[2]", "[1, 4]", "[4, 3, 2, 1]"] {
+            assert!(apply_packet_data_patch(dto(&format!("pdch_carrier_timeslots = {good}"))).is_ok(), "{good}");
         }
     }
 

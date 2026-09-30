@@ -9,7 +9,7 @@ use crate::bluestation::{
 
 use super::sec_brew::CfgBrew;
 use super::sec_dashboard::CfgDashboard;
-use super::sec_packet_data::CfgPacketData;
+use super::sec_packet_data::{CfgPacketData, PacketDataBearer};
 use super::sec_telegram::CfgTelegram;
 use super::sec_telemetry::CfgTelemetry;
 
@@ -127,7 +127,50 @@ pub struct StackConfig {
     pub packet_data: CfgPacketData,
 }
 
+/// The packet-data carrier in use (`[packet_data] pdch_carrier`): packet-data channels of up to
+/// four slots on the secondary carrier, sent there from the MCCH with a channel allocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PdchCarrierCfg {
+    pub carrier: u16,
+    /// Its slots a PDCH may take, in order of preference (1..=4).
+    pub timeslots: Vec<u8>,
+    /// Voice never goes there.
+    pub exclusive: bool,
+}
+
 impl StackConfig {
+    /// The packet-data carrier in use: `[packet_data] pdch_carrier` when packet data is on with
+    /// bearer "pdch" and it is the secondary carrier in use (`cell_info.secondary_carrier`, after
+    /// `dual_carrier_enabled`). Anything else is ignored (logged by the SNDCP at start), never an
+    /// error: the dashboard turns the secondary carrier off without touching `[packet_data]`.
+    pub fn pdch_carrier(&self) -> Option<PdchCarrierCfg> {
+        let pd = &self.packet_data;
+        let carrier = pd.pdch_carrier?;
+        (pd.enabled
+            && pd.bearer == PacketDataBearer::Pdch
+            && carrier != self.cell.main_carrier
+            && self.cell.secondary_carrier == Some(carrier))
+        .then(|| PdchCarrierCfg {
+            carrier,
+            timeslots: pd.pdch_carrier_timeslots.clone(),
+            exclusive: pd.pdch_carrier_exclusive,
+        })
+    }
+
+    /// Timeslots one radio's packet-data channel may have: `pdch_max_slots` within the distinct
+    /// slots of `pdch_timeslots` or, with a packet-data carrier in use, of
+    /// `pdch_carrier_timeslots` if more; 1 with the bearer on the MCCH.
+    pub fn pdch_slots_per_radio(&self) -> u8 {
+        let main = self.packet_data.pdch_slots_per_radio();
+        match self.pdch_carrier() {
+            Some(c) => {
+                let distinct = (1..=4u8).filter(|ts| c.timeslots.contains(ts)).count() as u8;
+                main.max(self.packet_data.pdch_max_slots.min(distinct).max(1))
+            }
+            None => main,
+        }
+    }
+
     /// Return BS phase-modulated carrier numbers and their DL/UL frequencies.
     pub fn bs_phase_mod_carriers(&self) -> Result<Vec<(u16, u32, u32)>, String> {
         let mut carriers = Vec::with_capacity(if self.cell.secondary_carrier.is_some() { 2 } else { 1 });

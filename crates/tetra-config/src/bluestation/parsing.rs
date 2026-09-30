@@ -901,6 +901,65 @@ ready_timer_code = 9
         assert!(from_toml_str(&off).is_ok(), "only checked with the bearer on");
     }
 
+    fn pdch_carrier_toml(cell: &str, packet_data: &str) -> String {
+        minimal_toml(cell) + "\n[wap]\ngateway_ipv4 = \"10.0.1.1\"\n[packet_data]\n" + packet_data + "\n"
+    }
+
+    /// The main carrier as `pdch_carrier` is ignored, never an error: the station starts.
+    #[test]
+    fn pdch_carrier_equal_to_the_main_carrier_is_ignored() {
+        let cfg = from_toml_str(&pdch_carrier_toml(
+            "secondary_carrier = 1585",
+            "enabled = true\nbearer = \"pdch\"\npdch_carrier = 1584",
+        ))
+        .expect("parse");
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.pdch_carrier(), None);
+        let shared = crate::bluestation::SharedConfig::from_parts(cfg, None);
+        assert_eq!(shared.config().pdch_carrier(), None);
+    }
+
+    /// Only the secondary carrier in use, with packet data on a PDCH, is a packet-data carrier.
+    #[test]
+    fn pdch_carrier_is_in_use_only_as_the_secondary() {
+        let on = "enabled = true\nbearer = \"pdch\"\npdch_carrier = 1585";
+        let carrier = |cell: &str, pd: &str| from_toml_str(&pdch_carrier_toml(cell, pd)).expect("parse").pdch_carrier();
+        assert_eq!(
+            carrier("secondary_carrier = 1585", on),
+            Some(crate::bluestation::PdchCarrierCfg {
+                carrier: 1585,
+                timeslots: vec![4, 3, 2, 1],
+                exclusive: false
+            })
+        );
+        assert_eq!(carrier("secondary_carrier = 1585", "bearer = \"pdch\"\npdch_carrier = 1585"), None, "packet data off");
+        assert_eq!(carrier("secondary_carrier = 1585", "enabled = true\npdch_carrier = 1585"), None, "bearer mcch");
+        assert_eq!(carrier("", on), None, "no secondary");
+        assert_eq!(carrier("secondary_carrier = 1585\ndual_carrier_enabled = false", on), None, "dual carrier off");
+        assert_eq!(carrier("secondary_carrier = 1586", on), None, "another secondary");
+        let exclusive = carrier(
+            "secondary_carrier = 1585",
+            "enabled = true\nbearer = \"pdch\"\npdch_carrier = 1585\npdch_carrier_timeslots = [4, 3]\npdch_carrier_exclusive = true",
+        )
+        .expect("in use");
+        assert_eq!((exclusive.timeslots, exclusive.exclusive), (vec![4, 3], true));
+    }
+
+    #[test]
+    fn pdch_slots_per_radio_counts_the_carrier() {
+        let slots = |cell: &str, pd: &str| from_toml_str(&pdch_carrier_toml(cell, pd)).expect("parse").pdch_slots_per_radio();
+        let pd = "enabled = true\nbearer = \"pdch\"\npdch_timeslots = [3]\npdch_carrier = 1585\npdch_max_slots = 4";
+        assert_eq!(slots("secondary_carrier = 1585", pd), 4);
+        assert_eq!(slots("", pd), 1, "carrier not in use: main [3] only");
+        assert_eq!(slots("secondary_carrier = 1585", &pd.replace("bearer = \"pdch\"", "bearer = \"mcch\"")), 1);
+        assert_eq!(slots("secondary_carrier = 1585", &pd.replace("pdch_max_slots = 4", "pdch_max_slots = 2")), 2);
+        assert_eq!(
+            slots("secondary_carrier = 1585", "enabled = true\nbearer = \"pdch\"\npdch_max_slots = 3"),
+            3,
+            "without pdch_carrier: phase 1"
+        );
+    }
+
     #[test]
     fn wap_section_parses_with_subsections() {
         let toml = minimal_toml("")
