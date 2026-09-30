@@ -5210,6 +5210,56 @@ fn the_last_uplink_after_the_quit_is_accepted() {
     assert_eq!(quit, vec![(MAIN_CARRIER, 1, false)], "on the MCCH, without the allocation");
 }
 
+/// A PDU with a channel allocation (here an assignment sent again, as the LLC routed it to the
+/// channel) for a radio whose carrier channel went more than a multiframe ago goes on the MCCH,
+/// where the radio is, not on that timeslot of the main carrier.
+#[test]
+fn an_allocation_for_a_carrier_channel_long_gone_goes_on_the_mcch() {
+    debug::setup_logging_verbose();
+    let mut air = released_carrier_channel();
+    for _ in 0..80 {
+        air.tick();
+    }
+    air.slots.clear();
+    air.test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+            req_handle: 0,
+            pdu: BitBuffer::from_bitstr("0000100110011000"),
+            main_address: TetraAddress::issi(ISSI),
+            link_id: 4,
+            endpoint_id: 0,
+            stealing_permission: false,
+            subscriber_class: 0,
+            air_interface_encryption: None,
+            stealing_repeats_flag: None,
+            data_category: None,
+            carrier_num: Some(SECONDARY_CARRIER),
+            chan_alloc: Some(CmceChanAllocReq {
+                usage: None,
+                carrier: Some(SECONDARY_CARRIER),
+                timeslots: [true; 4],
+                alloc_type: ChanAllocType::Replace,
+                ul_dl_assigned: UlDlAssignment::Both,
+            }),
+            tx_reporter: None,
+        }),
+    });
+    for _ in 0..8 {
+        air.tick();
+    }
+    let sent: Vec<(u16, u8)> = air
+        .slots
+        .iter()
+        .flat_map(|s| mac_resources(s).into_iter().map(move |r| (s.carrier_num, s.ts.t, r)))
+        .filter(|(_, _, r)| r.addr.is_some_and(|a| a.ssi == ISSI))
+        .map(|(c, t, _)| (c, t))
+        .collect();
+    assert_eq!(sent, vec![(MAIN_CARRIER, 1)], "on the MCCH");
+}
+
 /// A PDU queued for the radio on the MCCH when its carrier assignment goes out follows it to its
 /// channel. (miura: here the assignment fills its block, so the PDU behind it cannot share it;
 /// tea2 used an encrypted PDU, which must open its block.)

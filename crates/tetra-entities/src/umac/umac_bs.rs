@@ -2202,10 +2202,11 @@ impl UmacBs {
                 if theirs {
                     c
                 } else {
-                    // (Packet data or a quit is only ever meant for a channel; miura marks no
-                    // packet-data channel assignment, which goes on the MCCH anyway.)
-                    let for_a_pdch = matches!(prim.data_category, Some(DATA_CATEGORY_PACKET_DATA | DATA_CATEGORY_AL_REPLY))
-                        || mac_chan_alloc.as_ref().is_some_and(|a| a.alloc_type == ChanAllocType::QuitAndGo);
+                    // (Packet data is only ever meant for a channel, and so is a channel
+                    // allocation sent there - an assignment, a quit, a call's: never for that
+                    // timeslot of the main carrier, where the radio is not.)
+                    let for_a_pdch =
+                        matches!(prim.data_category, Some(DATA_CATEGORY_PACKET_DATA | DATA_CATEGORY_AL_REPLY)) || mac_chan_alloc.is_some();
                     if sched.pdch_owner(ts).is_some() || sched.pdch_released_owner(ts).is_some() || for_a_pdch {
                         tracing::debug!(
                             "UMAC: {} is no longer on its PDCH of carrier {} (link {}): MCCH",
