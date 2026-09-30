@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
@@ -29,6 +29,17 @@ use super::sink::Sink;
 thread_local! {
     /// Fingerprint of what `dump_sinks` returned on this thread since `trace_arm`.
     static TRACE: RefCell<Option<DefaultHasher>> = const { RefCell::new(None) };
+    /// Applied, on this thread, to every configuration a `ComponentTest` is built from.
+    static CONFIG_TWEAK: Cell<Option<fn(&mut StackConfig)>> = const { Cell::new(None) };
+}
+
+/// Run `f` with `tweak` applied to every configuration a `ComponentTest` is built from on this
+/// thread (a scenario run again with one more key, for the identity tests).
+pub fn with_config_tweak<R>(tweak: fn(&mut StackConfig), f: impl FnOnce() -> R) -> R {
+    CONFIG_TWEAK.with(|t| t.set(Some(tweak)));
+    let out = f();
+    CONFIG_TWEAK.with(|t| t.set(None));
+    out
 }
 
 /// Start a fingerprint, on this thread, of every slot the MAC puts on the air and every PDU
@@ -86,7 +97,10 @@ impl ComponentTest {
     }
 
     /// Create a new ComponentTest instance with the given config and optional start downlink time.
-    pub fn from_config(config: StackConfig, start_dl_time: Option<TdmaTime>) -> Self {
+    pub fn from_config(mut config: StackConfig, start_dl_time: Option<TdmaTime>) -> Self {
+        if let Some(tweak) = CONFIG_TWEAK.with(Cell::get) {
+            tweak(&mut config);
+        }
         let shared_config = SharedConfig::from_parts(config, None);
         let config_clone = shared_config.clone();
         let mut mr = MessageRouter::new(config_clone);

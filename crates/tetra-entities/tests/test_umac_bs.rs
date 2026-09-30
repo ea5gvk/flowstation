@@ -1398,6 +1398,81 @@ fn test_secondary_ts1_close_is_deferred_so_facch_release_goes_out_on_channel() {
     );
 }
 
+// ---------------------------------------------------------------------------------------------
+// The secondary carrier: what goes on the air, recorded on the code before the packet-data
+// carrier (ec7a393); a different value is a change on the air, never a reason to update it.
+// ---------------------------------------------------------------------------------------------
+
+/// Fingerprint of every slot `scenario` put on the air and every PDU between its MAC and LLC.
+fn fingerprint(scenario: fn()) -> u64 {
+    crate::common::component_test::trace_arm();
+    scenario();
+    let hash = crate::common::component_test::trace_hash();
+    println!("fingerprint {hash:#018x}");
+    hash
+}
+
+const SECONDARY_IDENTITY_MCCH_FALLBACK: u64 = 0xcff1_07d7_0d00_b160;
+const SECONDARY_IDENTITY_TS1_CHAN_ALLOC: u64 = 0xa34f_325f_fa50_331d;
+const SECONDARY_IDENTITY_TS1_CLOSE: u64 = 0xe3cf_f55b_8a1e_2e15;
+
+#[test]
+fn secondary_identity_mcch_fallback() {
+    assert_eq!(
+        fingerprint(test_secondary_carrier_normal_signalling_falls_back_to_primary_mcch),
+        SECONDARY_IDENTITY_MCCH_FALLBACK
+    );
+}
+
+#[test]
+fn secondary_identity_ts1_chan_alloc() {
+    assert_eq!(
+        fingerprint(test_secondary_ts1_channel_allocation_encodes_secondary_carrier_without_css),
+        SECONDARY_IDENTITY_TS1_CHAN_ALLOC
+    );
+}
+
+#[test]
+fn secondary_identity_ts1_close() {
+    assert_eq!(
+        fingerprint(test_secondary_ts1_close_is_deferred_so_facch_release_goes_out_on_channel),
+        SECONDARY_IDENTITY_TS1_CLOSE
+    );
+}
+
+/// Packet data on a PDCH (`[packet_data] bearer = "pdch"`) in every configuration of the scenario.
+fn packet_data_on_a_pdch(cfg: &mut tetra_config::bluestation::StackConfig) {
+    cfg.cell.sndcp_service = true;
+    cfg.packet_data.enabled = true;
+    cfg.packet_data.bearer = tetra_config::bluestation::PacketDataBearer::Pdch;
+}
+
+const SECONDARY_IDENTITY_PDCH_MCCH_FALLBACK: u64 = 0xc42d_b950_f975_ddc5;
+const SECONDARY_IDENTITY_PDCH_TS1_CHAN_ALLOC: u64 = 0x7ad3_5df6_28ad_7630;
+const SECONDARY_IDENTITY_PDCH_TS1_CLOSE: u64 = 0x1dc7_5269_0450_1a34;
+
+/// The secondary-carrier scenarios with packet data on a PDCH and no data session.
+fn secondary_scenarios_with(tweak: fn(&mut tetra_config::bluestation::StackConfig)) -> [u64; 3] {
+    [
+        test_secondary_carrier_normal_signalling_falls_back_to_primary_mcch as fn(),
+        test_secondary_ts1_channel_allocation_encodes_secondary_carrier_without_css,
+        test_secondary_ts1_close_is_deferred_so_facch_release_goes_out_on_channel,
+    ]
+    .map(|scenario| crate::common::component_test::with_config_tweak(tweak, || fingerprint(scenario)))
+}
+
+#[test]
+fn secondary_identity_with_packet_data_on_a_pdch() {
+    assert_eq!(
+        secondary_scenarios_with(packet_data_on_a_pdch),
+        [
+            SECONDARY_IDENTITY_PDCH_MCCH_FALLBACK,
+            SECONDARY_IDENTITY_PDCH_TS1_CHAN_ALLOC,
+            SECONDARY_IDENTITY_PDCH_TS1_CLOSE
+        ]
+    );
+}
+
 #[test]
 fn test_local_loopback_ul_still_loops_back_and_reaches_brew() {
     // Only a LocalParrot circuit hands its uplink to CMCE: an ordinary simplex circuit keeps

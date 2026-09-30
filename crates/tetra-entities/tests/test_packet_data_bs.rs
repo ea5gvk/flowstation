@@ -3396,6 +3396,40 @@ fn width1_identity_fragmented_datagram() {
     );
 }
 
+// Two carriers and multislot channels of the main carrier: recorded on the code before the
+// packet-data carrier (ec7a393); a different value is a change on the air, never a reason to
+// update the constant.
+
+#[test]
+fn dual_identity_voice_before_the_pdch() {
+    assert_eq!(fingerprint(with_two_carriers_voice_uses_the_secondary_before_the_pdch), 0x5e14_6dd2_6a2a_f4c7);
+}
+
+#[test]
+fn dual_identity_duplex_calls() {
+    assert_eq!(fingerprint(duplex_calls_on_two_carriers_are_the_same_with_packet_data_on), 0x6904_fb80_aa10_ba71);
+}
+
+#[test]
+fn multislot_identity_al_spread() {
+    assert_eq!(fingerprint(al_segments_spread_over_the_multislot_pdch), 0x1167_6276_3480_faa0);
+}
+
+#[test]
+fn multislot_identity_uplink_across_the_channel() {
+    assert_eq!(fingerprint(uplink_grant_and_reassembly_across_the_channel), 0xefd4_c74d_72b1_f386);
+}
+
+#[test]
+fn multislot_identity_voice_releases_the_channel() {
+    assert_eq!(fingerprint(voice_taking_one_slot_releases_the_whole_multislot_pdch), 0xe9e7_fae5_16ce_5726);
+}
+
+#[test]
+fn multislot_identity_two_radios() {
+    assert_eq!(fingerprint(two_radios_never_share_a_slot), 0x3cf9_f265_2810_2734);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Multislot PDCH (`pdch_max_slots` > 1): a packet-data channel of several main-carrier slots
 // ---------------------------------------------------------------------------------------------
