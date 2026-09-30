@@ -83,6 +83,10 @@ pub struct UmacBs {
     pdch_carrier: Option<u16>,
     /// The same as `pdch_conflict` on the packet-data carrier.
     pdch_carrier_conflict: Option<(u8, u32, u32)>,
+    /// While a channel of the packet-data carrier exists: the uplink MAC blocks received in the
+    /// current uplink label (carrier, label, PHY block, bits). A bit-exact copy of one on the other
+    /// carrier is the adjacent-channel copy of the same burst (see `rx_tmv_unitdata_ind`).
+    ul_label_blocks: Vec<(u16, TdmaTime, PhyBlockNum, String)>,
     /// The uplink MAC block being read: a PDU in it said its radio has nothing more to send (its
     /// carrier, uplink slot and ISSI), and whether a PDU in it carried a reservation requirement.
     /// With association the requirement is in the last PDU (23.5.2.1) and 23.5.2.3.1 judges the
@@ -159,6 +163,7 @@ impl UmacBs {
             pdch_conflict: None,
             pdch_carrier: pdch_carrier.map(|p| p.carrier),
             pdch_carrier_conflict: None,
+            ul_label_blocks: Vec::new(),
             ul_block_release: None,
             ul_block_requirement: false,
         }
@@ -281,6 +286,81 @@ impl UmacBs {
                 );
             }
         }
+    }
+
+    /// Whether a packet-data channel of the packet-data carrier exists (the uplink copy rules run
+    /// only then).
+    fn pdch_carrier_active(&self) -> bool {
+        self.pdch_carrier.is_some_and(|c| self.scheduler_for(c).has_pdch())
+    }
+
+    /// Whether an uplink MAC PDU from `issi`, received on `carrier_num` in uplink slot
+    /// `msg_dltime`, is the adjacent-channel copy of a burst the radio sent on the other carrier
+    /// (the receiver of each carrier also demodulates a nearby radio on the other one), to be
+    /// dropped before anything acts on it. Only with a packet-data carrier in use:
+    ///   1. on the packet-data carrier only a circuit, its hangtime or the radio of a channel there
+    ///      transmits (never on ts1), and for a multiframe after the release its previous owner (its
+    ///      last bursts, 23.5.2.2.4 NOTE 2): the carrier has no MCCH;
+    ///
+    /// and while a channel of the packet-data carrier exists:
+    ///   2. a radio holding this uplink slot on the other carrier cannot be transmitting here too;
+    ///   3. on main ts2-4 only a circuit, its hangtime or a packet-data channel's radio transmits
+    ///      (the mirror of 1).
+    ///
+    /// A copy whose original passed its CRC too is the same block bit for bit, already dropped
+    /// in `rx_tmv_unitdata_ind`.
+    fn is_adjacent_channel_copy(&self, carrier_num: u16, msg_dltime: TdmaTime, issi: u32) -> bool {
+        let Some(pdch_carrier) = self.pdch_carrier else {
+            return false;
+        };
+        let main = self.main_carrier();
+        let t = msg_dltime.t;
+        if carrier_num != main {
+            let sched = self.scheduler_for(carrier_num);
+            let pdch_own = t != 1 && (sched.is_pdch_of(t, issi) || sched.pdch_released_owner(t) == Some(issi));
+            if !(sched.circuit_is_active(Direction::Dl, t) || sched.circuit_is_active(Direction::Ul, t) || sched.is_hangtime(t) || pdch_own)
+            {
+                tracing::debug!(
+                    "UmacBs: dropping uplink from ISSI {} on carrier {} ts {}: no circuit there, adjacent-channel copy",
+                    issi,
+                    carrier_num,
+                    t
+                );
+                return true;
+            }
+        }
+        if !self.pdch_carrier_active() {
+            return false;
+        }
+        let other = if carrier_num == main { pdch_carrier } else { main };
+        if self.scheduler_for(other).ul_reserved_to(msg_dltime, issi) {
+            tracing::debug!(
+                "UmacBs: dropping uplink from ISSI {} on carrier {} ts {}: that slot is reserved to it on carrier {}, adjacent-channel copy",
+                issi,
+                carrier_num,
+                t,
+                other
+            );
+            return true;
+        }
+        let sched = &self.channel_scheduler;
+        if carrier_num == main
+            && t != 1
+            && !(sched.circuit_is_active(Direction::Dl, t)
+                || sched.circuit_is_active(Direction::Ul, t)
+                || sched.is_hangtime(t)
+                || sched.is_pdch_of(t, issi)
+                || sched.pdch_released_owner(t) == Some(issi))
+        {
+            tracing::debug!(
+                "UmacBs: dropping uplink from ISSI {} on carrier {} ts {}: no circuit or PDCH of it there, adjacent-channel copy",
+                issi,
+                carrier_num,
+                t
+            );
+            return true;
+        }
+        false
     }
 
     /// Whether `carrier` may hold packet-data channels: the main carrier, or the packet-data
@@ -639,6 +719,33 @@ impl UmacBs {
         self.ul_block_release = None;
         self.ul_block_requirement = false;
 
+        // While a channel of the packet-data carrier exists, one burst is often received on both
+        // carriers (adjacent channels, the PHY hands the stronger over first): demodulated from the
+        // same burst, with the cell's scrambling, a copy that passes its CRC is bit for bit the
+        // same, in the clear or encrypted. Dropped before anything attributes, decrypts or
+        // reassembles it; a different radio's block in the same slot is never equal.
+        if self.pdch_carrier_active() {
+            let label = self.dltime.add_timeslots(-2);
+            let bits = prim.pdu.to_bitstr();
+            self.ul_label_blocks.retain(|b| b.1 == label);
+            if let Some(&(other, ..)) = self
+                .ul_label_blocks
+                .iter()
+                .find(|b| b.0 != prim.carrier_num && b.2 == prim.block_num && b.3 == bits)
+            {
+                tracing::debug!(
+                    "UMAC: uplink block on carrier {} {} is a copy of carrier {}'s: dropped",
+                    prim.carrier_num,
+                    label,
+                    other
+                );
+                return;
+            }
+            self.ul_label_blocks.push((prim.carrier_num, label, prim.block_num, bits));
+        } else if !self.ul_label_blocks.is_empty() {
+            self.ul_label_blocks.clear();
+        }
+
         match prim.logical_channel {
             LogicalChannel::SchF => {
                 // Full slot signalling — must be a full block. A mismatched block_num
@@ -829,6 +936,9 @@ impl UmacBs {
             tracing::warn!("UMAC: rx_mac_data: PDU has neither addr nor event_label; dropping");
             return;
         };
+        if self.is_adjacent_channel_copy(carrier_num, self.dltime.add_timeslots(-2), addr.ssi) {
+            return;
+        }
 
         let (mut pdu_len_bits, is_frag_start, second_half_stolen, is_null_pdu) = {
             if let Some(len_ind) = pdu.length_ind {
@@ -1026,6 +1136,9 @@ impl UmacBs {
             tracing::error!("BUG: unexpected message or state -- routing error");
             return;
         };
+        if self.is_adjacent_channel_copy(carrier_num, self.dltime.add_timeslots(-2), addr.ssi) {
+            return;
+        }
 
         // Compute len and extract flags
         let mut pdu_len_bits;

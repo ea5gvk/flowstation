@@ -4,7 +4,7 @@ use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, BurstType, PhyBlockNum, PhyBlockType, Sap, TdmaTime, TrainingSequence, unimplemented_log};
 use tetra_pdus::phy::traits::rxtx_dev::RxBurstBits;
-use tetra_pdus::phy::traits::rxtx_dev::{RxTxDev, TxSlotBits};
+use tetra_pdus::phy::traits::rxtx_dev::{RxSlotBits, RxTxDev, TxSlotBits};
 use tetra_saps::tp::TpUnitdataInd;
 use tetra_saps::{SapMsg, SapMsgInner};
 
@@ -37,6 +37,26 @@ pub struct PhyBs<D: RxTxDev> {
     /// Next time a device/file error may be logged at warn level. These fire per
     /// timeslot (~70/s), so an unfiltered warning would bury the journal.
     err_log_next: std::time::Instant,
+
+    /// With a packet-data carrier in use (`[packet_data] pdch_carrier`) the carriers of a slot
+    /// are handed over strongest burst first: the burst a radio really sent comes before its
+    /// adjacent-channel copy on the other carrier, which the UMAC then drops as the weaker one.
+    order_by_rssi: bool,
+}
+
+/// The carriers of one received slot, strongest found burst first (non-finite RSSI last, ties in
+/// their order).
+fn strongest_first(rx: &mut [Option<RxSlotBits<'_>>]) {
+    let strongest = |s: &Option<RxSlotBits<'_>>| {
+        s.as_ref().map_or(f32::NEG_INFINITY, |s| {
+            [&s.slot, &s.subslot1, &s.subslot2]
+                .into_iter()
+                .filter(|b| b.train_type != TrainingSequence::NotFound && b.rssi_dbfs.is_finite())
+                .map(|b| b.rssi_dbfs)
+                .fold(f32::NEG_INFINITY, f32::max)
+        })
+    };
+    rx.sort_by(|a, b| strongest(b).total_cmp(&strongest(a)));
 }
 
 /// Minimum interval between warnings about a failing timeslot.
@@ -57,6 +77,7 @@ fn may_warn(next: &mut std::time::Instant) -> bool {
 
 impl<D: RxTxDev> PhyBs<D> {
     pub fn new(config: SharedConfig, rxtxdev: D) -> Self {
+        let order_by_rssi = config.config().pdch_carrier().is_some();
         let c = &config.config().phy_io;
 
         let dl_tx_logger = c
@@ -89,6 +110,7 @@ impl<D: RxTxDev> PhyBs<D> {
             rxtxdev,
             tick: 0,
             err_log_next: std::time::Instant::now(),
+            order_by_rssi,
         }
     }
 
@@ -306,7 +328,8 @@ impl<D: RxTxDev> PhyBs<D> {
         // catch_unwind, so a panic here kills the whole cell and systemd crash-loops it.
         // An RX overflow on a loaded RPi + LimeSDR is an everyday event -- drop this
         // timeslot's RX and let the next tick resync. TX has already been queued above.
-        let rx = match self.rxtxdev.rxtx_timeslot(&tx_slots) {
+        let order_by_rssi = self.order_by_rssi;
+        let mut rx = match self.rxtxdev.rxtx_timeslot(&tx_slots) {
             Ok(rx) => rx,
             Err(e) => {
                 if may_warn(&mut self.err_log_next) {
@@ -317,6 +340,9 @@ impl<D: RxTxDev> PhyBs<D> {
                 return;
             }
         };
+        if order_by_rssi {
+            strongest_first(&mut rx);
+        }
 
         for rx_slot in rx {
             if let Some(rx_slot) = rx_slot {
@@ -388,5 +414,41 @@ impl<D: RxTxDev + Send + 'static> TetraEntityTrait for PhyBs<D> {
         self.dltime = ts;
         let _ = &self.config;
         let _ = &self.ul_input_file;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn found(carrier_num: u16, rssi_dbfs: f32) -> Option<RxSlotBits<'static>> {
+        Some(RxSlotBits {
+            carrier_num,
+            slot: RxBurstBits {
+                train_type: TrainingSequence::NormalTrainSeq1,
+                bits: &[],
+                rssi_dbfs,
+            },
+            ..Default::default()
+        })
+    }
+
+    fn carriers(rx: &[Option<RxSlotBits<'_>>]) -> Vec<Option<u16>> {
+        rx.iter().map(|s| s.as_ref().map(|s| s.carrier_num)).collect()
+    }
+
+    /// With a packet-data carrier the stronger carrier's burst is handed over first (the real one
+    /// before its adjacent-channel copy); non-finite RSSI last, ties in the PHY's order.
+    #[test]
+    fn carriers_are_delivered_strongest_first_with_a_pdch_carrier() {
+        let mut rx = vec![found(1600, -75.0), found(1598, -40.0)];
+        strongest_first(&mut rx);
+        assert_eq!(carriers(&rx), vec![Some(1598), Some(1600)]);
+        let mut rx = vec![found(1600, f32::NEG_INFINITY), found(1598, -90.0), None];
+        strongest_first(&mut rx);
+        assert_eq!(carriers(&rx), vec![Some(1598), Some(1600), None]);
+        let mut rx = vec![found(1600, -60.0), found(1598, -60.0)];
+        strongest_first(&mut rx);
+        assert_eq!(carriers(&rx), vec![Some(1600), Some(1598)], "a tie keeps the main carrier first");
     }
 }
