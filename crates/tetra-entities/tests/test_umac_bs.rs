@@ -1399,8 +1399,8 @@ fn test_secondary_ts1_close_is_deferred_so_facch_release_goes_out_on_channel() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The secondary carrier: what goes on the air, recorded on the code before the packet-data
-// carrier (ec7a393); a different value is a change on the air, never a reason to update it.
+// The secondary carrier: what goes on the air, recorded on miura before the packet-data
+// carrier (c4fc51a); a different value is a change on the air, never a reason to update it.
 // ---------------------------------------------------------------------------------------------
 
 /// Fingerprint of every slot `scenario` put on the air and every PDU between its MAC and LLC.
@@ -1412,9 +1412,9 @@ fn fingerprint(scenario: fn()) -> u64 {
     hash
 }
 
-const SECONDARY_IDENTITY_MCCH_FALLBACK: u64 = 0xcff1_07d7_0d00_b160;
-const SECONDARY_IDENTITY_TS1_CHAN_ALLOC: u64 = 0xa34f_325f_fa50_331d;
-const SECONDARY_IDENTITY_TS1_CLOSE: u64 = 0xe3cf_f55b_8a1e_2e15;
+const SECONDARY_IDENTITY_MCCH_FALLBACK: u64 = 0x9fb4_e644_d687_7645;
+const SECONDARY_IDENTITY_TS1_CHAN_ALLOC: u64 = 0x26ca_16a9_4a01_fe80;
+const SECONDARY_IDENTITY_TS1_CLOSE: u64 = 0x8161_e654_6d07_aabe;
 
 #[test]
 fn secondary_identity_mcch_fallback() {
@@ -1447,9 +1447,9 @@ fn packet_data_on_a_pdch(cfg: &mut tetra_config::bluestation::StackConfig) {
     cfg.packet_data.bearer = tetra_config::bluestation::PacketDataBearer::Pdch;
 }
 
-const SECONDARY_IDENTITY_PDCH_MCCH_FALLBACK: u64 = 0xc42d_b950_f975_ddc5;
-const SECONDARY_IDENTITY_PDCH_TS1_CHAN_ALLOC: u64 = 0x7ad3_5df6_28ad_7630;
-const SECONDARY_IDENTITY_PDCH_TS1_CLOSE: u64 = 0x1dc7_5269_0450_1a34;
+const SECONDARY_IDENTITY_PDCH_MCCH_FALLBACK: u64 = 0x047d_a5ac_24b2_5ba9;
+const SECONDARY_IDENTITY_PDCH_TS1_CHAN_ALLOC: u64 = 0x0ddf_d5e0_dc2e_63de;
+const SECONDARY_IDENTITY_PDCH_TS1_CLOSE: u64 = 0x2770_f1fc_3b23_fa55;
 
 /// The secondary-carrier scenarios with packet data on a PDCH and no data session.
 fn secondary_scenarios_with(tweak: fn(&mut tetra_config::bluestation::StackConfig)) -> [u64; 3] {

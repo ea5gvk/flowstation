@@ -3396,38 +3396,38 @@ fn width1_identity_fragmented_datagram() {
     );
 }
 
-// Two carriers and multislot channels of the main carrier: recorded on the code before the
-// packet-data carrier (ec7a393); a different value is a change on the air, never a reason to
+// Two carriers and multislot channels of the main carrier: recorded on miura before the
+// packet-data carrier (c4fc51a); a different value is a change on the air, never a reason to
 // update the constant.
 
 #[test]
 fn dual_identity_voice_before_the_pdch() {
-    assert_eq!(fingerprint(with_two_carriers_voice_uses_the_secondary_before_the_pdch), 0x5e14_6dd2_6a2a_f4c7);
+    assert_eq!(fingerprint(with_two_carriers_voice_uses_the_secondary_before_the_pdch), 0x92be_16fd_a974_2435);
 }
 
 #[test]
 fn dual_identity_duplex_calls() {
-    assert_eq!(fingerprint(duplex_calls_on_two_carriers_are_the_same_with_packet_data_on), 0x6904_fb80_aa10_ba71);
+    assert_eq!(fingerprint(duplex_calls_on_two_carriers_are_the_same_with_packet_data_on), 0xdb61_bf54_cae9_5f0b);
 }
 
 #[test]
 fn multislot_identity_al_spread() {
-    assert_eq!(fingerprint(al_segments_spread_over_the_multislot_pdch), 0x1167_6276_3480_faa0);
+    assert_eq!(fingerprint(al_segments_spread_over_the_multislot_pdch), 0x26d6_f139_7a3f_1333);
 }
 
 #[test]
 fn multislot_identity_uplink_across_the_channel() {
-    assert_eq!(fingerprint(uplink_grant_and_reassembly_across_the_channel), 0xefd4_c74d_72b1_f386);
+    assert_eq!(fingerprint(uplink_grant_and_reassembly_across_the_channel), 0xfa06_aeaf_36d6_3e98);
 }
 
 #[test]
 fn multislot_identity_voice_releases_the_channel() {
-    assert_eq!(fingerprint(voice_taking_one_slot_releases_the_whole_multislot_pdch), 0xe9e7_fae5_16ce_5726);
+    assert_eq!(fingerprint(voice_taking_one_slot_releases_the_whole_multislot_pdch), 0xb5f2_aab5_94b2_7a8c);
 }
 
 #[test]
 fn multislot_identity_two_radios() {
-    assert_eq!(fingerprint(two_radios_never_share_a_slot), 0x3cf9_f265_2810_2734);
+    assert_eq!(fingerprint(two_radios_never_share_a_slot), 0x4b73_4e56_3d67_6772);
 }
 
 // ---------------------------------------------------------------------------------------------
