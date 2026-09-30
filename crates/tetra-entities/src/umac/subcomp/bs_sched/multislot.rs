@@ -132,6 +132,19 @@ impl BsChannelScheduler {
         e.ul1 == Some(ssi) || e.ul2 == Some(ssi)
     }
 
+    /// Whether uplink slot `u` is reserved to `ssi` for a burst on `lchan`: a slot is sent as
+    /// SCH/F, a subslot as SCH/HU (EN 300 392-2 23.5.2.3.1), never as STCH. Both subslots of one
+    /// slot granted to the radio read as the slot.
+    pub fn ul_reserved_as(&self, u: TdmaTime, ssi: u32, lchan: LogicalChannel) -> bool {
+        let e = &self.ulsched[u.t as usize - 1][self.ul_ts_to_sched_index(&u)];
+        let (one, two) = (e.ul1 == Some(ssi), e.ul2 == Some(ssi));
+        match lchan {
+            LogicalChannel::SchF => one && two,
+            LogicalChannel::SchHu => one != two,
+            _ => false,
+        }
+    }
+
     /// Free uplink slot `u`.
     fn ul_free_slot(&mut self, u: TdmaTime) {
         let index = self.ul_ts_to_sched_index(&u);
@@ -812,6 +825,33 @@ mod tests {
         let slots = finalize_slots(&mut sched, 3);
         assert_eq!(slots[2].ts, at(6, 3));
         assert_eq!(dl_pdus(&slots[2]).first().map(|p| (p.0, p.2)), Some((0, 0b111111)));
+    }
+
+    /// A slot reserved to the radio is one for an SCH/F burst, a subslot one for an SCH/HU burst,
+    /// neither for an STCH; both subslots of one slot granted to it read as the slot.
+    #[test]
+    fn test_ul_reserved_as_matches_the_granted_form() {
+        use LogicalChannel::{SchF, SchHu, Stch};
+        let mut sched = get_testing_slotter();
+        sched.set_dl_time(at(3, 3));
+        let (slot, subslot) = (at(5, 3), at(6, 3));
+        sched.ul_reserve_grant(RADIO, vec![slot], false, None);
+        assert_eq!(
+            [SchF, SchHu, Stch].map(|l| sched.ul_reserved_as(slot, RADIO, l)),
+            [true, false, false]
+        );
+        assert!(!sched.ul_reserved_as(slot, RADIO + 1, SchF), "another radio");
+        sched.ul_reserve_grant(RADIO, vec![subslot], true, None);
+        assert_eq!(
+            [SchF, SchHu, Stch].map(|l| sched.ul_reserved_as(subslot, RADIO, l)),
+            [false, true, false]
+        );
+        sched.ul_reserve_grant(RADIO, vec![subslot], true, None);
+        assert_eq!(
+            [SchF, SchHu].map(|l| sched.ul_reserved_as(subslot, RADIO, l)),
+            [true, false],
+            "two subslots"
+        );
     }
 
     fn time(m: u8, f: u8, t: u8) -> TdmaTime {
