@@ -38,6 +38,7 @@ use tetra_saps::lcmc::enums::ul_dl_assignment::UlDlAssignment;
 use tetra_saps::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
 use tetra_saps::ltpd::{LtpdBearer, LtpdMleUnitdataInd};
 use tetra_saps::tla::{TlDataReqAl, TlaTlUnitdataReqBl};
+use tetra_saps::tma::DATA_CATEGORY_PDCH_ASSIGNMENT;
 use tetra_saps::{SapMsg, SapMsgInner};
 
 use super::ip::{bitbuffer_npdu_octets, parse_ipv4_packet};
@@ -317,10 +318,13 @@ fn quit_to_mcch(main_carrier: u16) -> CmceChanAllocReq {
     }
 }
 
-/// `msg` (a TL-DATA request) with a channel allocation and a report of its transmission.
+/// `msg` (a TL-DATA request) with a channel allocation and a report of its transmission. It is
+/// marked as a packet-data channel assignment, so the MAC drops a channel allocation that is no
+/// longer the radio's when it goes out.
 fn with_chan_alloc(mut msg: SapMsg, chan_alloc: CmceChanAllocReq, reporter: &TxReporter) -> SapMsg {
     if let SapMsgInner::TlaTlDataReqBl(req) = &mut msg.msg {
         req.chan_alloc = Some(chan_alloc);
+        req.data_class_info = Some(DATA_CATEGORY_PDCH_ASSIGNMENT);
         req.tx_reporter = Some(reporter.clone());
     }
     msg

@@ -50,6 +50,11 @@ pub struct TmaReportInd {
 /// implementer).
 pub const DATA_CATEGORY_PACKET_DATA: Todo = 1;
 
+/// `TmaUnitdataReq::data_category` of SNDCP signalling that carries a packet-data channel
+/// assignment (or the quit back to the MCCH): the MAC checks, when it sends it, that the channel
+/// it gives is still its radio's, which a call or a release may have changed while it waited.
+pub const DATA_CATEGORY_PDCH_ASSIGNMENT: Todo = 2;
+
 /// `TmaUnitdataReq::data_category` of an advanced link segment that asks for an acknowledgement,
 /// on a packet-data channel of several slots: the MAC reserves the radio an uplink slot for its
 /// answer and grants it with the segment (EN 300 392-2 23.5.1.3.3, 23.5.2.2.1 b).

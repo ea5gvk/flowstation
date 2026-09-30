@@ -437,7 +437,7 @@ impl BsChannelScheduler {
         self.dltx_queues[q]
             .iter()
             .find_map(|e| match e {
-                DlSchedElem::Resource(pdu, _, reporter) if pdu.addr.is_some_and(|a| a.ssi == ssi && a.ssi_type != SsiType::Gssi) => {
+                DlSchedElem::Resource(pdu, _, reporter, _) if pdu.addr.is_some_and(|a| a.ssi == ssi && a.ssi_type != SsiType::Gssi) => {
                     Some(reporter.as_ref())
                 }
                 _ => None,
@@ -524,7 +524,7 @@ impl BsChannelScheduler {
         };
         self.ul_reserve_grant(ssi, labels.clone(), false, marker);
         let carrier = self.dltx_queues[q].iter().position(|e| {
-            matches!(e, DlSchedElem::Resource(pdu, sdu, _)
+            matches!(e, DlSchedElem::Resource(pdu, sdu, ..)
                 if pdu.addr.is_some_and(|a| a.ssi == ssi && a.ssi_type != SsiType::Gssi)
                     && pdu.chan_alloc_element.is_none()
                     && Self::fits_with_a_grant(pdu, sdu))
@@ -543,7 +543,7 @@ impl BsChannelScheduler {
             None => {
                 let mut pdu = Self::dl_make_minimal_resource(&debt.addr, Some(grant.clone()), false);
                 pdu.usage_marker = marker;
-                DlSchedElem::Resource(pdu, BitBuffer::new(0), None)
+                DlSchedElem::Resource(pdu, BitBuffer::new(0), None, false)
             }
         };
         self.dltx_queues[q].insert(0, elem);
@@ -585,7 +585,7 @@ impl BsChannelScheduler {
         let mut found = None;
         for (i, e) in self.dltx_queues[lazy.q].iter_mut().enumerate() {
             let (pdu, empty) = match e {
-                DlSchedElem::Resource(pdu, sdu, reporter) if pdu.addr.is_some_and(|a| a.ssi == lazy.ssi) => {
+                DlSchedElem::Resource(pdu, sdu, reporter, _) if pdu.addr.is_some_and(|a| a.ssi == lazy.ssi) => {
                     let empty = sdu.get_len() == 0 && reporter.is_none() && !pdu.random_access_flag;
                     (pdu, empty)
                 }
@@ -1654,6 +1654,84 @@ mod tests {
             .map(|r| (r.chan_alloc_element.is_some(), r.slot_granting_element.is_some()))
             .collect();
         assert_eq!(mine, vec![(true, true)]);
+    }
+
+    /// A packet-data channel assignment that is no longer its radio's channel when it goes out (a
+    /// call took a slot, the channel went or is now another radio's, while it waited in the queue)
+    /// goes without its channel allocation, on the main carrier and to the packet-data carrier.
+    /// One that still is goes with it, and so do a quit and an allocation not marked (a call's).
+    #[test]
+    fn test_a_stale_pdch_assignment_goes_without_its_allocation() {
+        use tetra_pdus::umac::fields::channel_allocation::ChanAllocElement;
+        use tetra_saps::lcmc::enums::{alloc_type::ChanAllocType, ul_dl_assignment::UlDlAssignment};
+        let main = get_testing_slotter().carrier_num;
+        let alloc_to = |carrier_num: u16, alloc_type: ChanAllocType, ts_assigned: [bool; 4]| {
+            let mut pdu = BsChannelScheduler::dl_make_minimal_resource(&radio(), None, false);
+            pdu.chan_alloc_element = Some(ChanAllocElement {
+                alloc_type,
+                ts_assigned,
+                ul_dl_assigned: UlDlAssignment::Both,
+                clch_permission: true,
+                cell_change_flag: false,
+                carrier_num,
+                ext: None,
+                mon_pattern: 1,
+                frame18_mon_pattern: None,
+            });
+            pdu
+        };
+        // Whether the PDU went out with its channel allocation.
+        let sent_with_it = |mut sched: BsChannelScheduler, pdu: MacResource, marked: bool| {
+            sched.set_dl_time(at(3, 3));
+            let sdu = BitBuffer::from_bitstr("1011001110001111");
+            if marked {
+                sched.dl_enqueue_pdch_assignment_for_link(0, pdu, sdu, None);
+            } else {
+                sched.dl_enqueue_tma_for_link(0, pdu, sdu, None);
+            }
+            let slot = finalize_slots(&mut sched, 1).remove(0);
+            let sent = resources(&slot)
+                .into_iter()
+                .find(|r| r.addr.is_some_and(|a| a.ssi == RADIO))
+                .expect("it went out");
+            sent.chan_alloc_element.is_some()
+        };
+        let own = [false, true, true, true];
+        let replace = ChanAllocType::Replace;
+        assert!(sent_with_it(
+            multislot_slotter(RADIO, &[2, 3, 4]),
+            alloc_to(main, replace, own),
+            true
+        ));
+        assert!(
+            !sent_with_it(multislot_slotter(RADIO, &[2, 3]), alloc_to(main, replace, own), true),
+            "a call took ts4"
+        );
+        assert!(
+            !sent_with_it(multislot_slotter(RADIO + 1, &[2, 3, 4]), alloc_to(main, replace, own), true),
+            "another radio's channel now"
+        );
+        assert!(
+            sent_with_it(multislot_slotter(RADIO, &[2, 3]), alloc_to(main, replace, own), false),
+            "not marked: as always"
+        );
+        // The packet-data carrier (1002), its channels as the UMAC last set them.
+        let handoff = |owners: [Option<u32>; 4]| {
+            let mut sched = get_testing_slotter();
+            sched.set_pdch_handoff_carrier(Some(1002));
+            sched.set_pdch_handoff_owners(owners);
+            sched
+        };
+        assert!(sent_with_it(handoff([Some(RADIO); 4]), alloc_to(1002, replace, ALL), true));
+        assert!(
+            !sent_with_it(handoff([None; 4]), alloc_to(1002, replace, ALL), true),
+            "the channel went"
+        );
+        assert!(sent_with_it(
+            handoff([None; 4]),
+            alloc_to(main, ChanAllocType::QuitAndGo, [false; 4]),
+            true
+        ));
     }
 
     /// Only the main carrier's scheduler with a packet-data carrier lists assignments to it:

@@ -231,7 +231,8 @@ pub enum DlSchedElem {
     Grant(TetraAddress, BasicSlotgrant, Option<u8>),
 
     /// A MAC-RESOURCE PDU. May be split into fragments upon processing, in which case a FragBuf will be inserted after processing the resource.
-    Resource(MacResource, BitBuffer, Option<TxReporter>),
+    /// The flag marks a packet-data channel assignment (see `dl_enqueue_pdch_assignment_for_link`).
+    Resource(MacResource, BitBuffer, Option<TxReporter>, bool),
 
     /// A FragBuf containing remaining non-transmitted information after a MAC-RESOURCE start has been transmitted
     FragBuf(BsFragger),
@@ -496,6 +497,25 @@ impl BsChannelScheduler {
             && c.ts_assigned == owners.map(|o| o == Some(addr.ssi))
     }
 
+    /// Whether a packet-data channel assignment of `ssi` to `ts_assigned` of `carrier` still gives
+    /// it its channel: that of this carrier, or of the packet-data carrier (`pdch_handoff_owners`),
+    /// as the UMAC set them before this slot. A call may have taken a slot (`allocate_any_slot`),
+    /// or the channel may have gone or changed, while the assignment waited in its queue. A quit
+    /// (no timeslot) and an allocation to a carrier whose channels this scheduler does not know
+    /// are left as they are.
+    fn pdch_assignment_still_valid(&self, ssi: u32, carrier: u16, ts_assigned: &[bool; 4]) -> bool {
+        if !ts_assigned.iter().any(|set| *set) {
+            return true;
+        }
+        if carrier == self.carrier_num {
+            *ts_assigned == self.pdch_timeslots_of(ssi)
+        } else if Some(carrier) == self.pdch_handoff_carrier {
+            *ts_assigned == self.pdch_handoff_owners.map(|o| o == Some(ssi))
+        } else {
+            true
+        }
+    }
+
     /// The packet-data channel assignments to `pdch_handoff_carrier` that went out since the
     /// last call: (ISSI, timeslots, downlink slot that carried it).
     pub fn take_assignments_elsewhere(&mut self) -> Vec<(u32, [bool; 4], TdmaTime)> {
@@ -519,7 +539,7 @@ impl BsChannelScheduler {
     pub fn take_individual_items(&mut self, ssi: u32) -> (Vec<DlSchedElem>, usize) {
         let (handoff, owners) = (self.pdch_handoff_carrier, self.pdch_handoff_owners);
         let mine = |e: &DlSchedElem| match e {
-            DlSchedElem::Resource(pdu, _, _) => {
+            DlSchedElem::Resource(pdu, ..) => {
                 !Self::is_handoff_assignment(pdu, handoff, owners) && pdu.addr.is_some_and(|a| a.ssi == ssi && a.ssi_type != SsiType::Gssi)
             }
             DlSchedElem::FragBuf(f) => f.ssi() == Some(ssi) && !f.is_for_group(),
@@ -624,13 +644,13 @@ impl BsChannelScheduler {
         let before = queue.len();
         queue.retain(|elem| {
             let for_ssi = match elem {
-                DlSchedElem::Resource(pdu, _, _) => pdu.addr.is_some_and(|a| a.ssi == ssi || a.ssi_type == SsiType::Gssi),
+                DlSchedElem::Resource(pdu, ..) => pdu.addr.is_some_and(|a| a.ssi == ssi || a.ssi_type == SsiType::Gssi),
                 DlSchedElem::FragBuf(fragger) => fragger.ssi() == Some(ssi) || fragger.is_for_group(),
                 DlSchedElem::Grant(addr, _, _) | DlSchedElem::RandomAccessAck(addr) => addr.ssi == ssi,
                 DlSchedElem::Broadcast(_) | DlSchedElem::Stealing(..) => false,
             };
             if for_ssi
-                && let DlSchedElem::Resource(_, _, Some(reporter)) = elem
+                && let DlSchedElem::Resource(_, _, Some(reporter), _) = elem
                 && reporter.get_state() == tetra_core::TxState::Pending
             {
                 reporter.mark_discarded();
@@ -1185,6 +1205,7 @@ impl BsChannelScheduler {
         pdu: MacResource,
         sdu: BitBuffer,
         tx_reporter: Option<TxReporter>,
+        pdch_assignment: bool,
     ) {
         // Queue the message for all timeslots on which we should transmit this message.
         // The loop basically prevents cloning the last element.
@@ -1228,18 +1249,18 @@ impl BsChannelScheduler {
 
             if deferred {
                 tracing::debug!("dl_enqueue_tma: ts {} deferring chan_alloc PDU to next frame (slot capacity)", ts);
-                let elem = DlSchedElem::Resource(pdu, sdu, tx_reporter);
+                let elem = DlSchedElem::Resource(pdu, sdu, tx_reporter, pdch_assignment);
                 self.dltx_next_slot_queue.push(elem);
                 break;
             } else if next_ts > 0 {
                 // There is another ts for which we need to transmit this message.
                 // Clone the message now and push it to the current ts.
-                let elem = DlSchedElem::Resource(pdu.clone(), sdu.clone(), tx_reporter.clone());
+                let elem = DlSchedElem::Resource(pdu.clone(), sdu.clone(), tx_reporter.clone(), pdch_assignment);
                 let q = self.queue_index(ts);
                 self.dltx_queues[q].push(elem);
             } else {
                 // This is the last ts on which we need to transmit this message
-                let elem = DlSchedElem::Resource(pdu, sdu, tx_reporter);
+                let elem = DlSchedElem::Resource(pdu, sdu, tx_reporter, pdch_assignment);
                 let q = self.queue_index(ts);
                 self.dltx_queues[q].push(elem);
                 break;
@@ -1249,12 +1270,26 @@ impl BsChannelScheduler {
 
     pub fn dl_enqueue_tma(&mut self, pdu: MacResource, sdu: BitBuffer, tx_reporter: Option<TxReporter>) {
         let timeslots = self.identify_timeslots_for_ssi(pdu.addr, 0);
-        self.dl_enqueue_tma_on_timeslots(timeslots, pdu, sdu, tx_reporter);
+        self.dl_enqueue_tma_on_timeslots(timeslots, pdu, sdu, tx_reporter, false);
     }
 
     pub fn dl_enqueue_tma_for_link(&mut self, link_id: LinkId, pdu: MacResource, sdu: BitBuffer, tx_reporter: Option<TxReporter>) {
         let timeslots = self.identify_timeslots_for_ssi(pdu.addr, link_id);
-        self.dl_enqueue_tma_on_timeslots(timeslots, pdu, sdu, tx_reporter);
+        self.dl_enqueue_tma_on_timeslots(timeslots, pdu, sdu, tx_reporter, false);
+    }
+
+    /// A packet-data channel assignment from SNDCP (`[packet_data] bearer = "pdch"`): queued like
+    /// any resource, but marked so that it is not sent with its channel allocation once that
+    /// channel is no longer its radio's (see `pdch_assignment_still_valid`).
+    pub fn dl_enqueue_pdch_assignment_for_link(
+        &mut self,
+        link_id: LinkId,
+        pdu: MacResource,
+        sdu: BitBuffer,
+        tx_reporter: Option<TxReporter>,
+    ) {
+        let timeslots = self.identify_timeslots_for_ssi(pdu.addr, link_id);
+        self.dl_enqueue_tma_on_timeslots(timeslots, pdu, sdu, tx_reporter, true);
     }
 
     /// A packet-data TM-SDU (`[packet_data]`): it waits in line like any resource, and once its
@@ -1323,7 +1358,7 @@ impl BsChannelScheduler {
             pdu,
             sdu.dump_bin()
         );
-        let elem = DlSchedElem::Resource(pdu, sdu, tx_reporter);
+        let elem = DlSchedElem::Resource(pdu, sdu, tx_reporter, false);
         self.dltx_next_slot_queue.push(elem);
     }
 
@@ -1429,7 +1464,7 @@ impl BsChannelScheduler {
 
         for index in 0..queue.len() {
             let elem = &mut queue[index];
-            if let DlSchedElem::Resource(pdu, _sdu, _repeat) = elem {
+            if let DlSchedElem::Resource(pdu, _sdu, _repeat, _) = elem {
                 if let Some(pdu_ssi) = pdu.addr {
                     if pdu_ssi.ssi == addr.ssi {
                         // Found a resource for this address
@@ -1501,7 +1536,7 @@ impl BsChannelScheduler {
                 tracing::debug!("dl_drop_all_except_stolen: discarding scheduled {:?} on ts {}", elem, timeslot);
 
                 match elem {
-                    DlSchedElem::Resource(_, _, tx_reporter) => {
+                    DlSchedElem::Resource(_, _, tx_reporter, _) => {
                         // Report as discarded manually
                         if let Some(tx_reporter) = tx_reporter {
                             tx_reporter.mark_discarded();
@@ -1550,7 +1585,7 @@ impl BsChannelScheduler {
                 .dl_get_scheduled_resource_for_ssi(ts, addr)
                 .filter(|e| !matches!(e, DlSchedElem::Resource(pdu, ..) if Self::is_handoff_assignment(pdu, handoff, owners)));
             match mac_resource {
-                Some(DlSchedElem::Resource(pdu, _sdu, _repeat)) => {
+                Some(DlSchedElem::Resource(pdu, _sdu, _repeat, _)) => {
                     // Integrate grant into the resource
                     match &elem {
                         DlSchedElem::Grant(_, grant, usage_marker) => {
@@ -1606,7 +1641,7 @@ impl BsChannelScheduler {
                     };
 
                     // Push new resource into the queue. These do not need a tx_reporter
-                    let dlsched_res = DlSchedElem::Resource(pdu, BitBuffer::new(0), None);
+                    let dlsched_res = DlSchedElem::Resource(pdu, BitBuffer::new(0), None, false);
                     let q = self.queue_index(ts.t);
                     self.dltx_queues[q].push(dlsched_res);
                 }
@@ -1633,7 +1668,24 @@ impl BsChannelScheduler {
                             unimplemented_log!("finalize_ts_for_tick: Broadcast scheduling not implemented");
                         }
 
-                        DlSchedElem::Resource(pdu, sdu, tx_reporter) => {
+                        DlSchedElem::Resource(mut pdu, sdu, tx_reporter, pdch_assignment) => {
+                            // A packet-data channel assignment whose channel a call took, or that
+                            // went, meanwhile must not send its radio there: it goes without the
+                            // allocation, so the radio's data stays on the MCCH (the SNDCP learns
+                            // of the lost slot from the allocator and drops the channel).
+                            if pdch_assignment
+                                && let (Some(c), Some(addr)) = (pdu.chan_alloc_element.as_ref(), pdu.addr)
+                                && !self.pdch_assignment_still_valid(addr.ssi, c.carrier_num, &c.ts_assigned)
+                            {
+                                tracing::info!(
+                                    "dl_build_block_from_signalling_schedule: PDCH assignment for {} to carrier={} {:?} is no longer its channel, sent without it",
+                                    addr,
+                                    c.carrier_num,
+                                    c.ts_assigned
+                                );
+                                pdu.chan_alloc_element = None;
+                                pdu.update_len_and_fill_ind(sdu.get_len());
+                            }
                             // Allocate bitbuf if not already done
                             let mut buf = buf_opt.unwrap_or_else(|| BitBuffer::new(SCH_F_CAP));
                             // Create fragger, either to send the whole PDU or to start fragmentation
@@ -1777,7 +1829,7 @@ impl BsChannelScheduler {
     /// Whether `elem` goes whole in `room` bits and leaves room for a fragment after it.
     fn fits_before_a_fragment(elem: &DlSchedElem, room: usize) -> bool {
         let len = match elem {
-            DlSchedElem::Resource(pdu, sdu, _) => pdu.compute_header_len() + sdu.get_len(),
+            DlSchedElem::Resource(pdu, sdu, ..) => pdu.compute_header_len() + sdu.get_len(),
             DlSchedElem::FragBuf(f) if !f.is_started() && !f.is_packet_data() => f.whole_len_bits(),
             _ => return false,
         };
@@ -1790,7 +1842,7 @@ impl BsChannelScheduler {
     /// 23.4.3.2), a full advanced link segment with a grant of several slots say.
     fn goes_whole(elem: &DlSchedElem, room: usize) -> bool {
         let len = match elem {
-            DlSchedElem::Resource(pdu, sdu, _) => Some(pdu.compute_header_len() + sdu.get_len()),
+            DlSchedElem::Resource(pdu, sdu, ..) => Some(pdu.compute_header_len() + sdu.get_len()),
             DlSchedElem::FragBuf(f) if !f.is_started() => Some(f.whole_len_bits()),
             _ => None,
         };
@@ -3170,7 +3222,7 @@ mod tests {
         sched.set_pdch(4, None);
         assert_eq!(reporter.get_state(), tetra_core::TxState::Discarded);
         assert_eq!(sched.dltx_queues[3].len(), 1);
-        assert!(matches!(&sched.dltx_queues[3][0], DlSchedElem::Resource(pdu, _, _) if pdu.addr == Some(other)));
+        assert!(matches!(&sched.dltx_queues[3][0], DlSchedElem::Resource(pdu, ..) if pdu.addr == Some(other)));
     }
 
     #[test]

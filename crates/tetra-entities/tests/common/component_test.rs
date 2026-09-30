@@ -54,7 +54,9 @@ pub fn trace_hash() -> u64 {
 }
 
 /// Feed the fingerprint, when armed, with the Debug form of `msgs` (sorted: entities keep some
-/// state in hash maps, so the order within one tick changes from run to run).
+/// state in hash maps, so the order within one tick changes from run to run). The TMA data
+/// category of a packet-data channel assignment (`DATA_CATEGORY_PDCH_ASSIGNMENT`), which came
+/// after the fingerprints were recorded and never goes on the air, is left out.
 fn trace(msgs: &[SapMsg]) {
     TRACE.with(|t| {
         if let Some(h) = t.borrow_mut().as_mut() {
@@ -66,7 +68,7 @@ fn trace(msgs: &[SapMsg]) {
                         SapMsgInner::TmvUnitdataReqSlots(_) | SapMsgInner::TmaUnitdataInd(_) | SapMsgInner::TmaUnitdataReq(_)
                     )
                 })
-                .map(|m| format!("{:?}", m.msg))
+                .map(|m| format!("{:?}", m.msg).replace("data_category: Some(2)", "data_category: None"))
                 .collect();
             lines.sort();
             lines.hash(h);

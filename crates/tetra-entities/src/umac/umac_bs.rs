@@ -27,7 +27,9 @@ use tetra_saps::control::call_control::{CallControl, Circuit, CircuitDlMediaSour
 use tetra_saps::lcmc::enums::alloc_type::ChanAllocType;
 use tetra_saps::lcmc::enums::ul_dl_assignment::UlDlAssignment;
 use tetra_saps::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
-use tetra_saps::tma::{DATA_CATEGORY_AL_REPLY, DATA_CATEGORY_PACKET_DATA, TmaReport, TmaReportInd, TmaUnitdataInd};
+use tetra_saps::tma::{
+    DATA_CATEGORY_AL_REPLY, DATA_CATEGORY_PACKET_DATA, DATA_CATEGORY_PDCH_ASSIGNMENT, TmaReport, TmaReportInd, TmaUnitdataInd,
+};
 use tetra_saps::tmv::enums::logical_chans::LogicalChannel;
 use tetra_saps::tmv::{TmvConfigureReq, TmvUnitdataReqSlots};
 use tetra_saps::{SapMsg, SapMsgInner};
@@ -2260,6 +2262,8 @@ impl UmacBs {
         let sched = self.scheduler_for_mut(target);
         if prim.data_category == Some(DATA_CATEGORY_PACKET_DATA) {
             sched.dl_enqueue_packet_data_for_link(link_id, pdu, sdu, prim.tx_reporter);
+        } else if prim.data_category == Some(DATA_CATEGORY_PDCH_ASSIGNMENT) {
+            sched.dl_enqueue_pdch_assignment_for_link(link_id, pdu, sdu, prim.tx_reporter);
         } else {
             // An advanced link segment asking for an acknowledgement, to the radio of a
             // packet-data channel of several slots: it gets a slot for the answer with it.

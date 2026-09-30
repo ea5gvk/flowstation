@@ -30,7 +30,7 @@ use tetra_saps::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
 use tetra_saps::ltpd::LtpdBearer;
 use tetra_saps::sapmsg::{SapMsg, SapMsgInner};
 use tetra_saps::tla::{TlDataIndAl, TlaTlDataIndBl, TlaTlUnitdataIndBl};
-use tetra_saps::tma::{TmaUnitdataInd, TmaUnitdataReq};
+use tetra_saps::tma::{DATA_CATEGORY_PDCH_ASSIGNMENT, TmaUnitdataInd, TmaUnitdataReq};
 
 const MAIN_CARRIER: u16 = 1521;
 const ISSI: u32 = 2_260_618;
@@ -174,6 +174,8 @@ struct Down {
     stealing: bool,
     chan_alloc: bool,
     alloc: Option<CmceChanAllocReq>,
+    /// `TmaUnitdataReq::data_category`.
+    category: Option<i32>,
     /// The SN-PDU (bits after the MLE discriminator) when the TL-SDU is for SNDCP. On the advanced
     /// link, the TL-SDU the radio reassembled (a Down of its own after the segments).
     sn: Option<String>,
@@ -324,6 +326,7 @@ impl Air {
                 stealing: false,
                 chan_alloc: false,
                 alloc: None,
+                category: None,
                 sn,
                 pdu: sdu,
             });
@@ -545,6 +548,7 @@ fn parse_down(req: &TmaUnitdataReq) -> Down {
             stealing: req.stealing_permission,
             chan_alloc: req.chan_alloc.is_some(),
             alloc: req.chan_alloc.clone(),
+            category: req.data_category,
             sn: None,
             pdu,
         };
@@ -574,6 +578,7 @@ fn parse_down(req: &TmaUnitdataReq) -> Down {
         stealing: req.stealing_permission,
         chan_alloc: req.chan_alloc.is_some(),
         alloc: req.chan_alloc.clone(),
+        category: req.data_category,
         sn,
         pdu: req.pdu.clone(),
     }
@@ -2739,6 +2744,7 @@ fn onto_pdch(air: &mut Air, issi: u32) -> Ipv4Addr {
         SndcpDataTransmitResponseResult::Accepted
     );
     assert!(response.alloc.is_some(), "PDCH assigned");
+    assert_eq!(response.category, Some(DATA_CATEGORY_PDCH_ASSIGNMENT), "marked as such for the MAC");
     air.run(2);
     assert!(air.test.config.state_read().pdch_by_issi.get(&issi).is_some_and(|g| g.on_air));
     air.take_sn();
@@ -4439,6 +4445,7 @@ fn a_request_is_assigned_the_packet_data_carrier() {
     air.send(ISSI, &transmit_request_full(1, 4, 4));
     let response = air.next_sn(8).expect("RESPONSE");
     assert_eq!(response.link_id, 0, "sent on the MCCH, where the radio still is");
+    assert_eq!(response.category, Some(DATA_CATEGORY_PDCH_ASSIGNMENT));
     let alloc = response.alloc.clone().expect("an assignment");
     assert_eq!(
         (alloc.alloc_type, alloc.ul_dl_assigned, alloc.carrier, alloc.timeslots),
@@ -5260,6 +5267,73 @@ fn an_allocation_for_a_carrier_channel_long_gone_goes_on_the_mcch() {
     assert_eq!(sent, vec![(MAIN_CARRIER, 1)], "on the MCCH");
 }
 
+/// A carrier assignment waiting on the MCCH (behind another radio's PDU that fills a block) when
+/// its channel goes (a call took a slot, or it was given back) goes out without its channel
+/// allocation: the SN-DATA TRANSMIT RESPONSE still reaches the radio, which is not sent to a
+/// carrier where it has no channel. With the channel still there it goes with it.
+#[test]
+fn a_queued_carrier_assignment_whose_channel_went_goes_without_it() {
+    debug::setup_logging_verbose();
+    let tma = |issi: u32, category: Option<i32>, chan_alloc: Option<CmceChanAllocReq>, bits: &str| SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+            req_handle: 0,
+            pdu: BitBuffer::from_bitstr(bits),
+            main_address: TetraAddress::issi(issi),
+            link_id: 0,
+            endpoint_id: 0,
+            stealing_permission: false,
+            subscriber_class: 0,
+            air_interface_encryption: None,
+            stealing_repeats_flag: None,
+            data_category: category,
+            carrier_num: chan_alloc.as_ref().and_then(|c| c.carrier),
+            chan_alloc,
+            tx_reporter: None,
+        }),
+    };
+    for goes in [false, true] {
+        let mut air = UmacAir::new(carrier_config(false, 4, false));
+        let slots = grant_carrier_slots(&air.test.config, ISSI, &[4, 3, 2, 1], false);
+        air.tick();
+        air.test.submit_message(tma(ISSI2, None, None, &"0010".repeat(52)));
+        air.test.submit_message(tma(
+            ISSI,
+            Some(DATA_CATEGORY_PDCH_ASSIGNMENT),
+            Some(CmceChanAllocReq {
+                usage: None,
+                carrier: Some(SECONDARY_CARRIER),
+                timeslots: [true; 4],
+                alloc_type: ChanAllocType::Replace,
+                ul_dl_assigned: UlDlAssignment::Both,
+            }),
+            "0000100110011000",
+        ));
+        air.tick();
+        if goes {
+            let mut state = air.test.config.state_write();
+            state.pdch_by_issi.remove(&ISSI);
+            state.pdch_timeslots_by_issi.remove(&ISSI);
+            for s in &slots {
+                state.timeslot_alloc.release_slot(TimeslotOwner::PacketData, *s).unwrap();
+            }
+        }
+        for _ in 0..40 {
+            air.tick();
+        }
+        let mine: Vec<(u16, u8, bool)> = air
+            .slots
+            .iter()
+            .flat_map(|s| mac_resources(s).into_iter().map(move |r| (s.carrier_num, s.ts.t, r)))
+            .filter(|(_, _, r)| r.addr.is_some_and(|a| a.ssi == ISSI))
+            .map(|(c, t, r)| (c, t, r.chan_alloc_element.is_some()))
+            .collect();
+        assert_eq!(mine.first(), Some(&(MAIN_CARRIER, 1, !goes)), "channel gone: {goes}, {mine:?}");
+    }
+}
+
 /// A PDU queued for the radio on the MCCH when its carrier assignment goes out follows it to its
 /// channel. (miura: here the assignment fills its block, so the PDU behind it cannot share it;
 /// tea2 used an encrypted PDU, which must open its block.)
@@ -5269,7 +5343,7 @@ fn the_mcch_items_follow_the_radio_to_the_carrier() {
     let mut air = UmacAir::new(carrier_config(false, 4, false));
     grant_carrier_slots(&air.test.config, ISSI, &[4, 3, 2, 1], false);
     air.tick();
-    let req = |chan_alloc: Option<CmceChanAllocReq>, bits: &str| SapMsg {
+    let req = |category: Option<i32>, chan_alloc: Option<CmceChanAllocReq>, bits: &str| SapMsg {
         sap: Sap::TmaSap,
         src: TetraEntity::Llc,
         dest: TetraEntity::Umac,
@@ -5283,13 +5357,14 @@ fn the_mcch_items_follow_the_radio_to_the_carrier() {
             subscriber_class: 0,
             air_interface_encryption: None,
             stealing_repeats_flag: None,
-            data_category: None,
+            data_category: category,
             carrier_num: Some(SECONDARY_CARRIER),
             chan_alloc,
             tx_reporter: None,
         }),
     };
     air.test.submit_message(req(
+        Some(DATA_CATEGORY_PDCH_ASSIGNMENT),
         Some(CmceChanAllocReq {
             usage: None,
             carrier: Some(SECONDARY_CARRIER),
@@ -5299,7 +5374,7 @@ fn the_mcch_items_follow_the_radio_to_the_carrier() {
         }),
         &"0000100110011000".repeat(12),
     ));
-    air.test.submit_message(req(None, &"0010".repeat(12)));
+    air.test.submit_message(req(None, None, &"0010".repeat(12)));
     for _ in 0..24 {
         air.tick();
     }
