@@ -951,8 +951,14 @@ ready_timer_code = 9
         let pd = "enabled = true\nbearer = \"pdch\"\npdch_timeslots = [3]\npdch_carrier = 1585\npdch_max_slots = 4";
         assert_eq!(slots("secondary_carrier = 1585", pd), 4);
         assert_eq!(slots("", pd), 1, "carrier not in use: main [3] only");
-        assert_eq!(slots("secondary_carrier = 1585", &pd.replace("bearer = \"pdch\"", "bearer = \"mcch\"")), 1);
-        assert_eq!(slots("secondary_carrier = 1585", &pd.replace("pdch_max_slots = 4", "pdch_max_slots = 2")), 2);
+        assert_eq!(
+            slots("secondary_carrier = 1585", &pd.replace("bearer = \"pdch\"", "bearer = \"mcch\"")),
+            1
+        );
+        assert_eq!(
+            slots("secondary_carrier = 1585", &pd.replace("pdch_max_slots = 4", "pdch_max_slots = 2")),
+            2
+        );
         assert_eq!(
             slots("secondary_carrier = 1585", "enabled = true\nbearer = \"pdch\"\npdch_max_slots = 3"),
             3,

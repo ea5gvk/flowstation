@@ -206,7 +206,9 @@ pub fn apply_packet_data_patch(dto: CfgPacketDataDto) -> Result<CfgPacketData, S
     }
     let cts = &dto.pdch_carrier_timeslots;
     if cts.is_empty() || cts.iter().any(|t| !(1..=4).contains(t)) || (1..cts.len()).any(|i| cts[..i].contains(&cts[i])) {
-        return Err("packet_data: pdch_carrier_timeslots must list timeslots 1, 2, 3 or 4 of the packet-data carrier, each once".to_string());
+        return Err(
+            "packet_data: pdch_carrier_timeslots must list timeslots 1, 2, 3 or 4 of the packet-data carrier, each once".to_string(),
+        );
     }
     if !cts.iter().any(|t| (2..=4).contains(t)) {
         return Err(
@@ -330,7 +332,10 @@ pdch_carrier_exclusive = true"))
         for bad in ["[]", "[0]", "[5]", "[1, 1]"] {
             assert_eq!(
                 apply_packet_data_patch(dto(&format!("pdch_carrier_timeslots = {bad}"))),
-                Err("packet_data: pdch_carrier_timeslots must list timeslots 1, 2, 3 or 4 of the packet-data carrier, each once".to_string()),
+                Err(
+                    "packet_data: pdch_carrier_timeslots must list timeslots 1, 2, 3 or 4 of the packet-data carrier, each once"
+                        .to_string()
+                ),
                 "{bad}"
             );
         }
@@ -341,7 +346,10 @@ pdch_carrier_exclusive = true"))
             "never ts1 alone"
         );
         for good in ["[2]", "[1, 4]", "[4, 3, 2, 1]"] {
-            assert!(apply_packet_data_patch(dto(&format!("pdch_carrier_timeslots = {good}"))).is_ok(), "{good}");
+            assert!(
+                apply_packet_data_patch(dto(&format!("pdch_carrier_timeslots = {good}"))).is_ok(),
+                "{good}"
+            );
         }
     }
 

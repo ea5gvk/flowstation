@@ -538,7 +538,11 @@ mod tests {
         assert!(voice.iter().all(|s| s.carrier_num == 1584), "{voice:?}");
         assert_eq!(alloc.allocate_any_slot(TimeslotOwner::Cmce), None);
         assert_eq!(alloc.free_slot_count(), 0);
-        assert_eq!(alloc.reserve_packet_data_slots_on(1585, &[4, 3, 2, 1], 4).len(), 4, "data still goes there");
+        assert_eq!(
+            alloc.reserve_packet_data_slots_on(1585, &[4, 3, 2, 1], 4).len(),
+            4,
+            "data still goes there"
+        );
         assert_eq!(alloc.allocate_any_slot(TimeslotOwner::Brew), None, "and is never preempted");
         alloc.configure_carriers(&[1584, 1585]);
         assert_eq!(alloc.free_slot_count(), 0, "kept across a carrier reconfiguration");
