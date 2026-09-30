@@ -4827,6 +4827,46 @@ fn a_radio_that_does_not_move_gets_the_main_carrier_from_then_on() {
     );
 }
 
+/// The block with the radio's carrier assignment is lost on the air: the radio, still waiting for
+/// its acknowledgement, sends its TRANSMIT REQUEST again on the MCCH. It never refused the
+/// carrier: the channel is kept, the assignment reaches it on the MCCH, and once the radio is on
+/// its channel its PDUs go there.
+#[test]
+fn a_lost_assignment_does_not_bar_the_radio_from_the_carrier() {
+    debug::setup_logging_verbose();
+    let mut air = Air::new(carrier_config(false, 4, false));
+    air.send(ISSI, &demand(1, None, false));
+    air.next_sn(8).expect("ACCEPT");
+    air.run(4);
+    air.send(ISSI, &transmit_request_full(1, 4, 4));
+    let mut responses = 0;
+    for _ in 0..3 {
+        air.acks.retain(|a| a.0 != ISSI);
+        responses += air.take_sn().iter().filter(|d| d.sn_type() == Some(7)).count();
+        air.step();
+    }
+    air.acks.retain(|a| a.0 != ISSI);
+    responses += air.take_sn().iter().filter(|d| d.sn_type() == Some(7)).count();
+    assert_eq!(responses, 1, "the RESPONSE went");
+    // The same BL-DATA again (same N(S)): the radio never got the answer.
+    *air.ns.get_mut(&ISSI).unwrap() ^= 1;
+    air.send(ISSI, &transmit_request_full(1, 4, 4));
+    air.run(40);
+    assert_eq!(
+        air.test.config.state_read().pdch_by_issi.get(&ISSI).map(|g| g.slot.carrier_num),
+        Some(SECONDARY_CARRIER),
+        "the carrier channel is kept"
+    );
+    al_setup_on_carrier(&mut air, ISSI, 4);
+    air.run(8);
+    assert!(air.test.config.state_read().pdch_by_issi[&ISSI].on_air, "on its channel");
+    air.down.clear();
+    air.test.submit_message(tl_data_to(TetraAddress::issi(ISSI), false));
+    air.run(2);
+    let d = air.down.iter().find(|d| d.issi == ISSI).expect("a PDU went down");
+    assert_eq!((d.carrier, d.link_id), (Some(SECONDARY_CARRIER), 4));
+}
+
 /// The radio back on the MCCH (a TRANSMIT REQUEST there, after it was heard on its channel) is
 /// off its channel, which it is assigned again; a request on a slot of its channel is answered
 /// there.

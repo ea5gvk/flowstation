@@ -540,7 +540,7 @@ impl PacketDataRuntime {
         // Anything from the radio on the MCCH: it left its packet-data channel. (A channel of the
         // packet-data carrier never transmits on its ts1: link 1 is always the MCCH.)
         if ind.link_id == 1 && self.pdch.get(&issi).is_some_and(|p| p.on_air) {
-            if let Some(carrier) = self.not_heard_on_its_carrier(config, issi) {
+            if let Some(carrier) = self.refused_its_carrier(config, issi) {
                 self.stayed_on_the_mcch(config, issi, carrier);
             } else if let Some(p) = self.pdch.get_mut(&issi) {
                 p.on_air = false;
@@ -1036,17 +1036,21 @@ impl PacketDataRuntime {
         (Some((assignment, reporter)), channel)
     }
 
-    /// The packet-data carrier when `issi` has a channel there and was not heard on it since it
-    /// was assigned (see `stayed_on_the_mcch`).
-    fn not_heard_on_its_carrier(&self, config: &SharedConfig, issi: u32) -> Option<u16> {
-        let carrier = self.pdch.get(&issi)?.slots.first()?.carrier_num;
-        (carrier != self.main_carrier && !config.state_read().pdch_heard_on_channel.contains(&issi)).then_some(carrier)
+    /// The packet-data carrier when `issi` has a channel there, acknowledged its assignment and
+    /// was not heard on the channel since (see `stayed_on_the_mcch`). An assignment only sent
+    /// proves nothing: the radio that missed it sends its request again on the MCCH, and gets the
+    /// assignment again there (the LLC repeats it).
+    fn refused_its_carrier(&self, config: &SharedConfig, issi: u32) -> Option<u16> {
+        let p = self.pdch.get(&issi)?;
+        let carrier = p.slots.first()?.carrier_num;
+        let acknowledged = p.assignment.is_none() && p.assignment_ack.as_ref().is_none_or(|r| r.get_state() == TxState::Acknowledged);
+        (carrier != self.main_carrier && acknowledged && !config.state_read().pdch_heard_on_channel.contains(&issi)).then_some(carrier)
     }
 
-    /// A radio assigned a channel of the packet-data carrier is heard on the MCCH before anything
-    /// of it was heard on the channel: it did not go there (its acknowledgement of the assignment
-    /// on the MCCH tells nothing). Its channel is released, and it gets channels of the main
-    /// carrier (or the MCCH) from then on.
+    /// A radio that acknowledged its assignment to a channel of the packet-data carrier is heard
+    /// on the MCCH before anything of it was heard on the channel: it did not go there (its
+    /// acknowledgement of the assignment on the MCCH tells nothing). Its channel is released, and
+    /// it gets channels of the main carrier (or the MCCH) from then on.
     fn stayed_on_the_mcch(&mut self, config: &SharedConfig, issi: u32, carrier: u16) {
         self.carrier_refused.insert(issi);
         tracing::info!(
@@ -1222,7 +1226,7 @@ impl PacketDataRuntime {
             (off, back)
         };
         for issi in off {
-            if let Some(carrier) = self.not_heard_on_its_carrier(config, issi) {
+            if let Some(carrier) = self.refused_its_carrier(config, issi) {
                 self.stayed_on_the_mcch(config, issi, carrier);
             } else if let Some(p) = self.pdch.get_mut(&issi) {
                 p.on_air = false;
