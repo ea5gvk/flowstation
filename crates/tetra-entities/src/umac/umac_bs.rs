@@ -79,11 +79,15 @@ pub struct UmacBs {
     /// Last slot two radios' packet-data channels both claimed (timeslot, ISSI kept, ISSI
     /// refused), warned once.
     pdch_conflict: Option<(u8, u32, u32)>,
+    /// `[packet_data] pdch_carrier` in use: packet-data channels on this carrier too (ts 1..=4).
+    pdch_carrier: Option<u16>,
+    /// The same as `pdch_conflict` on the packet-data carrier.
+    pdch_carrier_conflict: Option<(u8, u32, u32)>,
     /// The uplink MAC block being read: a PDU in it said its radio has nothing more to send (its
-    /// uplink slot and ISSI), and whether a PDU in it carried a reservation requirement. With
-    /// association the requirement is in the last PDU (23.5.2.1) and 23.5.2.3.1 judges the
+    /// carrier, uplink slot and ISSI), and whether a PDU in it carried a reservation requirement.
+    /// With association the requirement is in the last PDU (23.5.2.1) and 23.5.2.3.1 judges the
     /// block, so the radio's multislot reservations are freed once the whole block is read.
-    ul_block_release: Option<(TdmaTime, u32)>,
+    ul_block_release: Option<(u16, TdmaTime, u32)>,
     ul_block_requirement: bool,
 }
 
@@ -115,6 +119,26 @@ impl UmacBs {
             sched.set_downlink_mode(CarrierDownlinkMode::SecondaryBcchNoMcch);
             secondary_channel_schedulers.push(sched);
         }
+        let mut channel_scheduler = BsChannelScheduler::new(scrambling_code, precomps);
+        // A packet-data carrier: its channels are assigned on the MCCH and live in its scheduler.
+        let pdch_carrier = c.pdch_carrier();
+        if let Some(p) = &pdch_carrier {
+            channel_scheduler.set_pdch_handoff_carrier(Some(p.carrier));
+            if p.exclusive {
+                tracing::info!(
+                    "UmacBs: carrier {} carries packet-data channels (ts {:?}, data only: calls use carrier {} only, 3 traffic slots)",
+                    p.carrier,
+                    p.timeslots,
+                    c.cell.main_carrier
+                );
+            } else {
+                tracing::info!(
+                    "UmacBs: carrier {} carries packet-data channels (ts {:?}, shared with voice)",
+                    p.carrier,
+                    p.timeslots
+                );
+            }
+        }
         Self {
             self_component: TetraEntity::Umac,
             config,
@@ -124,7 +148,7 @@ impl UmacBs {
             defrag: BsDefrag::new(),
             pending_stch: None,
             // event_label_store: EventLabelStore::new(),
-            channel_scheduler: BsChannelScheduler::new(scrambling_code, precomps),
+            channel_scheduler,
             secondary_channel_schedulers,
             last_ul_voice: HashMap::new(),
             ul_signal_owner: HashMap::new(),
@@ -133,6 +157,8 @@ impl UmacBs {
             telemetry,
             pdch_mode,
             pdch_conflict: None,
+            pdch_carrier: pdch_carrier.map(|p| p.carrier),
+            pdch_carrier_conflict: None,
             ul_block_release: None,
             ul_block_requirement: false,
         }
@@ -143,6 +169,17 @@ impl UmacBs {
     /// took one slot of goes as a whole, see `StackState::pdch_channel`).
     fn sync_pdch(&mut self) {
         let main = self.main_carrier();
+        self.sync_pdch_on(main);
+        if let Some(carrier) = self.pdch_carrier {
+            self.sync_pdch_on(carrier);
+        }
+    }
+
+    /// `sync_pdch` for one carrier: ts 2..=4 of the main carrier, ts 1..=4 of the packet-data
+    /// carrier.
+    fn sync_pdch_on(&mut self, carrier: u16) {
+        let on_main = carrier == self.main_carrier();
+        let slots = if on_main { 2..=4u8 } else { 1..=4u8 };
         let mut owners: [Option<u32>; 4] = [None; 4];
         let mut conflict = None;
         {
@@ -153,10 +190,10 @@ impl UmacBs {
                 let Some((grant, timeslots)) = state.pdch_channel(issi) else {
                     continue;
                 };
-                if grant.slot.carrier_num != main {
+                if grant.slot.carrier_num != carrier {
                     continue;
                 }
-                for ts in 2..=4u8 {
+                for ts in slots.clone() {
                     if !timeslots[ts as usize - 1] {
                         continue;
                     }
@@ -167,27 +204,48 @@ impl UmacBs {
                 }
             }
         }
-        if conflict != self.pdch_conflict {
+        let known = if on_main { self.pdch_conflict } else { self.pdch_carrier_conflict };
+        if conflict != known {
             if let Some((ts, first, second)) = conflict {
-                tracing::warn!(
-                    "UMAC: PDCH ts {} claimed by ISSI {} and ISSI {}, kept for the first",
-                    ts,
-                    first,
-                    second
-                );
+                if on_main {
+                    tracing::warn!(
+                        "UMAC: PDCH ts {} claimed by ISSI {} and ISSI {}, kept for the first",
+                        ts,
+                        first,
+                        second
+                    );
+                } else {
+                    tracing::warn!(
+                        "UMAC: PDCH ts {} of carrier {} claimed by ISSI {} and ISSI {}, kept for the first",
+                        ts,
+                        carrier,
+                        first,
+                        second
+                    );
+                }
             }
-            self.pdch_conflict = conflict;
+            if on_main {
+                self.pdch_conflict = conflict;
+            } else {
+                self.pdch_carrier_conflict = conflict;
+            }
         }
-        for ts in 2..=4u8 {
-            let (old, new) = (self.channel_scheduler.pdch_owner(ts), owners[ts as usize - 1]);
-            self.channel_scheduler.set_pdch(ts, new);
+        // The main scheduler tells an assignment to this carrier by the channel it gives (miura
+        // marks no packet-data channel assignment in the queue).
+        if !on_main {
+            self.channel_scheduler.set_pdch_handoff_owners(owners);
+        }
+        for ts in slots {
+            let sched = self.scheduler_for_mut(carrier);
+            let (old, new) = (sched.pdch_owner(ts), owners[ts as usize - 1]);
+            sched.set_pdch(ts, new);
             if old != new
                 && let Some(sink) = &self.telemetry
             {
                 for (issi, active) in [(old, false), (new, true)] {
                     if let Some(issi) = issi {
                         sink.send(TelemetryEvent::PdchChanged {
-                            carrier_num: main,
+                            carrier_num: carrier,
                             ts,
                             issi,
                             active,
@@ -198,19 +256,53 @@ impl UmacBs {
         }
     }
 
+    /// The assignments to the packet-data carrier `carrier` that went out on the MCCH: each radio
+    /// is expected on its channel there per 23.5.4.3.1 rule 1 a (its scheduler sends it nothing
+    /// before), its MCCH reservations are freed (grants on the channel it left are void) and
+    /// what was queued for it alone on the MCCH follows it to its channel.
+    fn pdch_handoff(&mut self, carrier: u16) {
+        for (ssi, bits, a) in self.channel_scheduler.take_assignments_elsewhere() {
+            if self.scheduler_for(carrier).pdch_timeslots_of(ssi) != bits {
+                continue;
+            }
+            self.scheduler_for_mut(carrier).pdch_note_assignment_from_mcch(ssi, bits, a);
+            let freed = self.channel_scheduler.ul_release_for_handoff(a, ssi);
+            let (items, dropped) = self.channel_scheduler.take_individual_items(ssi);
+            let moved = items.len();
+            self.scheduler_for_mut(carrier).enqueue_on_pdch(ssi, items);
+            if moved + dropped + freed > 0 {
+                tracing::info!(
+                    "UMAC: ISSI {} moves to its PDCH of carrier {}: {} MCCH item(s) moved, {} dropped, {} uplink reservation(s) freed",
+                    ssi,
+                    carrier,
+                    moved,
+                    dropped,
+                    freed
+                );
+            }
+        }
+    }
+
+    /// Whether `carrier` may hold packet-data channels: the main carrier, or the packet-data
+    /// carrier in use.
+    fn carries_pdch(&self, carrier: u16) -> bool {
+        carrier == self.main_carrier() || Some(carrier) == self.pdch_carrier
+    }
+
     /// Packet-data activity of `ssi` on its PDCH (`ts` of `carrier_num`), for the dashboard: the
     /// uplink on the slot it came in, the downlink on every slot of the channel (they all carry
     /// it). Nothing for any other slot or radio, or with the bearer on the MCCH.
     fn note_pdch_traffic(&self, carrier_num: u16, ts: u8, ssi: u32, uplink: bool) {
         if self.pdch_mode
-            && carrier_num == self.main_carrier()
-            && self.channel_scheduler.is_pdch_of(ts, ssi)
+            && self.carries_pdch(carrier_num)
+            && self.scheduler_for(carrier_num).is_pdch_of(ts, ssi)
             && let Some(sink) = &self.telemetry
         {
+            let sched = self.scheduler_for(carrier_num);
             let slots = if uplink {
                 vec![ts]
             } else {
-                (2..=4u8).filter(|t| self.channel_scheduler.is_pdch_of(*t, ssi)).collect()
+                (1..=4u8).filter(|t| sched.is_pdch_of(*t, ssi)).collect()
             };
             for ts in slots {
                 sink.send(TelemetryEvent::TsDataActivity {
@@ -232,8 +324,9 @@ impl UmacBs {
     /// channel's lowest one, since a burst continues on any slot of the channel (EN 300 392-2
     /// 23.3.5).
     fn defrag_time(&self, carrier_num: u16, t: TdmaTime, ssi: u32) -> TdmaTime {
-        match (carrier_num == self.main_carrier())
-            .then(|| self.channel_scheduler.pdch_anchor(t.t, ssi))
+        match self
+            .carries_pdch(carrier_num)
+            .then(|| self.scheduler_for(carrier_num).pdch_anchor(t.t, ssi))
             .flatten()
         {
             Some(anchor) => TdmaTime { t: anchor, ..t },
@@ -582,10 +675,10 @@ impl UmacBs {
         // A radio on its packet-data channel of several slots with nothing more to send (no
         // reservation requirement in the block) no longer uses the slots it holds there
         // (23.5.2.3.1).
-        if let Some((label, ssi)) = self.ul_block_release.take()
+        if let Some((carrier, label, ssi)) = self.ul_block_release.take()
             && !self.ul_block_requirement
         {
-            self.channel_scheduler.ul_release_after(label, ssi);
+            self.scheduler_for_mut(carrier).ul_release_after(label, ssi);
         }
     }
 
@@ -806,10 +899,10 @@ impl UmacBs {
         // A radio on its packet-data channel of several slots with nothing more to send (no
         // reservation requirement) no longer uses the slots it holds there (23.5.2.3.1), once
         // the rest of the block says so too.
-        let on_main = carrier_num == self.main_carrier();
+        let on_pdch_carrier = self.carries_pdch(carrier_num);
         self.ul_block_requirement |= pdu.reservation_req.is_some();
-        if on_main && pdu.reservation_req.is_none() && !is_frag_start && !second_half_stolen {
-            self.ul_block_release = Some((self.dltime.add_timeslots(-2), addr.ssi));
+        if on_pdch_carrier && pdu.reservation_req.is_none() && !is_frag_start && !second_half_stolen {
+            self.ul_block_release = Some((carrier_num, self.dltime.add_timeslots(-2), addr.ssi));
         }
 
         if is_null_pdu {
@@ -826,13 +919,14 @@ impl UmacBs {
 
         // Handle reservation if present
         let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago.
-        if on_main {
-            self.channel_scheduler.pdch_random_access(msg_dltime, prim.block_num, addr.ssi);
+        if on_pdch_carrier {
+            self.scheduler_for_mut(carrier_num)
+                .pdch_random_access(msg_dltime, prim.block_num, addr.ssi);
         }
         if let Some(res_req) = &pdu.reservation_req {
             // On a packet-data channel of several slots it is granted when a slot of the channel
             // the radio hears is built.
-            if !(on_main && self.channel_scheduler.ul_defer_to_channel(msg_dltime, addr, res_req)) {
+            if !(on_pdch_carrier && self.scheduler_for_mut(carrier_num).ul_defer_to_channel(msg_dltime, addr, res_req)) {
                 let grant_result = self.scheduler_for_mut(carrier_num).ul_process_cap_req(msg_dltime.t, addr, res_req);
                 if let Some((grant, usage_marker)) = grant_result {
                     // Schedule grant — marker propagates into the MAC-RESOURCE ACK
@@ -978,10 +1072,10 @@ impl UmacBs {
 
         // An SCH/HU block without a reservation requirement: the radio no longer uses what it
         // holds on its packet-data channel of several slots (23.5.2.3.1).
-        let on_main = carrier_num == self.main_carrier();
+        let on_pdch_carrier = self.carries_pdch(carrier_num);
         self.ul_block_requirement |= pdu.reservation_req.is_some();
-        if on_main && pdu.reservation_req.is_none() && !pdu.is_frag_start() {
-            self.ul_block_release = Some((self.dltime.add_timeslots(-2), addr.ssi));
+        if on_pdch_carrier && pdu.reservation_req.is_none() && !pdu.is_frag_start() {
+            self.ul_block_release = Some((carrier_num, self.dltime.add_timeslots(-2), addr.ssi));
         }
 
         if pdu.is_null_pdu() {
@@ -995,8 +1089,9 @@ impl UmacBs {
         // Marking those as RA causes the next stolen downlink MAC-RESOURCE to carry
         // random_access_flag=true, which some radios reject during call setup.
         let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago.
-        if on_main {
-            self.channel_scheduler.pdch_random_access(msg_dltime, prim.block_num, addr.ssi);
+        if on_pdch_carrier {
+            self.scheduler_for_mut(carrier_num)
+                .pdch_random_access(msg_dltime, prim.block_num, addr.ssi);
         }
         if msg_dltime.t == 1 && !self.scheduler_for(carrier_num).allow_mcch() {
             if !self.scheduler_for(carrier_num).circuit_is_active(Direction::Dl, msg_dltime.t) {
@@ -1045,7 +1140,7 @@ impl UmacBs {
         if let Some(res_req) = &pdu.reservation_req {
             // On a packet-data channel of several slots it is granted when a slot of the channel
             // the radio hears is built.
-            if !(on_main && self.channel_scheduler.ul_defer_to_channel(msg_dltime, addr, res_req)) {
+            if !(on_pdch_carrier && self.scheduler_for_mut(carrier_num).ul_defer_to_channel(msg_dltime, addr, res_req)) {
                 let grant_result = self.scheduler_for_mut(carrier_num).ul_process_cap_req(msg_dltime.t, addr, res_req);
                 if let Some((grant, usage_marker)) = grant_result {
                     // Schedule grant — marker propagates into the MAC-RESOURCE ACK
@@ -1236,10 +1331,10 @@ impl UmacBs {
         // Without a reservation requirement the radio no longer uses what it holds on its
         // packet-data channel of several slots (23.5.2.3.1), once the rest of the block says so
         // too.
-        let on_main = carrier_num == self.main_carrier();
+        let on_pdch_carrier = self.carries_pdch(carrier_num);
         self.ul_block_requirement |= pdu.reservation_req.is_some();
-        if on_main && pdu.reservation_req.is_none() {
-            self.ul_block_release = Some((msg_dltime, slot_owner));
+        if on_pdch_carrier && pdu.reservation_req.is_none() {
+            self.ul_block_release = Some((carrier_num, msg_dltime, slot_owner));
         }
         let key = self.defrag_time(prim.carrier_num, msg_dltime, slot_owner);
         if let Some(_aie_info) = self.defrag.get_aie_info(slot_owner, key) {
@@ -1258,7 +1353,11 @@ impl UmacBs {
         if let Some(res_req) = &pdu.reservation_req {
             // On a packet-data channel of several slots it is granted when a slot of the channel
             // the radio hears is built.
-            if !(on_main && self.channel_scheduler.ul_defer_to_channel(msg_dltime, defragbuf.addr, res_req)) {
+            if !(on_pdch_carrier
+                && self
+                    .scheduler_for_mut(carrier_num)
+                    .ul_defer_to_channel(msg_dltime, defragbuf.addr, res_req))
+            {
                 let grant_result = self
                     .scheduler_for_mut(carrier_num)
                     .ul_process_cap_req(msg_dltime.t, defragbuf.addr, res_req);
@@ -1377,10 +1476,10 @@ impl UmacBs {
         };
         // An SCH/HU block without a reservation requirement: the radio no longer uses what it
         // holds on its packet-data channel of several slots (23.5.2.3.1).
-        let on_main = carrier_num == self.main_carrier();
+        let on_pdch_carrier = self.carries_pdch(carrier_num);
         self.ul_block_requirement |= pdu.reservation_req.is_some();
-        if on_main && pdu.reservation_req.is_none() {
-            self.ul_block_release = Some((msg_dltime, slot_owner));
+        if on_pdch_carrier && pdu.reservation_req.is_none() {
+            self.ul_block_release = Some((carrier_num, msg_dltime, slot_owner));
         }
         let key = self.defrag_time(prim.carrier_num, msg_dltime, slot_owner);
         if let Some(_aie_info) = self.defrag.get_aie_info(slot_owner, key) {
@@ -1399,7 +1498,11 @@ impl UmacBs {
         if let Some(res_req) = &pdu.reservation_req {
             // On a packet-data channel of several slots it is granted when a slot of the channel
             // the radio hears is built.
-            if !(on_main && self.channel_scheduler.ul_defer_to_channel(msg_dltime, defragbuf.addr, res_req)) {
+            if !(on_pdch_carrier
+                && self
+                    .scheduler_for_mut(carrier_num)
+                    .ul_defer_to_channel(msg_dltime, defragbuf.addr, res_req))
+            {
                 let grant_result = self
                     .scheduler_for_mut(carrier_num)
                     .ul_process_cap_req(msg_dltime.t, defragbuf.addr, res_req);
@@ -1537,7 +1640,7 @@ impl UmacBs {
 
         if self.pdch_mode {
             let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago.
-            if prim.carrier_num == self.main_carrier() && self.channel_scheduler.pdch_owner(msg_dltime.t).is_some() {
+            if self.carries_pdch(prim.carrier_num) && self.scheduler_for(prim.carrier_num).pdch_owner(msg_dltime.t).is_some() {
                 self.rx_ul_mac_u_blck_on_pdch(queue, prim, &pdu, msg_dltime);
                 return;
             }
@@ -1568,14 +1671,16 @@ impl UmacBs {
             tracing::debug!("rx_ul_mac_u_blck: event label {:#x} on the PDCH, ignored", pdu.event_label);
             return;
         }
+        let carrier = prim.carrier_num;
         let Some(ssi) = self
-            .channel_scheduler
+            .scheduler_for(carrier)
             .ul_get_slot_owner(msg_dltime, PhyBlockNum::Both)
-            .or_else(|| self.channel_scheduler.pdch_owner(msg_dltime.t))
+            .or_else(|| self.scheduler_for(carrier).pdch_owner(msg_dltime.t))
         else {
             return;
         };
-        self.channel_scheduler.pdch_random_access(msg_dltime, PhyBlockNum::Both, ssi);
+        self.scheduler_for_mut(carrier)
+            .pdch_random_access(msg_dltime, PhyBlockNum::Both, ssi);
         let addr = TetraAddress::issi(ssi);
         // Reservation requirement, with the MAC-U-BLCK meaning of the last two values
         // (table 21.37): 14 = more than 68 slots, 15 = none.
@@ -1589,13 +1694,15 @@ impl UmacBs {
         match res_req {
             // On a packet-data channel of several slots it is granted when a slot of the channel
             // the radio hears is built.
-            Some(res_req) if self.channel_scheduler.ul_defer_to_channel(msg_dltime, addr, &res_req) => {}
-            Some(res_req) => match self.channel_scheduler.ul_process_cap_req(msg_dltime.t, addr, &res_req) {
-                Some((grant, usage_marker)) => self.channel_scheduler.dl_enqueue_grant(msg_dltime.t, addr, grant, usage_marker),
+            Some(res_req) if self.scheduler_for_mut(carrier).ul_defer_to_channel(msg_dltime, addr, &res_req) => {}
+            Some(res_req) => match self.scheduler_for_mut(carrier).ul_process_cap_req(msg_dltime.t, addr, &res_req) {
+                Some((grant, usage_marker)) => self
+                    .scheduler_for_mut(carrier)
+                    .dl_enqueue_grant(msg_dltime.t, addr, grant, usage_marker),
                 None => tracing::warn!("rx_ul_mac_u_blck: No grant for reservation request {:?}", res_req),
             },
             // "No reservation requirement": the radio no longer uses what it holds (23.5.2.3.1).
-            None => self.channel_scheduler.ul_release_after(msg_dltime, ssi),
+            None => self.scheduler_for_mut(carrier).ul_release_after(msg_dltime, ssi),
         }
         if pdu.encrypted {
             unimplemented_log!("rx_ul_mac_u_blck: Encryption mode > 0");
@@ -1918,7 +2025,7 @@ impl UmacBs {
             }
         }
 
-        let (usage_marker, mac_chan_alloc) = if let Some(chan_alloc) = prim.chan_alloc.filter(|_| !chan_alloc_was_stealing_hint) {
+        let (usage_marker, mut mac_chan_alloc) = if let Some(chan_alloc) = prim.chan_alloc.filter(|_| !chan_alloc_was_stealing_hint) {
             let carrier_num = chan_alloc.carrier.unwrap_or(preferred_carrier);
             let Some(mac_chan_alloc) = self.cmce_to_mac_chanalloc(&chan_alloc, carrier_num) else {
                 if let Some(tx_reporter) = prim.tx_reporter {
@@ -1933,14 +2040,61 @@ impl UmacBs {
 
         // A stealing request that fell back here has no traffic circuit left to follow: the radio
         // is back on the MCCH, so drop the link to the slot it came from.
-        let link_id = if chan_alloc_was_stealing_hint { 0 } else { prim.link_id };
+        let mut link_id = if chan_alloc_was_stealing_hint { 0 } else { prim.link_id };
+        // A PDU for a radio on its packet-data channel of the packet-data carrier (link 2..=4 of
+        // that carrier: its uplink never uses ts1, so link 1 is always the MCCH) is built by that
+        // carrier's scheduler: its queue and its AACH. One for a slot there that is no longer the
+        // addressee's goes on the MCCH, without its channel allocation if that is a quit (not an
+        // allocation type for a common control channel, 23.5.4.2.2).
+        let main = self.main_carrier();
+        let target = match self
+            .pdch_carrier
+            .filter(|c| prim.carrier_num == Some(*c) && (2..=4).contains(&link_id))
+        {
+            Some(c) => {
+                let sched = self.scheduler_for(c);
+                let ts = link_id as u8;
+                let theirs = if prim.main_address.ssi_type == SsiType::Gssi {
+                    sched.pdch_owner(ts).is_some()
+                } else {
+                    sched.is_pdch_of(ts, prim.main_address.ssi)
+                };
+                if theirs {
+                    c
+                } else {
+                    // (Packet data or a quit is only ever meant for a channel; miura marks no
+                    // packet-data channel assignment, which goes on the MCCH anyway.)
+                    let for_a_pdch = matches!(prim.data_category, Some(DATA_CATEGORY_PACKET_DATA | DATA_CATEGORY_AL_REPLY))
+                        || mac_chan_alloc.as_ref().is_some_and(|a| a.alloc_type == ChanAllocType::QuitAndGo);
+                    if sched.pdch_owner(ts).is_some() || sched.pdch_released_owner(ts).is_some() || for_a_pdch {
+                        tracing::debug!(
+                            "UMAC: {} is no longer on its PDCH of carrier {} (link {}): MCCH",
+                            prim.main_address,
+                            c,
+                            link_id
+                        );
+                        link_id = 0;
+                        if mac_chan_alloc.as_ref().is_some_and(|a| a.alloc_type == ChanAllocType::QuitAndGo) {
+                            tracing::debug!(
+                                "UMAC: quit for {} re-routed to the MCCH without its channel allocation",
+                                prim.main_address
+                            );
+                            mac_chan_alloc = None;
+                        }
+                    }
+                    main
+                }
+            }
+            None => main,
+        };
         // On a radio's packet-data channel the scheduler adds the random-access flag itself when
         // it acknowledges a random access there.
         let on_its_pdch =
-            self.pdch_mode && u8::try_from(link_id).is_ok_and(|ts| self.channel_scheduler.is_pdch_of(ts, prim.main_address.ssi));
+            self.pdch_mode && u8::try_from(link_id).is_ok_and(|ts| self.scheduler_for(target).is_pdch_of(ts, prim.main_address.ssi));
         let is_random_access_response = prim.main_address.ssi_type != SsiType::Gssi && link_id != 0 && !on_its_pdch;
         if on_its_pdch {
-            self.note_pdch_traffic(preferred_carrier, link_id as u8, prim.main_address.ssi, false);
+            let carrier = if self.pdch_carrier.is_some() { target } else { preferred_carrier };
+            self.note_pdch_traffic(carrier, link_id as u8, prim.main_address.ssi, false);
         }
         let mut pdu = MacResource {
             fill_bits: false,
@@ -1962,18 +2116,18 @@ impl UmacBs {
         // BCCH carriers in `SecondaryBcchNoMcch` mode intentionally have no MCCH,
         // so enqueueing call-setup/control PDUs there makes them unschedulable
         // and drops D-CONNECT/D-SETUP for cross-carrier calls.
+        let sched = self.scheduler_for_mut(target);
         if prim.data_category == Some(DATA_CATEGORY_PACKET_DATA) {
-            self.channel_scheduler
-                .dl_enqueue_packet_data_for_link(link_id, pdu, sdu, prim.tx_reporter);
+            sched.dl_enqueue_packet_data_for_link(link_id, pdu, sdu, prim.tx_reporter);
         } else {
             // An advanced link segment asking for an acknowledgement, to the radio of a
             // packet-data channel of several slots: it gets a slot for the answer with it.
             if prim.data_category == Some(DATA_CATEGORY_AL_REPLY)
                 && let Some(reporter) = &prim.tx_reporter
             {
-                self.channel_scheduler.pdch_want_reply(prim.main_address.ssi, reporter.clone());
+                sched.pdch_want_reply(prim.main_address.ssi, reporter.clone());
             }
-            self.channel_scheduler.dl_enqueue_tma_for_link(link_id, pdu, sdu, prim.tx_reporter);
+            sched.dl_enqueue_tma_for_link(link_id, pdu, sdu, prim.tx_reporter);
         }
     }
 
@@ -2594,8 +2748,10 @@ impl TetraEntityTrait for UmacBs {
         // Check for UL inactivity (stuck transmitter detection)
         self.check_ul_inactivity(queue);
 
-        // Feed the health monitor's Congestion domain: current downlink scheduling backlog.
-        crate::health::registry().set_dl_queue_depth(self.channel_scheduler.dl_queue_depth());
+        // Feed the health monitor's Congestion domain: current downlink scheduling backlog, the
+        // channels of the packet-data carrier included.
+        let carrier_pdch_depth = self.pdch_carrier.map_or(0, |c| self.scheduler_for(c).pdch_queue_depth());
+        crate::health::registry().set_dl_queue_depth(self.channel_scheduler.dl_queue_depth() + carrier_pdch_depth);
 
         // Packet-data channels, before the slot is built (its AACH shows them)
         if self.pdch_mode {
@@ -2606,6 +2762,10 @@ impl TetraEntityTrait for UmacBs {
         // This is basically the _previous_ timeslot
         let mut slots = Vec::with_capacity(1 + self.secondary_channel_schedulers.len());
         slots.push(self.channel_scheduler.finalize_ts_for_tick());
+        // Radios the MCCH slot just built sent to their channel of the packet-data carrier.
+        if let Some(carrier) = self.pdch_carrier {
+            self.pdch_handoff(carrier);
+        }
         for scheduler in &mut self.secondary_channel_schedulers {
             if let Some(slot) = scheduler.finalize_secondary_ts_for_tick() {
                 slots.push(slot);
