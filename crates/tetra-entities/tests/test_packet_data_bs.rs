@@ -5788,6 +5788,38 @@ fn a_radio_is_heard_on_main_while_another_radio_talks_on_its_old_carrier_slot() 
     );
 }
 
+/// The radio's channel, the last one of the carrier, released while it is in hangtime of a call
+/// on main ts3: for a multiframe its bursts on the carrier ts3 it left still pass as its own
+/// (23.5.2.2.4 NOTE 2), so the copy rules keep running: its random access on main ts3 is taken
+/// once, the copy on the carrier dropped.
+#[test]
+fn a_copy_is_dropped_for_a_multiframe_after_the_last_carrier_channel_went() {
+    use tetra_core::PhyBlockNum;
+    use tetra_pdus::umac::enums::reservation_requirement::ReservationRequirement;
+    use tetra_saps::tmv::enums::logical_chans::LogicalChannel;
+    debug::setup_logging_verbose();
+    let air = UmacAir::new(carrier_config(false, 4, false));
+    let (mut air, held) = in_a_main_call_holding_carrier_slots(air, &[3, 2], ReservationRequirement::Req4Slots, false);
+    {
+        let mut state = air.test.config.state_write();
+        state.pdch_by_issi.remove(&ISSI);
+        state.pdch_timeslots_by_issi.remove(&ISSI);
+        for ts in [3, 2] {
+            state
+                .timeslot_alloc
+                .release_slot(TimeslotOwner::PacketData, carrier_slot(ts))
+                .unwrap();
+        }
+    }
+    air.tick();
+    let u = *held.last().unwrap();
+    let access = |carrier, rssi| from_lmac_as(mac_access_of(ISSI, None), carrier, rssi, LogicalChannel::SchHu, PhyBlockNum::Block1);
+    assert_eq!(
+        heard_at(&mut air, u, vec![access(MAIN_CARRIER, -40.0), access(SECONDARY_CARRIER, -75.0)]),
+        vec![MAIN_CARRIER]
+    );
+}
+
 /// ISSI2 on its main-carrier channel (ts3) has an uplink fragmentation open and one slot granted
 /// for its MAC-END; in that same uplink slot the radio of a carrier channel sends a MAC-END on the
 /// carrier, received first, and the main carrier gets either that block's adjacent-channel copy

@@ -294,10 +294,14 @@ impl UmacBs {
         }
     }
 
-    /// Whether a packet-data channel of the packet-data carrier exists (the uplink copy rules run
-    /// only then).
+    /// Whether a packet-data channel of the packet-data carrier exists, or one went less than
+    /// `PDCH_RELEASED_UNALLOCATED_SLOTS` ago: its radio may still send there and is heard on both
+    /// carriers (the uplink copy rules run only then).
     fn pdch_carrier_active(&self) -> bool {
-        self.pdch_carrier.is_some_and(|c| self.scheduler_for(c).has_pdch())
+        self.pdch_carrier.is_some_and(|c| {
+            let s = self.scheduler_for(c);
+            s.has_pdch() || (1..=4).any(|t| s.pdch_released_owner(t).is_some())
+        })
     }
 
     /// Whether an uplink MAC PDU from `issi`, received on `carrier_num` in uplink slot
@@ -308,7 +312,7 @@ impl UmacBs {
     ///      transmits (never on ts1), and for a multiframe after the release its previous owner (its
     ///      last bursts, 23.5.2.2.4 NOTE 2): the carrier has no MCCH;
     ///
-    /// and while a channel of the packet-data carrier exists:
+    /// and while a channel of the packet-data carrier exists, or for a multiframe after the last:
     ///   2. a radio holding this uplink slot on the other carrier in the form of this burst, unless
     ///      it holds it here too, cannot be transmitting here too;
     ///   3. on main ts2-4 only a circuit, its hangtime or a packet-data channel's radio transmits
