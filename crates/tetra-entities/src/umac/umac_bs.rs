@@ -374,7 +374,7 @@ impl UmacBs {
         }
         if reserved_there {
             tracing::debug!(
-                "UmacBs: uplink from ISSI {} on carrier {} ts {} ({:?}) taken although that slot is reserved to it on carrier {}: {}",
+                "UmacBs: uplink from ISSI {} on carrier {} ts {} ({:?}) passes the reservation test although that slot is reserved to it on carrier {}: {}",
                 issi,
                 carrier_num,
                 t,
