@@ -5729,16 +5729,12 @@ fn rule_two_still_drops_a_copy_handed_over_first() {
     );
 }
 
-/// A call takes the radio's carrier ts3 after its channel is released (another radio's channel
-/// stays on the carrier), and the radio joins it there while it still holds uplink slots of its
-/// old channel on ts3: the copy on main ts3 (in a call too) of its stolen block there, handed
-/// over first, is dropped; the block is taken.
-#[test]
-fn a_copy_is_dropped_while_a_call_holds_the_carrier_slot() {
-    use tetra_core::PhyBlockNum;
+/// The radio in hangtime of a call on main ts3 while it still holds uplink slots of its carrier
+/// channel [3, 2] on ts3 (ISSI2's channel on ts4 stays on the carrier), then its channel released
+/// and a call opened on carrier ts3 with `talker` talking. Returns the UMAC and the last carrier
+/// ts3 slot the radio holds.
+fn in_a_main_call_with_its_carrier_slot_in_a_call(talker: u32) -> (UmacAir, TdmaTime) {
     use tetra_pdus::umac::enums::reservation_requirement::ReservationRequirement;
-    use tetra_saps::tmv::enums::logical_chans::LogicalChannel;
-    debug::setup_logging_verbose();
     let air = UmacAir::new(carrier_config(false, 4, false));
     grant_carrier_slots(&air.test.config, ISSI2, &[4], true);
     let (mut air, held) = in_a_main_call_holding_carrier_slots(air, &[3, 2], ReservationRequirement::Req4Slots, false);
@@ -5754,12 +5750,41 @@ fn a_copy_is_dropped_while_a_call_holds_the_carrier_slot() {
         }
     }
     air.tick();
-    call_on(&mut air, SECONDARY_CARRIER, 3, Some(ISSI));
+    call_on(&mut air, SECONDARY_CARRIER, 3, Some(talker));
     let u = *held.last().unwrap();
+    (air, u)
+}
+
+/// A call takes the radio's carrier ts3 after its channel is released (another radio's channel
+/// stays on the carrier), and the radio joins it there while it still holds uplink slots of its
+/// old channel on ts3: the copy on main ts3 (in a call too) of its stolen block there, handed
+/// over first, is dropped; the block is taken.
+#[test]
+fn a_copy_is_dropped_while_a_call_holds_the_carrier_slot() {
+    use tetra_core::PhyBlockNum;
+    use tetra_saps::tmv::enums::logical_chans::LogicalChannel;
+    debug::setup_logging_verbose();
+    let (mut air, u) = in_a_main_call_with_its_carrier_slot_in_a_call(ISSI);
     let stolen = |carrier, rssi| from_lmac_as(stch_mac_data_of(ISSI), carrier, rssi, LogicalChannel::Stch, PhyBlockNum::Block1);
     assert_eq!(
         heard_at(&mut air, u, vec![stolen(MAIN_CARRIER, -60.0), stolen(SECONDARY_CARRIER, -40.0)]),
         vec![SECONDARY_CARRIER]
+    );
+}
+
+/// As above, but the call on carrier ts3 is another group's, ISSI2 talking: that uplink is closed
+/// to the radio (traffic usage marker, 23.5.5), so its random access on main ts3 (in hangtime) in
+/// a slot it still holds on carrier ts3 is its own, taken, and its copy on the carrier dropped.
+#[test]
+fn a_radio_is_heard_on_main_while_another_radio_talks_on_its_old_carrier_slot() {
+    use tetra_core::PhyBlockNum;
+    use tetra_saps::tmv::enums::logical_chans::LogicalChannel;
+    debug::setup_logging_verbose();
+    let (mut air, u) = in_a_main_call_with_its_carrier_slot_in_a_call(ISSI2);
+    let access = |carrier, rssi| from_lmac_as(mac_access_of(ISSI, None), carrier, rssi, LogicalChannel::SchHu, PhyBlockNum::Block1);
+    assert_eq!(
+        heard_at(&mut air, u, vec![access(MAIN_CARRIER, -40.0), access(SECONDARY_CARRIER, -75.0)]),
+        vec![MAIN_CARRIER]
     );
 }
 

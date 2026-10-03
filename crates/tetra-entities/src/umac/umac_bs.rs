@@ -343,13 +343,16 @@ impl UmacBs {
         let there = self.scheduler_for(other);
         // On a slot of its packet-data channel there (or of the one it gave back less than a
         // multiframe ago) that carries no call, a reserved uplink slot is closed to random access
-        // by its AACH (23.5.1.4.2 b), or shown unallocated: the radio sends there only what it was
-        // granted, a slot as SCH/F and a subslot as SCH/HU (23.5.2.3.1), and so does its copy
-        // here. A random access or a stolen block here is its own, sent after it left that channel
-        // (the slots it holds there are void, 23.5.4.3.1). On the MCCH, a call or its hangtime a
-        // reserved slot stays open to random access: any burst.
-        let pdch_slot = (there.is_pdch_of(t, issi) || there.pdch_released_owner(t) == Some(issi))
-            && !(there.circuit_is_active(Direction::Dl, t) || there.circuit_is_active(Direction::Ul, t) || there.is_hangtime(t));
+        // by its AACH (23.5.1.4.2 b), or shown unallocated, and so it is while another radio talks
+        // in a call that took the slot (its traffic usage marker, 23.5.5): the radio sends there
+        // only what it was granted, a slot as SCH/F and a subslot as SCH/HU (23.5.2.3.1), and so
+        // does its copy here. A random access or a stolen block here is its own, sent after it left
+        // that channel (the slots it holds there are void, 23.5.4.3.1). On the MCCH, or in a call
+        // no other radio talks in, a reserved slot stays open to random access and to its own
+        // stolen blocks: any burst.
+        let call_there = there.circuit_is_active(Direction::Dl, t) || there.circuit_is_active(Direction::Ul, t) || there.is_hangtime(t);
+        let other_talks_there = self.ul_signal_owner.get(&(other, t)).is_some_and(|&s| s != issi);
+        let pdch_slot = (there.is_pdch_of(t, issi) || there.pdch_released_owner(t) == Some(issi)) && (!call_there || other_talks_there);
         let reserved_there = there.ul_reserved_to(msg_dltime, issi);
         let held_there = if pdch_slot {
             there.ul_reserved_as(msg_dltime, issi, lchan)
